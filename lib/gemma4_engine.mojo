@@ -1,0 +1,1070 @@
+"""GemmaEngine — library wrapping the Gemma-4-31B Nomos kernel.
+
+Holds all GPU resources, weight pointers, KV caches, and KV caches.
+Constructed via __init__ which performs the full model load (~30s on H200).
+Released via destroy() which frees device memory.
+
+Used by:
+  - gemma4_unified.mojo (the TCP service binary): main() builds one engine
+    and runs the request loop calling engine methods.
+  - nomos_ffi.mojo (the cgo .so): @export functions allocate an engine on
+    the heap and return its address as an Int64 handle.
+
+This file is the SINGLE source of truth for what model state exists. Both
+deployment modes (TCP service + cgo library) share the load and inference
+implementations.
+"""
+
+from std.ffi import external_call, c_int, c_size_t
+from std.memory import UnsafePointer
+from std.collections import List
+from std.math import sqrt
+from std.gpu.host import DeviceContext
+
+from lib.cuda import cuda_malloc, cuda_free, cuda_sync, cuda_upload, cuda_download, cuda_memcpy, cuda_memcpy_2d, cuda_memset_2d
+from lib.cuda import cuda_mem_free_bytes, cuda_mem_total_bytes
+from lib.cublas import cublas_create, gpu_matmul
+from lib.io import read_f32, load_to_gpu, load_to_gpu_bf16
+from lib.q4_weights import load_to_gpu_q4
+from lib.fp4_weights import load_to_gpu_nvfp4
+from lib.q4_gemv_dp4a import act_precision
+from lib.gemma4_ops import rmsnorm
+from lib.gemma4_layer import prepare_qkv_dev, apply_output_and_mlp_dev, prepare_qkv_batched, apply_output_and_mlp_batched
+from lib.attention_gpu import append_kv_gpu_dev, attention_gpu_fp32_dev
+from lib.sampling import final_logit_softcap, apply_rep_penalty, mask_eos_if_too_early, fix_contraction_me_bug, fix_contraction_t_bug, sample_top_p, argmax, mask_tool_grammar, mask_special_tokens
+from lib.engine_decode import run_inference_impl
+from lib.engine_prefill import prefill_batch_impl
+from lib.engine_init import _read_env_bytes, zeros_f32, zeros_f64, zeros_i32
+from lib.eagle3_drafter import MAX_VERIFY_ROWS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Architecture constants — Gemma-4-31B
+# ─────────────────────────────────────────────────────────────────────────────
+
+alias D = 5376         # hidden_size
+alias NH = 32          # num attention heads
+alias NKV = 16         # num KV heads (sliding)
+alias HD = 256         # head dim (sliding)
+alias FF = 21504       # intermediate (MLP) size
+alias VOCAB = 262144
+alias TOTAL_LAYERS = 60
+alias FULL_HD = 512    # head dim (full attention)
+# bf16 KV (precision_bits=16) halves the cache, so 16384 fits in the VRAM the old
+# fp32 8192 cache used. Gemma-4 is natively 128k+; this is the kernel-alloc bound.
+# Context window is now a RUNTIME field (GemmaEngine.max_seq, from NOMOS_MAX_SEQ);
+# the old `alias MAX_SEQ = 16384` compile-time hardcode is gone.
+# Gemma-4 sliding-attention layers (5 of every 6) attend only to the last
+# SLIDING_WINDOW keys. Full layers (layer%6==5) attend to everything. Without
+# this bound, sliding layers over-attend past ~window tokens -> garbage at long
+# context (confirmed 2026-06-14: coherent <2.4k, gibberish >5k). Value from the
+# HF config ("sliding_window": 1024).
+alias SLIDING_WINDOW = 1024
+alias MAX_PROBE_TOKENS = 128  # per-token buffer bound (reserved)
+alias PROBE_TOPK = 32         # top-K logits kept per probed position (reserved)
+
+
+struct GemmaEngine(Movable):
+    """All state for one loaded model instance."""
+
+    # ── GPU contexts ─────────────────────────────────────────────────
+    var ctx: DeviceContext
+    var handle: UInt64                    # cuBLAS
+
+    # ── mmap'd embedding (for the per-token table lookup) ────────────
+    var embed_fd: c_int
+    var embed_size: Int
+
+    # ── GPU-resident weights ─────────────────────────────────────────
+    var d_embed_lmhead: UInt64       # fp32 lm-head [VOCAB,D] (0 when weight_nvfp4)
+    # NVFP4 lm-head (Feature A: tied embed/unembed quantized, ~5.3GB fp32 -> ~1.3GB).
+    # The INPUT embedding still uses the host mmap (embed_fd); only the GPU-resident
+    # logits projection is quantized. W4A4 path (FP4 act): reuses the per-layer
+    # d_w4a4_packed/bs/global act scratch (K=D<FF fits), needs its own cpad [16,VOCAB].
+    var d_embed_nvfp4: UInt64        # nvfp4 blob [e4m3 scales][E2M1 packed], 0 when fp32
+    var d_embed_q4: UInt64           # Q4_0 lm-head blob (.q4, ~792MB), 0 unless dp4a Q4 path
+    var embed_global: Float32        # per-tensor global scale for the nvfp4 lm-head
+    var d_lmhead_cpad: UInt64        # [W4A4_MPAD, VOCAB] fp32 raw-MMA scratch (16.8MB)
+    var d_lmhead_in: UInt64          # [D] fp32 GPU activation (normed_final upload)
+    var d_lmhead_logits: UInt64      # fp32 GPU logits output, [MAX_VERIFY_ROWS,VOCAB] capacity
+    var mtp_ptr: UInt64              # heap MTPDrafter address (0 = MTP not loaded); set by nomos_mtp_load
+    var d_eagle3_tap_out: UInt64     # [tap_count,D] mid-layer tap dst (0 = dormant); armed by a drafter
+    var d_eagle3_tap_rows_out: UInt64 # [rows,tap_count,D] verify tap-row cache (0 = dormant)
+    var drafter_tap_count: Int        # active tap layer count for the armed drafter
+    var drafter_tap_layers: List[Int] # target decoder-layer ids to capture, low->high
+    var eagle3_ptr: UInt64           # heap Eagle3Drafter address (0 = not loaded); set by nomos_eagle3_load
+    var dflash_ptr: UInt64           # heap DFlashDrafter address (0 = not loaded); set by nomos_dflash_load
+    var final_norm: List[Float32]
+
+    var d_qw: List[UInt64]
+    var d_kw: List[UInt64]
+    var d_vw: List[UInt64]
+    var d_ow: List[UInt64]
+    var d_gw: List[UInt64]
+    var d_uw: List[UInt64]
+    var d_dw: List[UInt64]
+
+    var weight_nvfp4: Bool          # NVFP4 weight mode (W4A16) — env NOMOS_WEIGHT_NVFP4
+    var w4a4: Bool                  # W4A4 decode (FP4 act × FP4 weight, native MMA) — env NOMOS_W4A4
+    var d_qw_gs: List[Float32]      # NVFP4 per-tensor global scales (parallel to d_*w)
+    var d_kw_gs: List[Float32]
+    var d_vw_gs: List[Float32]
+    var d_ow_gs: List[Float32]
+    var d_gw_gs: List[Float32]
+    var d_uw_gs: List[Float32]
+    var d_dw_gs: List[Float32]
+    var d_qw_ags: List[Float32]     # calibrated activation multipliers (1 / CT divisor)
+    var d_kw_ags: List[Float32]
+    var d_vw_ags: List[Float32]
+    var d_ow_ags: List[Float32]
+    var d_gw_ags: List[Float32]
+    var d_uw_ags: List[Float32]
+    var d_dw_ags: List[Float32]
+    var embed_input_global: Float32
+
+    var d_in_norms: List[UInt64]
+    var d_post_attn_norms: List[UInt64]
+    var d_pre_ff_norms: List[UInt64]
+    var d_post_ff_norms: List[UInt64]
+    var d_q_norms: List[UInt64]
+    var d_k_norms: List[UInt64]
+    var layer_scalars: List[Float32]
+
+    # ── Per-layer geometry ───────────────────────────────────────────
+    var layer_hd: List[Int]
+    var layer_nkv: List[Int]
+    var layer_qd: List[Int]
+    var layer_kvd: List[Int]
+    var layer_kvg: List[Int]
+    var layer_is_full: List[Bool]
+    var layer_cache_cap: List[Int]   # #430: KV ring capacity per layer (SLIDING_WINDOW for sliding layers under NOMOS_KV_SWA, else max_seq)
+
+    # ── KV caches (FP32 GPU-resident, all 60 layers on H200) ────────
+    var d_k_cache: List[UInt64]
+    var d_v_cache: List[UInt64]
+    # INT8 KV-cache quant (FP4 Step 5, env NOMOS_KV_QUANT): the live cache is stored
+    # INT8 (2× smaller — the bigger edge-fit lever than weights) + per-(head,pos)
+    # scales; dequant-on-read into a 1-layer bf16 scratch so the existing cuBLAS
+    # attention reads it unchanged. See lib/kv_cache_quant. Requires precision_bits<=16.
+    var kv_quant: Bool
+    var kv_int4: Bool                # Feature B: 4-bit packed KV (env NOMOS_KV_INT4, needs kv_quant)
+    var kv_int4_block32: Bool        # env-gated Q4_0-style scale per 32 values
+    var kv_swa: Bool                 # #430: ring-buffer the 50 sliding layers at SLIDING_WINDOW (env NOMOS_KV_SWA, needs kv_quant)
+    var d_k_cache_i8: List[UInt64]
+    var d_v_cache_i8: List[UInt64]
+    var d_k_scales: List[UInt64]
+    var d_v_scales: List[UInt64]
+    var d_k_deq: UInt64
+    var d_v_deq: UInt64
+    var deq_slide_pitch: Int   # deq scratch pitch for sliding layers: SLIDING_WINDOW under SWA, else max_seq
+    var cache_lens_fp32: List[Int]
+    var kv_continue: Bool   # one-shot: next run_inference continues from the injected KV prefix (one-shot continue)
+
+    # ── Per-token GPU scratch (allocated once, reused) ──────────────
+    var d_x_buf: UInt64
+    var d_normed_buf: UInt64
+    var d_q_buf: UInt64
+    var d_k_new_buf: UInt64
+    var d_v_new_buf: UInt64
+    var d_o_out_buf: UInt64
+    var d_pn_buf: UInt64
+    var d_gate_buf: UInt64
+    var d_up_buf: UInt64
+    var d_mlp_v_buf: UInt64
+    var d_down_buf: UInt64
+
+    # ── Attention scratch ────────────────────────────────────────────
+    var d_q_gpu: UInt64
+    var d_scores_scratch: UInt64
+    var d_attn_out_scratch: UInt64
+    # bf16 attention scratch (used only when precision_bits <= 16): Q + scores casts,
+    # and per-token K/V casts for the bf16 KV-cache append.
+    var d_q_bf16: UInt64
+    var d_scores_bf16: UInt64
+    var d_k_bf16: UInt64
+    var d_v_bf16: UInt64
+
+    # ── Matmul scratch ───────────────────────────────────────────────
+    var d_matmul_in_bf16: UInt64
+    # Q4 weight dequant scratch (precision_bits==4): one weight dequanted to BF16
+    # here per GEMM, reused (sized to the largest weight, D*FF). 0 when not q4.
+    var d_weight_bf16_scratch: UInt64
+    # W4A4 decode scratch (env NOMOS_W4A4): per-GEMM activation NVFP4 (packed/bs/global
+    # over W4A4_MPAD=16 rows) + the raw-MMA C buffer. Sized to the worst-case K,N (=FF).
+    # 0 when W4A4 off. See lib/fp4_act.gpu_matmul_nvfp4_w4a4_dev.
+    var d_w4a4_packed: UInt64
+    var d_w4a4_bs: UInt64
+    var d_w4a4_global: UInt64
+    var d_w4a4_cpad: UInt64
+    var d_w4a4_bs_sf: UInt64        # sm_100: SF-atom activation-scale scratch (0 on sm_120)
+    var d_w4a4_wbs_sf: UInt64       # sm_100: SF-atom weight-scale scratch, worst-case lm-head (0 on sm_120)
+    var w4a4_chunk_mpad: Int        # #431: W4A4 prefill scratch row capacity (env NOMOS_W4A4_CHUNK, mult of 16)
+
+    # (research-only engine state removed for the perf-clean product tree)
+
+    # ── Sampling state (mutable across requests) ─────────────────────
+    var rng_state: UInt64
+    var rep_penalty: Float32
+    var temp: Float32
+    var top_p: Float32
+    # Unified precision knob (NOMOS_PRECISION_BITS): 32=fp32 KV/attention (today),
+    # 16=bf16 KV/attention. Weights + activation matmuls are already bf16. One input
+    # drives all layers identically (the dual-host NUM_BF16/NUM_FP32 split is deleted).
+    var precision_bits: Int
+
+    # Runtime context window (NOMOS_MAX_SEQ): sizes every KV cache + attention
+    # scratch alloc. Was a compile-time alias hardcoded at 16384 — now per-deploy
+    # (lower = less VRAM, higher = more context), no recompile.
+    var max_seq: Int
+
+    # (research-only engine state removed — perf-clean product tree)
+
+    # ─────────────────────────────────────────────────────────────────
+    def __init__(
+        out self,
+        weights_dir: String,
+    ) raises:
+        """Load weights, allocate GPU buffers. ~30s on H200."""
+
+        self.ctx = DeviceContext()
+        self.handle = cublas_create()
+        # Free-VRAM baseline AFTER the CUDA context + cuBLAS handle exist, so the
+        # delta at the end of __init__ is exactly what THIS engine allocated
+        # (weights + KV + scratch). Reported alongside the absolute device usage.
+        var _free_baseline = cuda_mem_free_bytes()
+        self.rng_state = 42
+        # Sampling params are env-overridable (request-plumbing is the proper
+        # follow-up). Defaults preserve prior behavior. For agentic/tool use,
+        # low temp + mild rep_penalty matters: rep_penalty 1.3 over 128 tokens
+        # drifts code generation into garbage (penalizes legit repeats).
+        # Defaults tuned for agentic/structured output (the old 1.3/0.7 wrecked
+        # code generation — penalized legit repeats into garbage). Per-request
+        # values from the OpenAI API override these via nomos_generate.
+        self.rep_penalty = _env_float("NOMOS_REP_PENALTY", 1.05)
+        self.temp = _env_float("NOMOS_TEMP", 0.3)
+        self.top_p = _env_float("NOMOS_TOP_P", 0.9)
+        self.precision_bits = Int(_env_float("NOMOS_PRECISION_BITS", 32.0))
+        self.weight_nvfp4 = _env_float("NOMOS_WEIGHT_NVFP4", 0.0) > 0.5
+        # W4A4 needs NVFP4 weights (it MMAs FP4 act × FP4 weight), so it implies weight_nvfp4.
+        self.w4a4 = _env_float("NOMOS_W4A4", 0.0) > 0.5
+        if self.w4a4:
+            self.weight_nvfp4 = True
+        # #431: W4A4 prefill processes the prompt in row-chunks of this many MMA rows, so the
+        # act/MMA scratch (esp. cpad = chunk*FF*4) is sized to one chunk, not max_seq (~22GB
+        # @256k). Default 2048; floored to 16, rounded up to a multiple of 128 (the sm_100
+        # tcgen05 MMA m-dim; ⊃ the sm_120 m16, so both arches' chunks fit the scratch).
+        var w4a4_chunk = Int(_env_float("NOMOS_W4A4_CHUNK", 2048.0))
+        if w4a4_chunk < 16: w4a4_chunk = 16
+        # Round to 128 (the tcgen05 MMA m-dim on sm_100); a multiple of 128 is also a multiple
+        # of 16, so the sm_120 path is unaffected. Keeps the chunk scratch 128-row-aligned so a
+        # 128-padded chunk always fits the [w4a4_chunk_mpad, *] act/MMA buffers below.
+        self.w4a4_chunk_mpad = ((w4a4_chunk + 127) // 128) * 128
+        # INT8 KV-cache quant (the dequant scratch is bf16 → needs the bf16 attention path).
+        self.kv_quant = _env_float("NOMOS_KV_QUANT", 0.0) > 0.5
+        if self.kv_quant and self.precision_bits > 16:
+            self.precision_bits = 16
+        # Feature B: 4-bit packed KV (2 nibbles/byte). Requires kv_quant.
+        self.kv_int4 = self.kv_quant and (_env_float("NOMOS_KV_INT4", 0.0) > 0.5)
+        # BLOCK-32 KV — THE INVARIANT: the append side (gpu_append_quant_kv_i4) writes the
+        # scale layout this flag selects UNCONDITIONALLY, so EVERY read path must be handed
+        # i4_scale_blocks. There are two, and for a while only one of them could read it:
+        #   gpu_dequant_kv_i4_to_q8_layer  (int8 attention)  — always took scale_blocks
+        #   gpu_dequant_kv_i4_layer        (bf16 attention)  — had NO such parameter
+        # The block-32 scales are float16 at [nkv, cache_cap, nblocks]; the block-1 reader loads
+        # Float32 at [nkv, cache_cap], i.e. it reinterprets TWO fp16 scales as ONE fp32. That is
+        # garbage KV, not coarse KV, and it fails silently: the drafter taps corrupt hiddens and
+        # speculative acceptance goes to EXACTLY 0.000 at every depth. It measured +15.7% on Gold
+        # only because that arm ran NOMOS_Q4_DP4A=1 and took the int8 reader; Prime hit the bf16
+        # reader on the demo laptop and got 46.58 -> 17.55 tok/s, E 2.69 -> 1.00.
+        # Both readers now take scale_blocks, so the flag no longer depends on DP4A.
+        # If a THIRD reader is ever added, it must take scale_blocks too — the write is
+        # unconditional, so a reader that ignores it does not degrade, it corrupts.
+        # (debug_kv_i4_source_to_f32_dev is still block-1 only; it is opt-in behind
+        #  debug_omlp_stage==11 and will MISREPORT under block-32. Do not diagnose with it there.)
+        self.kv_int4_block32 = self.kv_int4 and (Int(_env_float("NOMOS_KV_I4_BLOCK", 0.0)) == 32)
+        # ── BLOCK-1 INT4 KV IS UNSAFE UNDER NVFP4/W4A4 — auto-upgrade to block-32 ──────────
+        # MEASURED 2026-08-04 (Prime found it on a 5090/interp; reproduced by Kvasir on GB10
+        # with THIS tree, deterministic, 3 boxes / 2 architectures / 2 kernel trees):
+        #   NVFP4 W4A4 + kv_int4 + block-1 -> DEGENERATE on prose/citation prompts, e.g.
+        #     "...introduces **Recursive Lats**, a method for..." then  du dw dx dy dz e//
+        #   NVFP4 W4A4 + kv_int4 + block-32 -> CLEAN (same prompt, same box, same seed)
+        #   Q4_0  + int8 acts + block-1     -> CLEAN (GB10 champion is NOT affected)
+        # It is NOT a broken reader: it degenerates on BOTH the bf16 reader
+        # (gpu_dequant_kv_i4_layer) and the int8 one (gpu_dequant_kv_i4_to_q8_layer). The
+        # condition is the PRECISION BUDGET: block-1 keeps one absmax scale per 256-value row
+        # (see tap-precision-drift, 2026-07-14: "8x too coarse; fatal at 4 bits — one Gemma
+        # outlier crushes the block"). Q4_0 survives it because int8 activations carry the
+        # headroom; W4A4's 4-bit activations do not, so weight+activation+KV error compounds
+        # past the point where attention still resolves.
+        # WHY NO GATE CAUGHT IT: content-dependent (prose/citation degenerates, code does not,
+        # so a code+agentic bar cannot see it) AND invisible to losslessness by construction —
+        # spec and base read the SAME dequant, so they agree while both drift.
+        # Upgrade rather than refuse: block-32 is measured strictly better here and already
+        # shipped, so upgrading fixes existing broken configs instead of breaking them.
+        # NOMOS_KV_I4_BLOCK_UNSAFE=1 bypasses the upgrade and RUNS THE DEGENERATE ARM ON PURPOSE.
+        # It exists because the arm has to stay reachable to be studied, and a safety rail that
+        # forbids the experiment validating it is over-rigid. NEVER set this for a benchmark, a
+        # demo, or anything whose output is quoted.
+        #
+        # The rationale here USED to cite a prediction that L47 workspace-ignition rank-orders
+        # WHICH prompts collapse. Prime pre-registered that test at `fb0fa4f` before any collapse
+        # data existed (collapse = `//`>=3 or maxrepeat>=8; CONFIRM at AUC>=0.80 AND top-K
+        # capture>=70%; REFUTE at AUC<0.65) and ran it 2026-08-05: **AUC 0.650, top-4 capture 50%
+        # — UNSUPPORTED**, sitting on the refutation boundary. Two cases carry it: "Attention Is
+        # All You Need" collapsed hardest (`//`x35) at ignition 3.50, near the BOTTOM of the
+        # battery, and the four highest-ignition prompts (4.70/4.68/4.63/4.58) all stayed clean.
+        # 3 of 4 collapses were fabrications, but that is carried by FABRICATION, not ignition —
+        # separating those two is exactly what the AUC was for, and 0.65 says it does not. Weak in
+        # the refuting direction too: K=4 is the floor his own prereg declared uninformative, so
+        # this is "unsupported", not "refuted". Collapse is near-binary and content-triggered,
+        # which may simply not be what a continuous magnitude predicts.
+        #
+        # The block-32 upgrade below does NOT depend on that bridge and never did. It rests on
+        # direct measurement: three boxes, two architectures, deterministic repeats. A supporting
+        # datum from the same run — at block-1 the int8 reader collapsed 3/24 and bf16 4/24, on
+        # PARTLY DISJOINT prompts (Halvorsen collapses on bf16, clean on int8) — which is what a
+        # starved precision budget under two different roundings looks like, and is NOT what a
+        # single broken code path looks like.
+        if self.kv_int4 and (self.weight_nvfp4 or self.w4a4) and not self.kv_int4_block32:
+            if _env_float("NOMOS_KV_I4_BLOCK_UNSAFE", 0.0) > 0.5:
+                print("[engine] *** UNSAFE: running block-1 INT4 KV under NVFP4/W4A4 ON PURPOSE.",
+                      "This arm produces DEGENERATE output on high-ignition prompts.",
+                      "RESEARCH ONLY — no number from this run may be quoted. ***")
+            else:
+                print("[engine] WARNING: NOMOS_KV_I4_BLOCK=1 with NVFP4/W4A4 produces DEGENERATE",
+                      "output on prose/citation prompts (measured 2026-08-04, 3 boxes).",
+                      "FORCING block-32. Set NOMOS_KV_I4_BLOCK=32 explicitly to silence this;",
+                      "NOMOS_KV_I4_BLOCK_UNSAFE=1 to study the broken arm.")
+                self.kv_int4_block32 = True
+        # #430 sliding-window KV: ring-buffer the 50 sliding layers at SLIDING_WINDOW
+        # (the 10 full/global layers stay at max_seq). Needs the quantized-cache path
+        # (the ring lives in the kv_quant alloc/append/dequant). The edge-context lever:
+        # 31B @256k full-4-bit KV drops ~53GB. Off => byte-identical to pre-#430.
+        self.kv_swa = self.kv_quant and (_env_float("NOMOS_KV_SWA", 0.0) > 0.5)
+        # Context window (NOMOS_MAX_SEQ, default 16384). Floor 256 so a stray
+        # tiny value can't under-size the cache; sizes all KV/attn allocs below.
+        self.max_seq = Int(_env_float("NOMOS_MAX_SEQ", 16384.0))
+        if self.max_seq < 256: self.max_seq = 256
+        # Sliding layers only expose the last SLIDING_WINDOW keys. Under SWA, pack their
+        # dequant scratch to that exact capacity; full layers retain max_seq pitch.
+        self.deq_slide_pitch = SLIDING_WINDOW if self.kv_swa else self.max_seq
+        # kv_i4_block is in the banner because its ABSENCE cost a full day (2026-08-04): the
+        # banner logged "kv_int4 = True" and nothing about granularity, so diagnosing which
+        # arm a box was on required a CODE READ instead of a LOG READ (Nano, who then had to
+        # discover that NOMOS_KV_I4_BLOCK is set nowhere in the launch path — serve_nomos.sh
+        # defaults NOMOS_KV_INT4:-1 but never the block size, so block-1 was the SILENT DEFAULT
+        # and a fresh box landed on the degenerate arm without anyone opting in).
+        # Log what RESOLVED, not what was requested — the auto-upgrade above can change it.
+        print("[engine] max_seq =", self.max_seq, " precision_bits =", self.precision_bits,
+              " weight_nvfp4 =", self.weight_nvfp4, " w4a4 =", self.w4a4,
+              " kv_quant =", self.kv_quant, " kv_int4 =", self.kv_int4,
+              " kv_i4_block =", 32 if self.kv_int4_block32 else 1, " kv_swa =", self.kv_swa)
+
+        # ── Per-layer geometry tables ─────────────────────────────
+        self.layer_hd = List[Int]()
+        self.layer_nkv = List[Int]()
+        self.layer_qd = List[Int]()
+        self.layer_kvd = List[Int]()
+        self.layer_kvg = List[Int]()
+        self.layer_is_full = List[Bool]()
+        self.layer_cache_cap = List[Int]()
+        for layer in range(TOTAL_LAYERS):
+            if layer % 6 == 5:
+                self.layer_hd.append(FULL_HD)
+                self.layer_nkv.append(4)
+                self.layer_qd.append(NH * FULL_HD)
+                self.layer_kvd.append(4 * FULL_HD)
+                self.layer_kvg.append(NH // 4)
+                self.layer_is_full.append(True)
+                # Full/global layers always keep the whole context (long-range recall).
+                self.layer_cache_cap.append(self.max_seq)
+            else:
+                self.layer_hd.append(HD)
+                self.layer_nkv.append(NKV)
+                self.layer_qd.append(NH * HD)
+                self.layer_kvd.append(NKV * HD)
+                self.layer_kvg.append(NH // NKV)
+                self.layer_is_full.append(False)
+                # Sliding layers cannot read beyond SLIDING_WINDOW. Under SWA, retain only
+                # that logical window in a modulo-addressed ring; non-SWA stays linear.
+                self.layer_cache_cap.append(
+                    SLIDING_WINDOW if self.kv_swa else self.max_seq
+                )
+
+        # RESOLVED ATTENTION GEOMETRY. Print it, do not make anyone infer it from a flag.
+        # 2026-08-04: an SWA A/B was interpreted as "full attention vs approximation" when
+        # NOMOS_KV_SWA does not touch the mask at all -- the window is a MODEL property
+        # (SLIDING_WINDOW, from the HF config) and kv_swa gates only STORAGE. That misreading
+        # survived a build, a run and a commit because the banner printed the flag but never the
+        # geometry the flag does and does not control. Same lesson as kv_i4_block above: a config
+        # mistake must be visible in a LOG READ, not a code read.
+        var n_sliding = 0
+        var n_full = 0
+        for layer in range(TOTAL_LAYERS):
+            if self.layer_is_full[layer]: n_full += 1
+            else: n_sliding += 1
+        print("[engine] attn: sliding_window =", SLIDING_WINDOW,
+              " sliding_layers =", n_sliding, " full_layers =", n_full,
+              " (mask is a MODEL property — kv_swa does NOT change it)")
+        print("[engine] kv storage: sliding_cache_cap =",
+              SLIDING_WINDOW if self.kv_swa else self.max_seq,
+              " full_cache_cap =", self.max_seq,
+              " deq_slide_pitch =", self.deq_slide_pitch)
+
+        # ── Embedding mmap ────────────────────────────────────────
+        var embed_path_bytes = List[UInt8]()
+        var ep = weights_dir + "embed_tokens_weight.bin"
+        for i in range(ep.byte_length()): embed_path_bytes.append(ep.as_bytes()[i])
+        embed_path_bytes.append(0)
+        self.embed_fd = external_call["nomos_open", c_int](
+            embed_path_bytes.unsafe_ptr(), c_int(0), c_int(0))
+        self.embed_size = Int(external_call["nomos_lseek", c_size_t](
+            self.embed_fd, c_size_t(0), c_int(2)))
+        _ = external_call["nomos_lseek", c_size_t](self.embed_fd, c_size_t(0), c_int(0))
+
+        # ── LM head + final norm ──────────────────────────────────
+        # Feature A: in the full-FP4-stack mode (w4a4) the GPU lm-head is NVFP4
+        # (~1.3GB) and the logits GEMM goes through the W4A4 native-MMA path; the
+        # scratch (cpad/in/logits) is allocated with the other W4A4 buffers below.
+        self.embed_global = 0.0
+        self.embed_input_global = 0.0
+        self.d_lmhead_cpad = UInt64(0)
+        self.d_lmhead_in = UInt64(0)
+        self.d_lmhead_logits = UInt64(0)
+        self.d_embed_q4 = UInt64(0)
+        if self.w4a4:
+            var _eg = List[Float32]()
+            var _eag = List[Float32]()
+            self.d_embed_nvfp4 = load_to_gpu_nvfp4(
+                weights_dir + "embed_tokens_weight.nvfp4", _eg, _eag)
+            if self.d_embed_nvfp4 == 0:
+                raise Error(
+                    "NOMOS_W4A4=1 requires embed_tokens_weight.nvfp4; "
+                    "the fp32 embed_tokens_weight.bin is not a valid NVFP4 lm-head fallback"
+                )
+            self.embed_global = _eg[0] if len(_eg) > 0 else Float32(1.0)
+            self.embed_input_global = _eag[0] if len(_eag) > 0 else Float32(0.0)
+            self.d_embed_lmhead = UInt64(0)
+        else:
+            self.d_embed_nvfp4 = UInt64(0)
+            self.d_embed_lmhead = load_to_gpu(weights_dir + "embed_tokens_weight.bin")
+            # dp4a Q4 lm-head (2026-06-27): the fp32 lm-head above is a 5.63 GB
+            # read/token (full-precision creep vs the quant-4 SOP). Load the Q4 blob +
+            # GPU buffers so the lm_head can route to dp4a (engine_decode) when
+            # act_precision()==8. ~792MB Q4, ~4ms/token vs ~30ms fp32.
+            self.d_embed_q4 = load_to_gpu_q4(weights_dir + "embed_tokens_weight.q4")
+            self.d_lmhead_in = cuda_malloc(D * 4)
+            # Fused verify writes up to MAX_VERIFY_ROWS logit rows; decode uses row 0.
+            self.d_lmhead_logits = cuda_malloc(MAX_VERIFY_ROWS * VOCAB * 4)
+        cuda_sync()
+        self.final_norm = read_f32(weights_dir + "norm_weight.bin")
+
+        # ── Per-layer projections (BF16 on H200 unified path) ─────
+        self.d_qw = List[UInt64]()
+        self.d_kw = List[UInt64]()
+        self.d_vw = List[UInt64]()
+        self.d_ow = List[UInt64]()
+        self.d_gw = List[UInt64]()
+        self.d_uw = List[UInt64]()
+        self.d_dw = List[UInt64]()
+        self.d_qw_gs = List[Float32]()
+        self.d_kw_gs = List[Float32]()
+        self.d_vw_gs = List[Float32]()
+        self.d_ow_gs = List[Float32]()
+        self.d_gw_gs = List[Float32]()
+        self.d_uw_gs = List[Float32]()
+        self.d_dw_gs = List[Float32]()
+        self.d_qw_ags = List[Float32]()
+        self.d_kw_ags = List[Float32]()
+        self.d_vw_ags = List[Float32]()
+        self.d_ow_ags = List[Float32]()
+        self.d_gw_ags = List[Float32]()
+        self.d_uw_ags = List[Float32]()
+        self.d_dw_ags = List[Float32]()
+        self.layer_scalars = List[Float32]()
+        var in_norms_h = List[List[Float32]]()
+        var post_attn_h = List[List[Float32]]()
+        var pre_ff_h = List[List[Float32]]()
+        var post_ff_h = List[List[Float32]]()
+        var q_norms_h = List[List[Float32]]()
+        var k_norms_h = List[List[Float32]]()
+
+        for layer in range(TOTAL_LAYERS):
+            var p = weights_dir + "layers_" + String(layer) + "_"
+
+            in_norms_h.append(read_f32(p + "input_layernorm_weight.bin"))
+            post_attn_h.append(read_f32(p + "post_attention_layernorm_weight.bin"))
+            pre_ff_h.append(read_f32(p + "pre_feedforward_layernorm_weight.bin"))
+            post_ff_h.append(read_f32(p + "post_feedforward_layernorm_weight.bin"))
+            q_norms_h.append(read_f32(p + "self_attn_q_norm_weight.bin"))
+            k_norms_h.append(read_f32(p + "self_attn_k_norm_weight.bin"))
+
+            var scalar_data = read_f32(p + "layer_scalar.bin")
+            if len(scalar_data) > 0:
+                self.layer_scalars.append(scalar_data[0])
+            else:
+                self.layer_scalars.append(1.0)
+
+            if self.weight_nvfp4:
+                # NVFP4 weights (W4A16): .nvfp4 blobs + per-tensor fp32 global scales.
+                self.d_qw.append(load_to_gpu_nvfp4(p + "self_attn_q_proj_weight.nvfp4", self.d_qw_gs, self.d_qw_ags))
+                self.d_kw.append(load_to_gpu_nvfp4(p + "self_attn_k_proj_weight.nvfp4", self.d_kw_gs, self.d_kw_ags))
+                if self.layer_is_full[layer]:
+                    self.d_vw.append(UInt64(0))
+                    self.d_vw_gs.append(Float32(0.0))
+                    self.d_vw_ags.append(Float32(0.0))
+                else:
+                    self.d_vw.append(load_to_gpu_nvfp4(p + "self_attn_v_proj_weight.nvfp4", self.d_vw_gs, self.d_vw_ags))
+                self.d_ow.append(load_to_gpu_nvfp4(p + "self_attn_o_proj_weight.nvfp4", self.d_ow_gs, self.d_ow_ags))
+                self.d_gw.append(load_to_gpu_nvfp4(p + "mlp_gate_proj_weight.nvfp4", self.d_gw_gs, self.d_gw_ags))
+                self.d_uw.append(load_to_gpu_nvfp4(p + "mlp_up_proj_weight.nvfp4", self.d_uw_gs, self.d_uw_ags))
+                self.d_dw.append(load_to_gpu_nvfp4(p + "mlp_down_proj_weight.nvfp4", self.d_dw_gs, self.d_dw_ags))
+            elif self.precision_bits == 4:
+                # 4-bit weights: load packed Q4_0 blobs (.q4). Same arch, ~17GB total.
+                self.d_qw.append(load_to_gpu_q4(p + "self_attn_q_proj_weight.q4"))
+                self.d_kw.append(load_to_gpu_q4(p + "self_attn_k_proj_weight.q4"))
+                if self.layer_is_full[layer]:
+                    self.d_vw.append(UInt64(0))
+                else:
+                    self.d_vw.append(load_to_gpu_q4(p + "self_attn_v_proj_weight.q4"))
+                self.d_ow.append(load_to_gpu_q4(p + "self_attn_o_proj_weight.q4"))
+                self.d_gw.append(load_to_gpu_q4(p + "mlp_gate_proj_weight.q4"))
+                self.d_uw.append(load_to_gpu_q4(p + "mlp_up_proj_weight.q4"))
+                self.d_dw.append(load_to_gpu_q4(p + "mlp_down_proj_weight.q4"))
+            else:
+                self.d_qw.append(load_to_gpu_bf16(p + "self_attn_q_proj_weight.bin"))
+                self.d_kw.append(load_to_gpu_bf16(p + "self_attn_k_proj_weight.bin"))
+                if self.layer_is_full[layer]:
+                    self.d_vw.append(UInt64(0))
+                else:
+                    self.d_vw.append(load_to_gpu_bf16(p + "self_attn_v_proj_weight.bin"))
+                self.d_ow.append(load_to_gpu_bf16(p + "self_attn_o_proj_weight.bin"))
+                self.d_gw.append(load_to_gpu_bf16(p + "mlp_gate_proj_weight.bin"))
+                self.d_uw.append(load_to_gpu_bf16(p + "mlp_up_proj_weight.bin"))
+                self.d_dw.append(load_to_gpu_bf16(p + "mlp_down_proj_weight.bin"))
+        cuda_sync()
+
+        # ── Upload norm weights to device ─────────────────────────
+        self.d_in_norms = List[UInt64]()
+        self.d_post_attn_norms = List[UInt64]()
+        self.d_pre_ff_norms = List[UInt64]()
+        self.d_post_ff_norms = List[UInt64]()
+        self.d_q_norms = List[UInt64]()
+        self.d_k_norms = List[UInt64]()
+        for layer in range(TOTAL_LAYERS):
+            var d_in = cuda_malloc(D * 4); cuda_upload(d_in, in_norms_h[layer]); self.d_in_norms.append(d_in)
+            var d_pa = cuda_malloc(D * 4); cuda_upload(d_pa, post_attn_h[layer]); self.d_post_attn_norms.append(d_pa)
+            var d_pf = cuda_malloc(D * 4); cuda_upload(d_pf, pre_ff_h[layer]); self.d_pre_ff_norms.append(d_pf)
+            var d_pof = cuda_malloc(D * 4); cuda_upload(d_pof, post_ff_h[layer]); self.d_post_ff_norms.append(d_pof)
+            var d_qn = cuda_malloc(self.layer_hd[layer] * 4); cuda_upload(d_qn, q_norms_h[layer]); self.d_q_norms.append(d_qn)
+            var d_kn = cuda_malloc(self.layer_hd[layer] * 4); cuda_upload(d_kn, k_norms_h[layer]); self.d_k_norms.append(d_kn)
+        cuda_sync()
+
+        # ── KV caches: bytes/elem per precision_bits (32=fp32→4B, 16=bf16→2B).
+        # bf16 halves the ~40GB cache → frees VRAM to raise MAX_SEQ. ───────
+        # KV cache packed to the TRUE per-layer geometry (layer_nkv × max_seq × layer_hd),
+        # NOT the uniform NKV×FULL_HD: sliding layers use head_dim 256 (not 512), full layers
+        # use 4 KV heads (not 16). The padding was dead (Q·Kᵀ contracts over the real l_hd),
+        # so this is byte-identical + ~2.18× smaller. The dequant scratch is sized to the
+        # worst-case per-layer slot (NKV×HD = 16×256 = the sliding layer, the max).
+        var kv_bytes = 2 if self.precision_bits <= 16 else 4
+        self.d_k_cache = List[UInt64]()
+        self.d_v_cache = List[UInt64]()
+        self.d_k_cache_i8 = List[UInt64]()
+        self.d_v_cache_i8 = List[UInt64]()
+        self.d_k_scales = List[UInt64]()
+        self.d_v_scales = List[UInt64]()
+        self.d_k_deq = UInt64(0)
+        self.d_v_deq = UInt64(0)
+        if self.kv_quant:
+            # INT8 cache (1 byte/elem) + per-(head,pos) fp32 scales + a 1-layer bf16 dequant
+            # scratch. The big bf16 cache is NOT allocated.
+            for layer in range(TOTAL_LAYERS):
+                # #430: sliding layers are a ring of layer_cache_cap (=SLIDING_WINDOW
+                # under SWA) slots, not max_seq → the footprint win. Full layers + the
+                # non-SWA path keep cache_cap == max_seq (identical alloc to pre-#430).
+                var ccap = self.layer_cache_cap[layer]
+                var slot = self.layer_nkv[layer] * ccap * self.layer_hd[layer]
+                if self.kv_int4: slot = slot // 2   # Feature B: 2 nibbles/byte
+                self.d_k_cache_i8.append(cuda_malloc(slot))
+                self.d_v_cache_i8.append(cuda_malloc(slot))
+                var scale_blocks = (self.layer_hd[layer] + 31) // 32 if self.kv_int4_block32 else 1
+                var scale_rows = self.layer_nkv[layer] * ccap
+                var scale_bytes = (scale_rows * scale_blocks * 2 + scale_rows * 4) if self.kv_int4_block32 else (scale_rows * 4)
+                self.d_k_scales.append(cuda_malloc(scale_bytes))
+                self.d_v_scales.append(cuda_malloc(scale_bytes))
+            # Dequant scratch: per-layer pitch = max_seq for full layers (they dequant the
+            # whole context) but SLIDING_WINDOW for sliding layers UNDER SWA (they only ever
+            # dequant the window, packed tight at that pitch — byte-identical since the
+            # attention GEMM reads the same window keys, just denser). Sized to the largest
+            # single-layer need; under SWA that is the full layer (4·max_seq·512) not the
+            # sliding layer (16·max_seq·256), so 4096·max_seq → 2048·max_seq (≈4.0GB→2.1GB
+            # @256k). Non-SWA keeps max_seq pitch everywhere (no shrink).
+            var deq_full = 4 * self.max_seq * FULL_HD              # full layer: 4 KV heads × max_seq × 512
+            var deq_slide = NKV * self.deq_slide_pitch * HD        # sliding: 16 KV heads × pitch × 256
+            var deq_elems = deq_full if deq_full > deq_slide else deq_slide
+            # The production INT4 path losslessly widens nibbles to Int8 before
+            # attention. These buffers used to retain the obsolete BF16 width,
+            # wasting deq_elems bytes apiece. Legacy BF16 dequant keeps 2 bytes.
+            var deq_elem_bytes = 1 if (self.kv_int4 and self.precision_bits <= 16 and act_precision() == 8) else 2
+            self.d_k_deq = cuda_malloc(deq_elems * deq_elem_bytes)
+            self.d_v_deq = cuda_malloc(deq_elems * deq_elem_bytes)
+        else:
+            for layer in range(TOTAL_LAYERS):
+                var lpb = self.layer_nkv[layer] * self.max_seq * self.layer_hd[layer] * kv_bytes
+                self.d_k_cache.append(cuda_malloc(lpb))
+                self.d_v_cache.append(cuda_malloc(lpb))
+        self.cache_lens_fp32 = List[Int](capacity=TOTAL_LAYERS)
+        for _ in range(TOTAL_LAYERS): self.cache_lens_fp32.append(0)
+        self.kv_continue = False
+
+        # ── Per-token scratch buffers ────────────────────────────
+        var max_qd = NH * FULL_HD
+        var max_kvd = NKV * HD
+        self.d_x_buf = cuda_malloc(D * 4)
+        self.d_normed_buf = cuda_malloc(D * 4)
+        self.d_q_buf = cuda_malloc(max_qd * 4)
+        self.d_k_new_buf = cuda_malloc(max_kvd * 4)
+        self.d_v_new_buf = cuda_malloc(max_kvd * 4)
+        self.d_o_out_buf = cuda_malloc(D * 4)
+        self.d_pn_buf = cuda_malloc(D * 4)
+        self.d_gate_buf = cuda_malloc(FF * 4)
+        self.d_up_buf = cuda_malloc(FF * 4)
+        self.d_mlp_v_buf = cuda_malloc(FF * 4)
+        self.d_down_buf = cuda_malloc(FF * 4)
+
+        # ── Attention scratch ─────────────────────────────────────
+        self.d_q_gpu = cuda_malloc(NH * FULL_HD * 4)
+        self.d_scores_scratch = cuda_malloc(NH * self.max_seq * 4)
+        self.d_attn_out_scratch = cuda_malloc(NH * FULL_HD * 4)
+        # bf16 attention scratch (tiny vs the cache; always allocated, used only when
+        # precision_bits<=16). Half-byte mirrors of d_q_gpu / d_scores_scratch / d_k_new.
+        var q_bf16_bytes = NH * FULL_HD * 2
+        var k_scale_scratch_bytes = NKV * self.max_seq * 4
+        if k_scale_scratch_bytes > q_bf16_bytes:
+            q_bf16_bytes = k_scale_scratch_bytes
+        self.d_q_bf16 = cuda_malloc(q_bf16_bytes)
+        self.d_scores_bf16 = cuda_malloc(NH * self.max_seq * 2)
+        self.d_k_bf16 = cuda_malloc(max_kvd * 2)
+        self.d_v_bf16 = cuda_malloc(max_kvd * 2)
+
+        # ── Matmul scratch ────────────────────────────────────────
+        self.d_matmul_in_bf16 = cuda_malloc(FF * 2)
+        # Q4 dequant scratch: largest weight (D*FF) in BF16, reused per GEMM. Only
+        # when precision_bits==4 (else 0, never touched by the bf16 path).
+        # Q4/W4A16 weight-dequant scratch (largest weight D*FF in bf16). NOT needed under W4A4:
+        # the W4A4 GEMM reads FP4 directly (the W4A16 dequant->bf16->cuBLAS branch is never taken
+        # when w4a4.on). Skipping it under W4A4 frees ~220MB toward the 24GB edge fit.
+        self.d_weight_bf16_scratch = (cuda_malloc(D * FF * 2) if ((self.precision_bits == 4 or self.weight_nvfp4) and not self.w4a4) else UInt64(0))
+        # W4A4 act/MMA scratch: rows = the prefill worst case (mpad = ceil(max_seq/16)*16,
+        # which also covers decode's Mpad=16); cols = worst-case K,N (=FF). packed=K/2 u8,
+        # bs=K/16 u8, global=fp32, cpad=N fp32. ~1.6 MB/row-group; 0 when W4A4 off.
+        # #431: sized to the PREFILL CHUNK (w4a4_chunk_mpad rows), not max_seq — the GEMM
+        # processes the prompt in row-chunks of this many MMA rows, so cpad drops from
+        # ~max_seq*FF*4 (≈22GB @256k) to ~chunk*FF*4 (≈176MB @chunk=2048). Decode (M=1) and
+        # prompts <= chunk run as a single chunk = the original path.
+        var w4a4_mpad = self.w4a4_chunk_mpad
+        if self.w4a4:
+            self.d_w4a4_packed = cuda_malloc(w4a4_mpad * (FF // 2))
+            self.d_w4a4_bs = cuda_malloc(w4a4_mpad * (FF // 16))
+            self.d_w4a4_global = cuda_malloc(w4a4_mpad * 4)
+            self.d_w4a4_cpad = cuda_malloc(w4a4_mpad * FF * 4)
+            # sm_100 (B200) tcgen05 SF-atom scale scratch (harmless extra alloc on sm_120):
+            #   act: worst-case MN=w4a4_mpad, NB=FF/16 -> ceil(MN/128)*ceil(NB/4)*32*4*4.
+            #   weight: worst-case over ALL weights (N<=VOCAB, K<=FF) -> bulletproof size.
+            self.d_w4a4_bs_sf = cuda_malloc(
+                ((w4a4_mpad + 127) // 128) * (((FF // 16) + 3) // 4) * (32 * 4 * 4))
+            self.d_w4a4_wbs_sf = cuda_malloc(
+                ((VOCAB + 127) // 128) * (((FF // 16) + 3) // 4) * (32 * 4 * 4))
+            # Feature A lm-head W4A4 scratch: the act buffers above already fit
+            # K=D<FF, but the raw-MMA C output is [Mpad, VOCAB] (VOCAB>>FF), so the
+            # lm-head needs its own cpad. sm_100 pads M=1 -> 128 (vs 16 on sm_120), so
+            # size to 128 rows always (134MB; +117MB vs 16 — trivial on Blackwell).
+            self.d_lmhead_cpad = cuda_malloc(128 * VOCAB * 4)  # Mpad up to 128 (sm_100)
+            self.d_lmhead_in = cuda_malloc(D * 4)
+            # [MAX_VERIFY_ROWS, VOCAB]: decode writes row 0; the BATCHED spec-verify
+            # readout writes all S rows in one M=S lm-head GEMM (mirrors the q4/MTP path
+            # at line 339). Sized VOCAB (1 row) before -> the M=S batched write overflowed.
+            self.d_lmhead_logits = cuda_malloc(MAX_VERIFY_ROWS * VOCAB * 4)
+        else:
+            self.d_w4a4_packed = UInt64(0)
+            self.d_w4a4_bs = UInt64(0)
+            self.d_w4a4_global = UInt64(0)
+            self.d_w4a4_cpad = UInt64(0)
+            self.d_w4a4_bs_sf = UInt64(0)
+            self.d_w4a4_wbs_sf = UInt64(0)
+
+        # (research-only init removed)
+
+        # RESERVED-footprint accounting (the number the DISCRETE 24GB edge card must fit —
+        # GB10 unified lazy-commit makes `free` under-report it). Sums the max_seq-scaled
+        # allocations exactly; weights are a separate ~16.5GB NVFP4 constant (printed apart).
+        var _kv_b = 0
+        for _L in range(TOTAL_LAYERS):
+            var _cc = self.layer_cache_cap[_L]
+            var _slot = self.layer_nkv[_L] * _cc * self.layer_hd[_L]
+            if self.kv_int4: _slot = _slot // 2
+            _kv_b += 2 * _slot + 2 * (self.layer_nkv[_L] * _cc * 4)   # K+V cache + K+V scales
+        var _deq_full = 4 * self.max_seq * FULL_HD
+        var _deq_slide = NKV * self.deq_slide_pitch * HD
+        var _deq_elems = _deq_full if _deq_full > _deq_slide else _deq_slide
+        var _deq_elem_b = 1 if (self.kv_int4 and self.precision_bits <= 16 and act_precision() == 8) else 2
+        var _deq_b = 2 * _deq_elems * _deq_elem_b
+        var _w4_b = 0
+        if self.w4a4:
+            var _cm = self.w4a4_chunk_mpad
+            _w4_b = _cm * (FF // 2) + _cm * (FF // 16) + _cm * 4 + _cm * FF * 4 + 16 * VOCAB * 4
+        var _attn_b = NH * self.max_seq * 4 + NH * self.max_seq * 2
+        var _wbf_b = (D * FF * 2) if ((self.precision_bits == 4 or self.weight_nvfp4) and not self.w4a4) else 0
+        var _mb = 1024 * 1024
+        var _scaled_mb = (_kv_b + _deq_b + _w4_b + _attn_b + _wbf_b) // _mb
+        # MEASURED footprint (2026-08-01). The old report hardcoded a `du` constant for
+        # weights and printed 0 on the Q4 path — fiction you cannot size a 24 GB card
+        # against. These come from cudaMemGetInfo: `engine` is this engine's own delta,
+        # `device` is everything resident (incl. CUDA context, cuBLAS, other processes).
+        # Exact on discrete cards; GB10's lazy-commit unified pool under-reports (floor).
+        var _free_now = cuda_mem_free_bytes()
+        var _total_mb = cuda_mem_total_bytes() // _mb
+        var _free_mb = _free_now // _mb
+        var _engine_mb = (_free_baseline - _free_now) // _mb
+        var _device_used_mb = _total_mb - _free_mb
+        print("[footprint] @max_seq", self.max_seq, "(MiB): KV =", _kv_b // _mb,
+              " deq =", _deq_b // _mb, " w4a4_scratch =", _w4_b // _mb,
+              " attn_scratch =", _attn_b // _mb, " wt_bf16_scratch =", _wbf_b // _mb,
+              " | scaled-subtotal(est) =", _scaled_mb, "MiB")
+        print("[footprint] MEASURED: engine =", _engine_mb, "MiB | device used =",
+              _device_used_mb, "MiB of", _total_mb, "MiB | FREE =", _free_mb, "MiB (",
+              (_free_mb * 100) // (_total_mb if _total_mb > 0 else 1), "% headroom )")
+        # Self-flag the unified-memory case: if the measured delta does not even cover
+        # the scratch estimate, the weights were lazily committed and NOT counted. Say
+        # so, or a reader will take a 1 GB delta for a 17 GB model as a real fit number.
+        if _engine_mb < _scaled_mb:
+            print("[footprint] NOTE: measured engine delta <", _scaled_mb,
+                  "MiB estimate => unified-memory lazy commit is UNDER-REPORTING",
+                  "(weights not yet committed). This number is a FLOOR, not the fit.",
+                  "Size discrete-card fit on a discrete card.")
+
+        # MTP spec-decode drafter: loaded lazily via nomos_mtp_load (host passes the
+        # assistant weights dir). 0 = not loaded — the base serving path pays nothing.
+        self.mtp_ptr = UInt64(0)
+        self.d_eagle3_tap_out = UInt64(0)   # drafter taps dormant until a drafter arms them
+        self.d_eagle3_tap_rows_out = UInt64(0)  # fused-verify tap rows dormant until load
+        self.drafter_tap_count = 0
+        self.drafter_tap_layers = List[Int]()
+        self.eagle3_ptr = UInt64(0)         # EAGLE-3 drafter not loaded until nomos_eagle3_load
+        self.dflash_ptr = UInt64(0)         # DFlash drafter not loaded until nomos_dflash_load
+
+    def clear_drafter_taps(mut self):
+        self.d_eagle3_tap_out = UInt64(0)
+        self.d_eagle3_tap_rows_out = UInt64(0)
+        self.drafter_tap_count = 0
+        self.drafter_tap_layers = List[Int]()
+
+    def configure_drafter_taps(mut self, d_live_taps: UInt64, d_row_taps: UInt64, tap_layers: List[Int]):
+        self.d_eagle3_tap_out = d_live_taps
+        self.d_eagle3_tap_rows_out = d_row_taps
+        self.drafter_tap_layers = List[Int]()
+        for i in range(len(tap_layers)):
+            self.drafter_tap_layers.append(tap_layers[i])
+        self.drafter_tap_count = len(self.drafter_tap_layers)
+
+    def drafter_tap_slot(self, layer: Int) -> Int:
+        var n = self.drafter_tap_count
+        if n > len(self.drafter_tap_layers):
+            n = len(self.drafter_tap_layers)
+        var i = 0
+        while i < n:
+            if layer == self.drafter_tap_layers[i]:
+                return i
+            i += 1
+        return -1
+
+    def prefill_batch(
+        mut self, tokens: List[Int], start_pos: Int = 0, dflash_context_append: Bool = False,
+        chunk_prefix: Bool = False,
+    ) raises:
+        """Batched prefill: process the prompt (minus its last token) through
+        all 60 layers as one [S,d] batch, populating the KV cache at start_pos.
+        start_pos>0 = KV reuse (append suffix attending the cached prefix). Body
+        in lib/engine_prefill.prefill_batch_impl.
+
+        chunk_prefix=True (chunked-prefill driver ONLY): offset chunks take the
+        batched PREFIX attention route instead of the per-token fallback. An
+        EXPLICIT parameter, never inferred from env, so spec-VERIFY calls into the
+        same impl keep their own routing untouched — verify's prefix route stays
+        gated by NOMOS_VERIFY_BLOCK_ATTN exactly as before."""
+        prefill_batch_impl(
+            self,
+            tokens,
+            start_pos,
+            dflash_context_append=dflash_context_append,
+            chunk_prefix=chunk_prefix,
+        )
+    def run_inference(
+        mut self,
+        prompt: List[Int],
+        max_new_tokens: Int,
+        store_mode: Bool,
+        mut out_tokens: List[Int],
+        cb_id: Int64 = Int64(0),
+    ) raises:
+        """Run prefill + decode (or store mode), appending generated token
+        IDs to out_tokens. Body lives in lib/engine_decode.run_inference_impl;
+        cb_id!=0 enables per-token Go streaming via nomos_token_cb."""
+        run_inference_impl(self, prompt, max_new_tokens, store_mode, out_tokens, cb_id)
+
+    def prefill_logits(mut self, prompt: List[Int], logits_out: Int64) raises:
+        """Logits-engine path (Python host): prefill `prompt`, write the last-position
+        logits[VOCAB] (fp32, post-softcap) to logits_out, and sample NOTHING. The KV
+        cache persists for subsequent step_logits calls."""
+        self.kv_continue = False
+        var dummy = List[Int]()
+        run_inference_impl(self, prompt, 0, False, dummy, Int64(0), logits_out)
+
+    def step_logits(mut self, token: Int, logits_out: Int64) raises:
+        """Logits-engine path (Python host): append one `token` at the current cache
+        position (continuing the held KV), write the next logits[VOCAB] to logits_out,
+        and sample NOTHING."""
+        self.kv_continue = True
+        var p = List[Int]()
+        p.append(token)
+        var dummy = List[Int]()
+        run_inference_impl(self, p, 0, False, dummy, Int64(0), logits_out)
+
+    def step_token(mut self, token: Int, fast_token_out: Int64) raises:
+        """Perf Lever A: append one `token`, run the decode forward (same as
+        step_logits, leaving d_lmhead_logits on device), then on-device softcap+argmax;
+        write the chosen greedy token (Int32) to fast_token_out. NO VOCAB host copy.
+        Greedy fast-path only (sampling/grammar use step_logits)."""
+        self.kv_continue = True
+        var p = List[Int]()
+        p.append(token)
+        var dummy = List[Int]()
+        run_inference_impl(self, p, 0, False, dummy, Int64(0), Int64(0), fast_token_out)
+
+    def debug_decode_qkv_source(
+        mut self,
+        token: Int,
+        layer: Int,
+        normed_out: Int64,
+        k_out: Int64,
+        v_out: Int64,
+    ) raises:
+        """Append no KV at `layer`; dump decode-path normed/K/V source rows after
+        prepare_qkv_dev and before the append kernel. The caller positions KV first."""
+        self.kv_continue = True
+        var p = List[Int]()
+        p.append(token)
+        var dummy = List[Int]()
+        run_inference_impl(
+            self, p, 0, False, dummy, Int64(0), Int64(0), Int64(0),
+            layer, normed_out, k_out, v_out,
+        )
+
+    def debug_decode_omlp_stage(
+        mut self,
+        token: Int,
+        layer: Int,
+        stage: Int,
+        out_ptr: Int64,
+    ) raises:
+        """Dump one decode-path O/MLP stage for `token` at `layer`.
+
+        stage: 0 attn_out, 1 o_proj, 2 post_attn_norm, 3 x_post_attn,
+        4 pre_ff_norm, 5 down_proj, 6 post_ff_norm, 7 layer_out,
+        8 post-RoPE Q, 9 q8-Q-as-f32 plus q-scale tail,
+        10 K/V q8 views, 11 raw packed INT4 K/V source, 12 QK scores.
+        The caller positions KV first."""
+        self.kv_continue = True
+        var p = List[Int]()
+        p.append(token)
+        var dummy = List[Int]()
+        run_inference_impl(
+            self, p, 0, False, dummy, Int64(0), Int64(0), Int64(0),
+            -1, Int64(0), Int64(0), Int64(0),
+            layer, stage, out_ptr,
+        )
+
+    def verify_forward(mut self, drafts: List[Int], out_g: Int64) raises:
+        """Spec-decode 1b: ONE batched forward over the K draft tokens at the current cache
+        position (KV-continue), writing each draft position's greedy argmax g_0..g_{K-1} (Int32)
+        to out_g — vs K sequential decode_steps. Leaves KV at cache_len+K; caller rolls back via
+        set_cache_len(L + accepted). g_p = greedy token predicting position L+p+1; host accepts
+        q_p iff q_p == g_{p-1} (g_{-1}=argmax(prev_logits) held by the host)."""
+        var L = self.cache_lens_fp32[0]
+        prefill_batch_impl(self, drafts, L, out_g)
+
+    def set_cache_len(mut self, n: Int):
+        """KV reuse: set every layer's cache valid length to n (truncate/position). The KV
+        memory [0,n) stays valid; the next append goes at n. SWA-off (linear cache) only."""
+        for l in range(TOTAL_LAYERS):
+            self.cache_lens_fp32[l] = n
+
+    def prefill_cont_logits(mut self, suffix: List[Int], logits_out: Int64) raises:
+        """KV reuse: prefill `suffix` at the CURRENT cache position (continue mode), attending
+        the held prefix [0,cache_len). Writes last-position logits[VOCAB], samples NOTHING. The
+        caller positions the cache to the common-prefix length via set_cache_len() first."""
+        self.kv_continue = True
+        var dummy = List[Int]()
+        run_inference_impl(self, suffix, 0, False, dummy, Int64(0), logits_out)
+
+    def cache_len(self) -> Int:
+        """Current KV cache length (positions filled), read from layer 0."""
+        return self.cache_lens_fp32[0]
+
+    def reset_kv_cache(mut self):
+        """Restore fresh-init KV state for a NEW stateless request. CALLER-GATED
+        (the `fresh` boundary, via nomos_reset_kv). Multi-turn callers must NOT
+        call this between turns — it wipes the conversation cache. Zeros only
+        positions 0..max(cache_lens) per head (cheap, one cudaMemset2D per
+        buffer) so a reused engine starts each inject/generate byte-identical to
+        a fresh init; then clears lengths + kv_continue."""
+        var p = 0
+        for l in range(TOTAL_LAYERS):
+            if self.cache_lens_fp32[l] > p:
+                p = self.cache_lens_fp32[l]
+        if p > 0 and not self.kv_quant:
+            # bf16/fp32 cache only — the kv_quant (INT4) path keeps no d_k_cache (uses
+            # d_k_cache_i8); zeroing cache_lens below is sufficient there (the next prefill
+            # overwrites [0,L) before any read, and reads are gated by cache_lens).
+            var kvb = 2 if self.precision_bits <= 16 else 4   # bf16 cache = 2 bytes/elem
+            var pitch = self.max_seq * FULL_HD * kvb
+            var width = p * FULL_HD * kvb
+            for l in range(TOTAL_LAYERS):
+                cuda_memset_2d(self.d_k_cache[l], pitch, 0, width, NKV)
+                cuda_memset_2d(self.d_v_cache[l], pitch, 0, width, NKV)
+            cuda_sync()
+        for l in range(TOTAL_LAYERS):
+            self.cache_lens_fp32[l] = 0
+        self.kv_continue = False
+
+    # (research delegators removed — perf-clean product tree)
+
+
+
+
+def _env_float(name: String, default: Float32) -> Float32:
+    """Parse a simple decimal env var (e.g. "0.2", "1.05", "0", "-1") to Float32.
+    Returns `default` if unset or empty. Byte-level parse to sidestep Mojo 1.0's
+    missing String(bytes=...) constructor."""
+    var b = _read_env_bytes(name)
+    if len(b) == 0:
+        return default
+    var i = 0
+    var sign: Float32 = 1.0
+    if b[0] == 45:  # '-'
+        sign = -1.0
+        i = 1
+    var intpart: Float32 = 0.0
+    while i < len(b) and b[i] >= 48 and b[i] <= 57:
+        intpart = intpart * 10.0 + Float32(Int(b[i]) - 48)
+        i += 1
+    var frac: Float32 = 0.0
+    var scale: Float32 = 0.1
+    if i < len(b) and b[i] == 46:  # '.'
+        i += 1
+        while i < len(b) and b[i] >= 48 and b[i] <= 57:
+            frac += Float32(Int(b[i]) - 48) * scale
+            scale *= 0.1
+            i += 1
+    return sign * (intpart + frac)
+
+
+
+
+def init_engine_handle(weights_dir: String) raises -> UInt64:
+    """Allocate a GemmaEngine on the heap, run __init__, return its address.
+
+    Caller owns the handle and must call `release_engine_handle` when done.
+    """
+    from std.memory import alloc
+    var ptr = alloc[GemmaEngine](1)
+    ptr.init_pointee_move(GemmaEngine(weights_dir))
+    return UInt64(Int(ptr))
+
+
+def release_engine_handle(handle: UInt64):
+    """Free a GemmaEngine allocated by init_engine_handle. Walks every device
+    pointer and cuda_frees it before deallocating the host struct.
+
+    This matters because if the cgo process is killed and CUDA memory isn't
+    explicitly freed, the NVIDIA driver leaves a zombie allocation that holds
+    GPU memory until the next reboot. The next process that allocates ends
+    up with whatever fragmented memory remains, which is too small for the
+    31B weights — it loads garbage and produces vocab-salad output.
+    """
+    if handle == 0:
+        return
+    var ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+
+    # Free per-layer weight pointers
+    for layer in range(TOTAL_LAYERS):
+        if ptr[0].d_qw[layer] != 0: cuda_free(ptr[0].d_qw[layer])
+        if ptr[0].d_kw[layer] != 0: cuda_free(ptr[0].d_kw[layer])
+        if ptr[0].d_vw[layer] != 0: cuda_free(ptr[0].d_vw[layer])
+        if ptr[0].d_ow[layer] != 0: cuda_free(ptr[0].d_ow[layer])
+        if ptr[0].d_gw[layer] != 0: cuda_free(ptr[0].d_gw[layer])
+        if ptr[0].d_uw[layer] != 0: cuda_free(ptr[0].d_uw[layer])
+        if ptr[0].d_dw[layer] != 0: cuda_free(ptr[0].d_dw[layer])
+        cuda_free(ptr[0].d_in_norms[layer])
+        cuda_free(ptr[0].d_post_attn_norms[layer])
+        cuda_free(ptr[0].d_pre_ff_norms[layer])
+        cuda_free(ptr[0].d_post_ff_norms[layer])
+        cuda_free(ptr[0].d_q_norms[layer])
+        cuda_free(ptr[0].d_k_norms[layer])
+        if ptr[0].kv_quant:
+            cuda_free(ptr[0].d_k_cache_i8[layer])
+            cuda_free(ptr[0].d_v_cache_i8[layer])
+            cuda_free(ptr[0].d_k_scales[layer])
+            cuda_free(ptr[0].d_v_scales[layer])
+        else:
+            cuda_free(ptr[0].d_k_cache[layer])
+            cuda_free(ptr[0].d_v_cache[layer])
+
+    # LM head + final norm
+    if ptr[0].d_embed_lmhead != 0:
+        cuda_free(ptr[0].d_embed_lmhead)
+    if ptr[0].d_embed_nvfp4 != 0: cuda_free(ptr[0].d_embed_nvfp4)
+    if ptr[0].d_lmhead_cpad != 0: cuda_free(ptr[0].d_lmhead_cpad)
+    if ptr[0].d_lmhead_in != 0: cuda_free(ptr[0].d_lmhead_in)
+    if ptr[0].d_lmhead_logits != 0: cuda_free(ptr[0].d_lmhead_logits)
+
+    # Per-token scratch
+    cuda_free(ptr[0].d_x_buf)
+    cuda_free(ptr[0].d_normed_buf)
+    cuda_free(ptr[0].d_q_buf)
+    cuda_free(ptr[0].d_k_new_buf)
+    cuda_free(ptr[0].d_v_new_buf)
+    cuda_free(ptr[0].d_o_out_buf)
+    cuda_free(ptr[0].d_pn_buf)
+    cuda_free(ptr[0].d_gate_buf)
+    cuda_free(ptr[0].d_up_buf)
+    cuda_free(ptr[0].d_mlp_v_buf)
+    cuda_free(ptr[0].d_down_buf)
+
+    # Attention scratch
+    cuda_free(ptr[0].d_q_gpu)
+    cuda_free(ptr[0].d_scores_scratch)
+    cuda_free(ptr[0].d_attn_out_scratch)
+    cuda_free(ptr[0].d_q_bf16)
+    cuda_free(ptr[0].d_scores_bf16)
+    cuda_free(ptr[0].d_k_bf16)
+    cuda_free(ptr[0].d_v_bf16)
+
+    # Matmul scratch
+    cuda_free(ptr[0].d_matmul_in_bf16)
+    if ptr[0].d_weight_bf16_scratch != 0: cuda_free(ptr[0].d_weight_bf16_scratch)
+    if ptr[0].d_w4a4_packed != 0: cuda_free(ptr[0].d_w4a4_packed)
+    if ptr[0].d_w4a4_bs != 0: cuda_free(ptr[0].d_w4a4_bs)
+    if ptr[0].d_w4a4_global != 0: cuda_free(ptr[0].d_w4a4_global)
+    if ptr[0].d_w4a4_cpad != 0: cuda_free(ptr[0].d_w4a4_cpad)
+    if ptr[0].d_w4a4_bs_sf != 0: cuda_free(ptr[0].d_w4a4_bs_sf)
+    if ptr[0].d_w4a4_wbs_sf != 0: cuda_free(ptr[0].d_w4a4_wbs_sf)
+    if ptr[0].d_k_deq != 0: cuda_free(ptr[0].d_k_deq)
+    if ptr[0].d_v_deq != 0: cuda_free(ptr[0].d_v_deq)
+
+    # Sync to make sure all frees actually flush before we deallocate the struct
+    cuda_sync()
+
+    ptr.destroy_pointee()
+    ptr.free()

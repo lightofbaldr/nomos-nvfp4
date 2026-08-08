@@ -1,0 +1,9 @@
+#!/bin/bash
+# CI cleanliness gate: the product .so must export ONLY the perf keep-list (+ libc/callback shims).
+# Whitelist-based (lists what's ALLOWED, never what's forbidden) so the gate itself stays clean.
+set -e
+SO="${1:-libnomos_kernel.so}"
+ALLOW='^nomos_(init|shutdown|prefill|prefill_cont|decode_step|decode_step_token|mtp_load|mtp_draft|mtp_verify|verify_fused|verify_exact_next_token|debug_prefill_all_layers|debug_kv_block32_q8_ab|debug_kv_append_ab|debug_kv_append_overwrite_ab|debug_qkv_source_ab|debug_omlp_stage_ab|eagle3_load|eagle3_draft|eagle3_draft_from_taps|eagle3_head_logits|eagle3_draft_trace|eagle3_verify_fused|eagle3_select_verify_tap|eagle3_commit|eagle3_get_taps|eagle3_get_verify_taps|eagle3_reset|dflash_load|dflash_get_taps|dflash_project_context|dflash_forward_synth|dflash_verify_fused|dflash_append_verify_context|dflash_cache_len|dflash_set_len|dflash_reset|dflash_draft_block|lm_draft_load|lm_draft_load_with_target|lm_draft_shutdown|lm_draft_prefill|lm_draft_step_token|lm_draft_draft|lm_draft_draft_conf|lm_draft_draft_until|lm_draft_cache_len|lm_draft_set_len|lm_draft_reset|lm_draft_debug_prefill|lm_draft_debug_prefill_layer|lm_draft_debug_prefill_layer_attn|generate|generate_stream|version|kv_cache_len|kv_set_len|reset_kv|strict_violation_count|strict_violation_mask|strict_reset|violation_count|violation_mask|reset_violations|flag_violation|env_flag_cached|blend_cb|token_cb|fopen|fclose|fread|fwrite|fsync|fdopen|fflush|open|close|read|write|recv|send|mmap|munmap|lseek|mkdir|pread)$'
+BAD=$(nm -D "$SO" 2>/dev/null | grep ' T nomos_' | awk '{print $3}' | grep -vE "$ALLOW" || true)
+if [ -n "$BAD" ]; then echo "FAIL: $SO exports outside the perf keep-list:"; echo "$BAD"; exit 1; fi
+echo "OK: $SO exports only the perf keep-list ($(nm -D "$SO" | grep -c ' T nomos_') symbols)"

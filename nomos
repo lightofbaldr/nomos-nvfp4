@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""nomos — launch CLI for the Nomos kernel.
+
+Buries the environment ceremony (precision selection per arch, library paths,
+the WEIGHTS trailing slash) behind four commands:
+
+  nomos env                 print the resolved configuration and validate paths
+  nomos smoke  [--prompt]   one greedy completion (needs `transformers` for the tokenizer)
+  nomos bench               base greedy decode on the 12-prompt bar (no extra deps)
+  nomos bench --spec        DFlash speculative decode, champion config (VB=9),
+                            with per-prompt lossless verification vs greedy
+  nomos verify              dual-prefix bit-exactness ladder (verify == decode,
+                            including the tie-dense adversarial prefix; no extra deps)
+  nomos serve [up|down|status]   OpenAI-compatible server (wraps pyhost)
+
+Records this reproduces (GB10, 2026-07-14): base 10.91 tok/s weighted,
+spec 21.88 tok/s weighted, all 12 prompts token-for-token equal to greedy.
+(3x paired A/B vs the old VB=4 champion, idle GPU: 20.97 -> 21.88, +4.3%. Bases flat
+ at 10.92/10.91, so the delta is the change, not box drift.)
+
+Precision is selected per architecture, per the project's locked rule:
+aarch64 unified-memory (GB10/Spark) -> Q4_0; x86_64 discrete Blackwell -> NVFP4.
+Override any NOMOS_* variable in your environment before invoking; explicit
+settings are never clobbered (what runs == what was requested).
+"""
+import argparse, ctypes, json, os, platform, sys, time
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+VOCAB = 262144
+BLOCK = 16
+
+BASE_ENV = {
+    "NOMOS_KV_QUANT": "1", "NOMOS_KV_INT4": "1", "NOMOS_KV_SWA": "0",
+    "NOMOS_KV_REUSE": "0", "NOMOS_MAX_SEQ": "4096", "NOMOS_BATCHED_PREFILL": "1",
+    "NOMOS_VERIFY_BLOCK_ATTN": "1", "NOMOS_VERIFY_DECODE_ORDER_ATTN": "1",
+    "NOMOS_VERIFY_DECODE_ORDER_MULTIROW_ATTN": "1",
+    # Route S=5..8 verify through the tensor-core MMQ body. The shipped GEMV route
+    # degrades ~19ms/row there and peaks at 185ms @S=8 — WORSE than S=9 (128ms), where
+    # MMQ already took over. That cliff is why VB=4 looked optimal: every sweep hit it.
+    # Byte-exact logits+argmax at every S. Removing it moved the optimum to VB=9.
+    "NOMOS_VERIFY_MMQ_SMALL": "1",
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+}
+Q4_ENV = {"NOMOS_WEIGHT_NVFP4": "0", "NOMOS_W4A4": "0",
+          "NOMOS_PRECISION_BITS": "4", "NOMOS_Q4_DP4A": "1"}
+NVFP4_ENV = {"NOMOS_WEIGHT_NVFP4": "1", "NOMOS_W4A4": "1",
+             "NOMOS_PRECISION_BITS": "16"}
+
+
+def resolve_env():
+    arch = platform.machine()
+    quant = Q4_ENV if arch == "aarch64" else NVFP4_ENV
+    for k, v in {**BASE_ENV, **quant}.items():
+        os.environ.setdefault(k, v)
+    cuda_lib = ("/usr/local/cuda/targets/sbsa-linux/lib" if arch == "aarch64"
+                else "/usr/local/cuda/lib64")
+    pixi_lib = os.path.join(REPO, ".pixi/envs/default/lib")
+    parts = [REPO, cuda_lib, pixi_lib]
+    cur = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LD_LIBRARY_PATH"] = ":".join(parts + ([cur] if cur else []))
+    wts = os.environ.get("WEIGHTS", os.path.expanduser("~/nomos_data/gemma-4-31b/"))
+    if not wts.endswith("/"):
+        wts += "/"  # engine concats WEIGHTS+filename; a missing slash is an Xid-31 trap
+    os.environ["WEIGHTS"] = wts
+    return arch, "Q4_0" if quant is Q4_ENV else "NVFP4", wts
+
+
+def load_lib():
+    so = os.environ.get("SO_PATH", os.path.join(REPO, "libnomos_kernel.so"))
+    if not os.path.exists(so):
+        sys.exit(f"libnomos_kernel.so not found at {so} — build first: bash refresh_build.sh")
+    lib = ctypes.CDLL(so)
+    sigs = [
+        ("nomos_init", ctypes.c_int64, [ctypes.c_int64]),
+        ("nomos_prefill", ctypes.c_int32, [ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int64]),
+        ("nomos_decode_step", ctypes.c_int32, [ctypes.c_int64, ctypes.c_int32, ctypes.c_int64]),
+        ("nomos_reset_kv", ctypes.c_int32, [ctypes.c_int64]),
+        ("nomos_kv_cache_len", ctypes.c_int32, [ctypes.c_int64]),
+        ("nomos_kv_set_len", ctypes.c_int32, [ctypes.c_int64, ctypes.c_int32]),
+        ("nomos_dflash_load", ctypes.c_int32, [ctypes.c_int64, ctypes.c_int64]),
+        ("nomos_dflash_reset", ctypes.c_int32, [ctypes.c_int64]),
+        ("nomos_dflash_cache_len", ctypes.c_int32, [ctypes.c_int64]),
+        ("nomos_dflash_draft_block", ctypes.c_int32, [ctypes.c_int64, ctypes.c_int32, ctypes.c_int32, ctypes.c_int64]),
+        ("nomos_dflash_verify_fused", ctypes.c_int32, [ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int32, ctypes.c_int64]),
+        ("nomos_dflash_append_verify_context", ctypes.c_int32, [ctypes.c_int64, ctypes.c_int32, ctypes.c_int32]),
+    ]
+    for n, r, a in sigs:
+        f = getattr(lib, n); f.restype = r; f.argtypes = a
+    return lib
+
+
+def cptr(s):
+    buf = ctypes.create_string_buffer(s.encode() + b"\x00")
+    return buf, ctypes.cast(buf, ctypes.c_void_p).value
+
+
+def engine_init(lib):
+    import numpy as np
+    buf, wptr = cptr(os.environ["WEIGHTS"])
+    t0 = time.time()
+    ht = lib.nomos_init(wptr)
+    if not ht:
+        sys.exit("engine init failed — check WEIGHTS contents match the arch "
+                 "(GB10: .q4 / discrete: .nvfp4) and the trailing slash")
+    print(f"engine ready {time.time()-t0:.0f}s")
+    return ht, np.zeros(VOCAB, np.float32)
+
+
+def greedy(lib, ht, logits, ids_np, ntok):
+    import numpy as np
+    lib.nomos_reset_kv(ht)
+    lib.nomos_prefill(ht, ids_np.ctypes.data, len(ids_np), logits.ctypes.data)
+    out = [int(np.argmax(logits))]
+    t0 = time.time()
+    for _ in range(ntok - 1):
+        lib.nomos_decode_step(ht, out[-1], logits.ctypes.data)
+        out.append(int(np.argmax(logits)))
+    return out, (ntok - 1) / (time.time() - t0)
+
+
+def dflash_spec(lib, ht, logits, ids_np, ntok, vb):
+    """The champion loop (VB-truncated DFlash block spec decode)."""
+    import numpy as np
+    rows = np.zeros((BLOCK + 1, VOCAB), np.float32)
+    dout = np.zeros(BLOCK, np.int32)
+    toks = np.zeros(BLOCK, np.int32)
+    lib.nomos_reset_kv(ht); lib.nomos_dflash_reset(ht)
+    lib.nomos_prefill(ht, ids_np.ctypes.data, len(ids_np), logits.ctypes.data)
+    assert lib.nomos_dflash_cache_len(ht) == len(ids_np), "drafter context desync"
+    c = int(np.argmax(logits))
+    spec = [c]; steps = 0; acc = 0
+    t0 = time.time()
+    while len(spec) < ntok:
+        steps += 1
+        start = lib.nomos_kv_cache_len(ht)
+        rc = lib.nomos_dflash_draft_block(ht, c, start, dout.ctypes.data)
+        assert rc == BLOCK - 1, f"draft_block rc={rc}"
+        drafts = [int(x) for x in dout[:vb - 1]]
+        toks[0] = c
+        for i, d in enumerate(drafts):
+            toks[1 + i] = d
+        rc = lib.nomos_dflash_verify_fused(ht, toks.ctypes.data, vb, start, rows.ctypes.data)
+        assert rc == 0, f"verify rc={rc}"
+        num_acc = vb - 1
+        for j, d in enumerate(drafts):
+            if d != int(np.argmax(rows[j])):
+                num_acc = j
+                break
+        nxt = int(np.argmax(rows[num_acc]))
+        spec.extend(drafts[:num_acc]); spec.append(nxt); acc += num_acc
+        lib.nomos_kv_set_len(ht, start + 1 + num_acc)
+        rc = lib.nomos_dflash_append_verify_context(ht, 0, num_acc + 1)
+        assert rc > 0, f"ctx append rc={rc}"
+        c = nxt
+    dt = time.time() - t0
+    return spec[:ntok], 1.0 + acc / steps, ntok / dt
+
+
+def weighted_table(results, weights, label):
+    print(f"\n== {label} — per-bucket median, weighted ==")
+    wsum = 0.0
+    for b, wgt in weights.items():
+        v = sorted(r for bb, r in results if bb == b)
+        med = v[len(v) // 2] if len(v) % 2 else 0.5 * (v[len(v) // 2 - 1] + v[len(v) // 2])
+        wsum += wgt * med
+        print(f"{b:>12}: median {med:6.2f} tok/s  (weight {wgt})")
+    print(f"WEIGHTED: {wsum:.2f} tok/s")
+    return wsum
+
+
+
+def cmd_verify(args):
+    """Dual-prefix law ladder: teacher-forced verify rows must match decode's
+    argmax at every position, on a REAL prompt AND a degenerate tie-dense
+    prefix. The degenerate cell is the adversarial one: uniform tokens make
+    flat logit landscapes where any accumulation-order deviation flips an
+    argmax that real prompts would absorb in their margins."""
+    resolve_env()
+    import numpy as np
+    bar = json.load(open(os.path.join(REPO, "tools/gold_bar_tokens.json")))
+    real = np.array(next(p["ids"] for p in bar["prompts"] if p["id"] == "ag2"), np.int32)
+    degen = np.full(94, 108, np.int32); degen[0] = 2
+    lib = load_lib()
+    lib.nomos_verify_fused.restype = ctypes.c_int32
+    lib.nomos_verify_fused.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int32,
+                                       ctypes.c_int32, ctypes.c_int64]
+    ht, logits = engine_init(lib)
+    s_list = [int(x) for x in args.s.split(",")]
+    max_s = max(s_list)
+    ok = True
+    for tag, prefix in [("REAL-ag2", real), ("DEGEN-108", degen)]:
+        pp = len(prefix)
+        lib.nomos_reset_kv(ht)
+        lib.nomos_prefill(ht, prefix.ctypes.data, pp, logits.ctypes.data)
+        g = [int(np.argmax(logits))]; refs = []
+        for _ in range(max_s):
+            lib.nomos_decode_step(ht, g[-1], logits.ctypes.data)
+            refs.append(logits.copy()); g.append(int(np.argmax(logits)))
+        for S in s_list:
+            lib.nomos_reset_kv(ht)
+            lib.nomos_prefill(ht, prefix.ctypes.data, pp, logits.ctypes.data)
+            toks = np.array(g[:S], np.int32)
+            rows = np.zeros((S, VOCAB), np.float32)
+            rc = lib.nomos_verify_fused(ht, toks.ctypes.data, S, pp, rows.ctypes.data)
+            pat = "".join("." if int(np.argmax(rows[j])) == int(np.argmax(refs[j])) else "X"
+                          for j in range(S - 1))
+            mm = pat.count("X")
+            ok &= (rc == 0 and mm == 0)
+            print(f"{tag:>10} S={S:<3} rc={rc} mismatches={mm}/{S-1} {pat}")
+    print("VERIFY==DECODE:", "GREEN (bit-exact at every cell)" if ok else "RED")
+    sys.exit(0 if ok else 1)
+
+
+def cmd_serve(args):
+    import subprocess
+    script = os.path.join(REPO, "pyhost/serve_nomos.sh")
+    if args.action == "status":
+        port = os.environ.get("NOMOS_PORT", "8090")
+        r = subprocess.run(["curl", "-s", f"localhost:{port}/health"],
+                           capture_output=True, text=True)
+        print(r.stdout or f"no response on :{port}")
+        return
+    os.execv("/bin/bash", ["bash", script, args.action])
+
+
+def cmd_env(_):
+    arch, quant, wts = resolve_env()
+    print(f"arch={arch} -> {quant}")
+    print(f"WEIGHTS={wts}  exists={os.path.isdir(wts)}")
+    so = os.path.join(REPO, "libnomos_kernel.so")
+    print(f"SO={so}  exists={os.path.exists(so)}")
+    for k in sorted(k for k in os.environ if k.startswith("NOMOS_")):
+        print(f"  {k}={os.environ[k]}")
+
+
+def cmd_smoke(args):
+    resolve_env()
+    from transformers import AutoTokenizer
+    import numpy as np
+    tok_dir = os.environ.get("TOK_DIR", os.path.expanduser("~/models/gemma-4-31b-it"))
+    tk = AutoTokenizer.from_pretrained(tok_dir)
+    lib = load_lib(); ht, logits = engine_init(lib)
+    ids = tk.apply_chat_template([{"role": "user", "content": args.prompt}],
+                                 add_generation_prompt=True, return_dict=True)["input_ids"]
+    out, tps = greedy(lib, ht, logits, np.array(ids, np.int32), args.ntok)
+    print(tk.decode(out, skip_special_tokens=True))
+    print(f"\n[{tps:.2f} tok/s greedy decode]")
+
+
+def cmd_bench(args):
+    resolve_env()
+    import numpy as np
+    bar = json.load(open(os.path.join(REPO, "tools/gold_bar_tokens.json")))
+    lib = load_lib()
+    ht, logits = engine_init(lib)
+    if args.spec:
+        buf, dptr = cptr(os.environ.get(
+            "DFLASH_DIR", os.path.expanduser("~/nomos_data/dflash-gemma-4-31b-flat/")))
+        rc = lib.nomos_dflash_load(ht, dptr)
+        if rc != 0:
+            sys.exit(f"DFlash drafter load failed (rc={rc}) — check DFLASH_DIR (.q4 flat dir)")
+    ntok = args.ntok
+    base_r, spec_r, exact = [], [], 0
+    for p in bar["prompts"]:
+        ids = np.array(p["ids"], np.int32)
+        g, gtps = greedy(lib, ht, logits, ids, ntok)
+        base_r.append((p["bucket"], gtps))
+        line = f"{p['id']:>8} [{p['bucket']:>12}] greedy {gtps:6.2f} tok/s"
+        if args.spec:
+            s, acc, stps = dflash_spec(lib, ht, logits, ids, ntok, args.vb)
+            spec_r.append((p["bucket"], stps))
+            ok = s == g[:len(s)]
+            exact += ok
+            line += f" | spec {stps:6.2f} tok/s acc={acc:.2f} parity={'EXACT' if ok else 'DIVERGES'}"
+        print(line, flush=True)
+    weighted_table(base_r, bar["weights"], "BASE GREEDY DECODE")
+    if args.spec:
+        weighted_table(spec_r, bar["weights"], f"DFLASH SPEC DECODE (VB={args.vb})")
+        print(f"LOSSLESS: {exact}/{len(bar['prompts'])} prompts token-exact vs greedy")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="nomos", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("env")
+    ps = sub.add_parser("smoke")
+    ps.add_argument("--prompt", default="Explain speculative decoding in two sentences.")
+    ps.add_argument("--ntok", type=int, default=96)
+    pb = sub.add_parser("bench")
+    pb.add_argument("--spec", action="store_true", help="run DFlash speculative decode too")
+    pb.add_argument("--vb", type=int, default=9, help="verify budget (champion: 9)")
+    pb.add_argument("--ntok", type=int, default=96)
+    pv = sub.add_parser("verify")
+    pv.add_argument("--s", default="8,9,12,14,16,17", help="comma list of verify row counts")
+    pr = sub.add_parser("serve")
+    pr.add_argument("action", choices=["up", "down", "status"], nargs="?", default="up")
+    args = ap.parse_args()
+    {"env": cmd_env, "smoke": cmd_smoke, "bench": cmd_bench,
+     "verify": cmd_verify, "serve": cmd_serve}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

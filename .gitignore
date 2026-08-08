@@ -1,0 +1,18 @@
+*.so
+*.o
+__pycache__/
+.pixi/
+*.pyc
+build/
+
+# run / profiling / weight artifacts — regenerable, never track
+*.log
+*.npz
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+*.q4
+*.q8
+*.nvfp4
+*.gguf
+results/

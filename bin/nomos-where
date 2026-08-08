@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# nomos-where — one-shot "where does this box stand" for the Nomos kernel.
+# Canonical layout per docs/SOP.md. Safe to run on any machine.
+set -uo pipefail
+CODE="$HOME/Projects/nomos-kernel"
+WEIGHTS="$HOME/nomos_data/gemma-4-31b"
+TOK="$HOME/models/gemma-4-31b-it"
+BRANCH="serve-stable"
+ok(){   printf '  \033[32m✓\033[0m %s\n' "$1"; }
+bad(){  printf '  \033[31m✗\033[0m %s\n' "$1"; }
+warn(){ printf '  \033[33m!\033[0m %s\n' "$1"; }
+
+echo "════ NOMOS @ $(hostname) ($(uname -m)) ════"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-gpu=index,name,memory.used,memory.total,driver_version --format=csv,noheader 2>/dev/null \
+    | sed 's/^/  GPU /'
+else warn "no nvidia-smi (no GPU?)"; fi
+
+echo "── code (canonical: $CODE @ $BRANCH) ──"
+if [ -d "$CODE/.git" ]; then
+  cur=$(git -C "$CODE" rev-parse --short HEAD 2>/dev/null)
+  br=$(git -C "$CODE" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  git -C "$CODE" fetch -q origin "$BRANCH" 2>/dev/null
+  rem=$(git -C "$CODE" rev-parse --short "origin/$BRANCH" 2>/dev/null)
+  if [ -n "$rem" ] && [ "$cur" = "$rem" ]; then ok "$br ($cur) == origin/$BRANCH"
+  else warn "$br ($cur) != origin/$BRANCH ($rem)  ← DRIFT: git checkout $BRANCH && git pull"; fi
+else bad "$CODE missing — clone: git clone <forgejo>/nomos-kernel.git $CODE"; fi
+if [ -f "$CODE/libnomos_kernel.so" ]; then
+  ok ".so built $(stat -c '%y' "$CODE/libnomos_kernel.so" 2>/dev/null | cut -d. -f1)"
+else warn ".so not built on this box (build for its GPU arch)"; fi
+
+echo "── tokenizer (canonical: $TOK) ──"
+if [ -f "$TOK/tokenizer.json" ]; then
+  [ -f "$TOK/chat_template.jinja" ] && ok "present + chat_template.jinja ✓" \
+    || bad "present but NO chat_template.jinja (apply_chat_template will fail)"
+else bad "$TOK missing — the chat-template hunt starts here; put the HF gemma-4-31b-it tokenizer dir at $TOK"; fi
+
+echo "── weights (canonical: $WEIGHTS) ──"
+if [ -d "$WEIGHTS" ]; then
+  q4=$(ls "$WEIGHTS"/*.q4 2>/dev/null | wc -l); nv=$(ls "$WEIGHTS"/*.nvfp4 2>/dev/null | wc -l)
+  sz=$(du -sh "$WEIGHTS" 2>/dev/null | cut -f1)
+  ok "q4=$q4 files  nvfp4=$nv files  ($sz)"
+else bad "$WEIGHTS missing"; fi
+
+echo "── service (pyhost tmux — start with pyhost/serve_nomos.sh up) ──"
+for s in nomos-engine nomos-serve; do
+  if tmux has-session -t "$s" 2>/dev/null; then ok "$s: tmux session up"
+  else warn "$s: down (pyhost/serve_nomos.sh up)"; fi
+done
+[ -S "${NOMOS_ENGINE_SOCKET:-/tmp/nomos_engine.sock}" ] && ok "engine socket present" || warn "engine socket absent"
+port="${NOMOS_PORT:-8090}"
+if curl -sS --max-time 3 "localhost:$port/v1/models" >/dev/null 2>&1; then
+  ok "serve answering on :$port"
+else warn "no serve on :$port (set NOMOS_PORT for this box)"; fi

@@ -1,0 +1,29 @@
+{
+  "meta": {
+    "oracle_git_sha": "eb7a6a89edf2dd096f2db989ff260102dc653afa",
+    "kv_swa": "1",
+    "max_seq": "4096",
+    "max_new": 16,
+    "seed_text": "The quick brown fox jumps over the lazy dog. "
+  },
+  "cases": [
+    {
+      "length": 512,
+      "input_sha256": "f70b57348c0e9706464adae2c9fdbd2feacbd607ff65ea5c67d98edbcebe0ff1",
+      "nout": 16,
+      "tokens": [8864, 37423, 38167, 1024, 506, 31770, 4799, 236761, 669, 3823, 8864, 37423, 38167, 1024, 506, 31770]
+    },
+    {
+      "length": 1100,
+      "input_sha256": "bced94b6d0b69484f0ab06db072316e569c54d6073ea7eb37fcdfd07b262bf55",
+      "nout": 16,
+      "tokens": [669, 3823, 8864, 37423, 38167, 1024, 506, 31770, 4799, 236761, 669, 3823, 8864, 37423, 38167, 1024]
+    },
+    {
+      "length": 3000,
+      "input_sha256": "79970a562dfaae8476ac36927f0277a3d7a1094d2a84b2201b3084b5355b7f8a",
+      "nout": 16,
+      "tokens": [669, 3823, 8864, 37423, 38167, 1024, 506, 31770, 4799, 236761, 669, 3823, 8864, 37423, 38167, 1024]
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 23963 MiB):
+  Device 0: NVIDIA RTX PRO 4000 Blackwell, compute capability 12.0, VMM: yes, VRAM: 23963 MiB
+| model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --: | --------------: | -------------------: |
+| gemma4 31B Q4_0                |  16.42 GiB |    30.70 B | CUDA       |  99 |   1 |            pp96 |      1027.37 ± 43.61 |
+| gemma4 31B Q4_0                |  16.42 GiB |    30.70 B | CUDA       |  99 |   1 |            tg96 |         29.58 ± 0.09 |
+
+build: 06938ac (1)

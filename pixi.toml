@@ -1,0 +1,26 @@
+[workspace]
+authors = ["Adam Kruger <adam@revelry-inc.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "nomos-kernel"
+platforms = ["linux-aarch64", "linux-64"]
+version = "0.1.0"
+
+[tasks]
+serve = "bash pyhost/serve_nomos.sh up"     # arch-detect quant, start engine+serve
+stop = "bash pyhost/serve_nomos.sh down"
+
+[dependencies]
+mojo = "==1.0.0b3.dev2026080106"
+python = ">=3.12"
+pytorch = ">=2.10.0,<3"
+torchvision = ">=0.26.0,<0.27"
+max-core = "==26.5.0.dev2026080106"
+
+[pypi-dependencies]
+safetensors = "*"
+huggingface-hub = "*"
+numpy = "*"
+fastapi = "*"
+uvicorn = "*"
+transformers = ">=5.12.1, <6"
+requests = "*"        # tests/kernel_smoke_test.py

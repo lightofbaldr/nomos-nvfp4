@@ -1,0 +1,74 @@
+[
+{
+"id": "ag1",
+"bucket": "agentic",
+"nids": 97,
+"text": "<bos><|turn>user\nYou are an operations agent with these tools: ssh_run(host, cmd), read_file(host, path), restart_service(host, name). The API service on host 'gold' is returning HTTP 502 to all requests. Diagnose the root cause and fix it. Think step by step, and emit each tool call you would make in order with its arguments, then state the fix.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"id": "ag2",
+"bucket": "agentic",
+"nids": 94,
+"text": "<bos><|turn>user\nYou have tools: search_code(query), read_file(path), edit_file(path, patch), run_tests(). Task: add a function `parse_iso8601(s: str) -> datetime` to utils/time.py and verify it with the existing test suite. Lay out your plan, then emit the ordered sequence of tool calls with concrete arguments.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"id": "ag3",
+"bucket": "agentic",
+"nids": 81,
+"text": "<bos><|turn>user\nYou are a data analyst agent with tools: query_db(sql) and chart(spec). The user asks: 'Which three customers had the highest total spend last quarter, and how does each compare to the same quarter last year?' Plan the queries, emit the SQL for each tool call, and describe the chart you would produce.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"id": "ag4",
+"bucket": "agentic",
+"nids": 74,
+"text": "<bos><|turn>user\nAct as an SRE. A containerized service starts and then exits with code 1; the logs show only 'bind: address already in use'. Walk through your diagnosis as a numbered reasoning chain, identify the most likely cause, and give the exact commands you would run to confirm and resolve it.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"id": "ag5",
+"bucket": "agentic",
+"nids": 216,
+"text": "<bos><|turn>user\nYou have tools read_file(path) and edit_file(path, patch). The function below has duplicated validation logic in three branches. Plan a refactor that removes the duplication without changing behavior, then emit the edit. Function: def handle(req):\\n  if req.kind=='a':\\n    if not req.user: raise Error('no user')\\n    if req.amount<=0: raise Error('bad amount')\\n    return do_a(req)\\n  if req.kind=='b':\\n    if not req.user: raise Error('no user')\\n    if req.amount<=0: raise Error('bad amount')\\n    return do_b(req)\\n  if req.kind=='c':\\n    if not req.user: raise Error('no user')\\n    if req.amount<=0: raise Error('bad amount')\\n    return do_c(req)<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"id": "mem1",
+"bucket": "memory_prose",
+"nids": 59,
+"text": "<bos><|turn>user\nExplain the trade-offs between speculative decoding and standard autoregressive decoding when serving a large language model on bandwidth-limited hardware. Cover why speculative decoding helps, what determines its speedup, and the cases where it provides little benefit.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"id": "mem2",
+"bucket": "memory_prose",
+"nids": 67,
+"text": "<bos><|turn>user\nSummarize the key considerations when choosing a 4-bit quantization scheme for large-model inference on a unified-memory GPU: accuracy impact, memory bandwidth, kernel support, and how the choice interacts with the KV cache. Write three to four well-developed paragraphs.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"id": "mem3",
+"bucket": "memory_prose",
+"nids": 54,
+"text": "<bos><|turn>user\nDescribe how a retrieval-augmented external memory can improve the factual accuracy of a frozen language model without changing its weights. Explain the mechanism, the failure modes it addresses, and the main risks of the approach.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"id": "code1",
+"bucket": "code",
+"nids": 71,
+"text": "<bos><|turn>user\nWrite a Python function `merge_intervals(intervals: list[list[int]]) -> list[list[int]]` that merges all overlapping intervals and returns them sorted by start. Include a clear docstring, handle the empty input case, and add three example assert statements demonstrating correctness.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"id": "code2",
+"bucket": "code",
+"nids": 68,
+"text": "<bos><|turn>user\nImplement a Python class `LRUCache` with O(1) `get(key)` and `put(key, value)` using a hash map plus a doubly linked list, with a fixed capacity set at construction. Include a docstring and a short usage example.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"id": "struct1",
+"bucket": "structured",
+"nids": 79,
+"text": "<bos><|turn>user\nOutput a single valid JSON object describing a person, with fields: name (string), age (integer), email (string), address (object with street, city, state, zip), employment (object with company, title, years), and hobbies (array of exactly three strings). Use realistic placeholder values. Output only the JSON.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"id": "struct2",
+"bucket": "structured",
+"nids": 70,
+"text": "<bos><|turn>user\nProduce three numbered lists: (1) the first fifteen prime numbers, (2) the eight planets of the solar system in order from the Sun, and (3) the seven days of the week starting from Monday. Use a clean numbered-list format with a heading for each.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+}
+]
