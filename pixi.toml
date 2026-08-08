@@ -15,6 +15,10 @@ python = ">=3.12"
 pytorch = ">=2.10.0,<3"
 torchvision = ">=0.26.0,<0.27"
 max-core = "==26.5.0.dev2026080106"
+cuda-version = ">=12.8"
+cuda-cudart-dev = ">=13.3.29,<14"
+libcublas-dev = ">=13.6.0.2,<14"
+cuda-nvcc = ">=13.3.73,<14"
 
 [pypi-dependencies]
 safetensors = "*"

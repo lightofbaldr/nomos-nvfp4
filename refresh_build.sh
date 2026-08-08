@@ -7,16 +7,45 @@
 set -eo pipefail
 export PATH=$HOME/.pixi/bin:$PATH
 cd "$(cd "$(dirname "$0")" && pwd)"
-CUDA_ROOT="${CUDA_HOME:-/usr/local/cuda}"
+# CUDA is RESOLVED, not assumed. The old code hardcoded ${CUDA_HOME:-/usr/local/cuda} and
+# died on any box without a SYSTEM CUDA install — which is the normal case here, because pixi
+# provides CUDA inside the environment (cuda-cudart-dev / libcublas-dev in pixi.toml). That
+# made `pixi install && ./refresh_build.sh`, the two commands in the README quick-start, fail
+# on a clean clone for exactly the discrete/x86 audience this repo targets.
+#
+# Probe for the ARTIFACT (libcudart), never for a directory name: a path can exist and be
+# empty, and "directory is present" is not "the library is here".
 case "$(uname -m)" in
-  aarch64) CUDA_TARGET_LIB="$CUDA_ROOT/targets/sbsa-linux/lib" ;;
-  x86_64) CUDA_TARGET_LIB="$CUDA_ROOT/targets/x86_64-linux/lib" ;;
+  aarch64) CUDA_TRIPLE="sbsa-linux" ;;
+  x86_64)  CUDA_TRIPLE="x86_64-linux" ;;
   *) echo "unsupported host architecture: $(uname -m)" >&2; exit 1 ;;
 esac
-if [ ! -d "$CUDA_TARGET_LIB" ]; then
-  echo "CUDA target library directory not found: $CUDA_TARGET_LIB" >&2
+PIXI_ENV="$(pwd)/.pixi/envs/default"
+CUDA_TARGET_LIB=""
+for _c in "${CUDA_HOME:+$CUDA_HOME/targets/$CUDA_TRIPLE/lib}" "${CUDA_HOME:+$CUDA_HOME/lib64}" \
+          "$PIXI_ENV/targets/$CUDA_TRIPLE/lib" "$PIXI_ENV/lib" \
+          "/usr/local/cuda/targets/$CUDA_TRIPLE/lib" "/usr/local/cuda/lib64"; do
+  [ -n "$_c" ] || continue
+  if [ -f "$_c/libcudart.so" ] || ls "$_c"/libcudart.so.* >/dev/null 2>&1; then
+    CUDA_TARGET_LIB="$_c"; break
+  fi
+done
+if [ -z "$CUDA_TARGET_LIB" ]; then
+  echo "libcudart not found. Looked under CUDA_HOME (${CUDA_HOME:-unset}), the pixi env" >&2
+  echo "($PIXI_ENV), and /usr/local/cuda. Run \`pixi install\` first — pixi.toml declares" >&2
+  echo "cuda-cudart-dev/libcublas-dev, so a synced env is normally enough." >&2
   exit 1
 fi
+# Headers for the gcc shim: same probe, on the artifact (cuda_runtime.h).
+CUDA_INCLUDE=""
+for _i in "${CUDA_HOME:+$CUDA_HOME/targets/$CUDA_TRIPLE/include}" "${CUDA_HOME:+$CUDA_HOME/include}" \
+          "$PIXI_ENV/targets/$CUDA_TRIPLE/include" "$PIXI_ENV/include" \
+          "/usr/local/cuda/targets/$CUDA_TRIPLE/include" "/usr/local/cuda/include"; do
+  [ -n "$_i" ] && [ -f "$_i/cuda_runtime.h" ] && { CUDA_INCLUDE="$_i"; break; }
+done
+[ -n "$CUDA_INCLUDE" ] || { echo "cuda_runtime.h not found (looked beside libcudart)" >&2; exit 1; }
+echo "cuda lib: $CUDA_TARGET_LIB"
+echo "cuda inc: $CUDA_INCLUDE"
 # Rebuilds the .so on the CURRENT checkout. Does NOT switch branches or hard-reset
 # (the old `git checkout fork-refactor && git reset --hard` was a footgun that silently
 #  discarded local work — removed 2026-06-25). Check out the branch you want yourself.
@@ -24,7 +53,7 @@ echo "=== refresh build on $(git rev-parse --abbrev-ref HEAD 2>/dev/null) @ $(gi
 echo "=== pixi env sync ==="
 pixi install 2>&1 | tail -3
 echo "=== gcc shims ==="
-gcc -c -fPIC nomos_libc_shim.c -o nomos_libc_shim.o && gcc -c -fPIC nomos_token_cb_stub.c -o nomos_token_cb_stub.o && gcc -c -fPIC -fvisibility=hidden -I"$CUDA_ROOT/include" nomos_cuda_budget.c -o nomos_cuda_budget.o && echo "shims ok"
+gcc -c -fPIC nomos_libc_shim.c -o nomos_libc_shim.o && gcc -c -fPIC nomos_token_cb_stub.c -o nomos_token_cb_stub.o && gcc -c -fPIC -fvisibility=hidden -I"$CUDA_INCLUDE" nomos_cuda_budget.c -o nomos_cuda_budget.o && echo "shims ok"
 echo "=== build libnomos_kernel for current GPU ($(date +%T)) ==="
 pixi run mojo build --emit shared-lib nomos_ffi.mojo -o libnomos_kernel.so \
   -Xlinker nomos_libc_shim.o -Xlinker nomos_token_cb_stub.o -Xlinker nomos_cuda_budget.o \
