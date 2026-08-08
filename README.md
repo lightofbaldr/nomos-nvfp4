@@ -35,7 +35,7 @@ run. It passes not by luck but by arithmetic — see *Correctness by constructio
 ## Quickstart
 
 ```bash
-git clone <repo-url> && cd nomos-nvfp4
+git clone https://github.com/lightofbaldr/nomos-nvfp4.git && cd nomos-nvfp4
 pixi install
 bash refresh_build.sh            # builds libnomos_kernel.so FOR THIS GPU (arch is baked in)
 # download the weights and export WEIGHTS + DFLASH_DIR — see "Weights" below
