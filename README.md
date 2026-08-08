@@ -12,18 +12,35 @@ decoding by construction**.
 ## Measured performance
 
 12-prompt weighted benchmark (agentic / code / long-prose / structured buckets),
-Gemma-4-31B QAT Q4_0, 96 tokens per prompt, greedy — NVIDIA GB10 (DGX Spark),
-2026-07-14:
+96 tokens per prompt, greedy. On **NVIDIA GB10 (DGX Spark)**, Gemma-4-31B QAT
+Q4_0, measured 2026-08-04:
 
 | Configuration | tok/s (weighted) | Losslessness |
 |---|---|---|
-| Base greedy decode | 10.91 | — (it *is* the reference) |
-| **DFlash speculative, VB=9 (champion)** | **21.88** | **12/12 prompts token-exact vs greedy** |
+| Base greedy decode | 10.9 | — (it *is* the reference) |
+| **DFlash speculative, VB=9 (champion)** | **23.73** | **12/12 prompts token-exact vs greedy** |
 | llama.cpp draft-assisted (same box/model/prompts, for context) | 26.54 | not bit-gated |
+
+And on **discrete Blackwell — RTX 5090 laptop** (power-capped GDDR7), Gemma-4-31B
+NVFP4 W4A4, same bar, measured 2026-08-04:
+
+| Configuration | tok/s (weighted) | Losslessness |
+|---|---|---|
+| Base greedy decode | 23.65 | — (the reference) |
+| **DFlash speculative, VB=7** | **53.5** | **12/12 byte-identical to greedy** |
+| llama.cpp base decode (same box/model) | 31.45 | not bit-gated |
+| llama.cpp draft-assisted (same box, same drafter, same prompts) | 45.8 | not bit-gated |
+
+Two honest reads on the 5090, one box: llama.cpp's **base** decode leads ours
+(31.45 vs 23.65), but our **speculative stack leads theirs** (53.5 vs 45.8, +16.8%)
+— and ours is bit-exact against greedy while theirs isn't gated. Where a fast base
+reference already exists we don't beat it head-on; where speculation is on and
+losslessness matters, we lead.
 
 "Lossless" is the strong claim: the speculative pipeline's output is compared
 token-for-token against the same engine's non-speculative greedy stream, every
-run. It passes not by luck but by arithmetic — see *Correctness by construction*.
+run — bit-identical to *our own* greedy decode, not to any other implementation.
+It passes not by luck but by arithmetic — see *Correctness by construction*.
 
 > **A number is only real for the box, the code path, and the entry point it was
 > measured on.** The same KV-scale flag measures −3.5% on one card and +15.7% on
