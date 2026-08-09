@@ -25,6 +25,32 @@ Gemma-4-31B QAT Q4_0, 96 tokens per prompt, greedy — NVIDIA GB10 (DGX Spark),
 token-for-token against the same engine's non-speculative greedy stream, every
 run. It passes not by luck but by arithmetic — see *Correctness by construction*.
 
+### Head-to-head vs llama.cpp — RTX 5090 laptop (discrete Blackwell)
+
+One measurement session on the published tree, same card / model family / 12-prompt
+bar / greedy / `ntok=96`, out-of-box defaults. Nomos NVFP4 W4A4 vs llama.cpp Q4_0
+(build `7bd8282`), 2026-08-08:
+
+| | Nomos | llama.cpp | |
+|---|---|---|---|
+| base decode | 23.33 | **30.39** | llama.cpp **+30.3%** |
+| **drafted / speculative** | **54.31** (12/12 lossless) | 49.30 | Nomos **+10.2%** |
+| multiplier over own base | **2.33×** | 1.62× | |
+
+**Both halves, stated plainly.** llama.cpp's **base decode leads ours** by 30.3% —
+its kernel is the stronger foundation, and closing that gap is where our base-decode
+work goes next. Our **speculative stack leads** by 10.2% (and in every bucket), with
+the larger multiplier (2.33× vs 1.62×) and bit-exact output against our own greedy.
+
+> *Fairness + scope:* one 5090 laptop, one prompt set; both engines' tok/s taken from
+> their **own** counters under the same `(n−1)/dt` convention (not externally timed).
+> llama.cpp's draft depth was swept to its optimum (`nmax=3`) while Nomos ran its
+> shipped default (`VB=8`) — an asymmetry that **favors llama.cpp**. NVFP4/Q4 path
+> only; "lossless" = bit-exact vs our own greedy decode (`tools/gold_parity_ids.py`),
+> not a claim about other precision paths or about output quality. This ±% is measured
+> on the 5090 only — llama.cpp's per-architecture drafter behaviour on GB10 is
+> unmeasured.
+
 > **A number is only real for the box, the code path, and the entry point it was
 > measured on.** The same KV-scale flag measures −3.5% on one card and +15.7% on
 > another; the same greedy gate is sound for one change and blind to the next; and

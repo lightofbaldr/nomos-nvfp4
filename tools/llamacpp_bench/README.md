@@ -22,18 +22,29 @@ prompts, to close the "vs llama.cpp on this silicon" comparison for gemma-4-31B.
 
 llama.cpp base decode on Gold = **~30 tok/s**.
 
-## Verdict vs our kernel
+## Base-decode reference (Gold, RTX PRO 4000)
+
 | comparison | ours | llama.cpp | result |
 |---|---|---|---|
 | base-vs-base (pure kernel) | 21.7 | ~30 | **llama.cpp base ~1.36–1.40x FASTER** |
-| our spec vs their base (stack-vs-stack) | ~50 (lossless spec) | ~30 (base) | **our stack ~1.65–1.69x faster** |
 
 - Vanilla llama.cpp base decode BEATS our NVFP4 base kernel on identical silicon/model/quant.
-  Our base kernel has headroom to close.
-- Vanilla llama.cpp has NO native standalone gemma-4-31B drafter (the assistant/DFlash head is
-  a coupled nextn head with no own K/V → not a valid `--model-draft`), so its realistic
-  single-stream ceiling here is base decode. Our spec-decode stack (~50) beats that ceiling.
-  This is stack-vs-stack, NOT spec-vs-spec.
+  Our base kernel has headroom to close. (An honest Gold-box base-decode measurement; the
+  ~30 here is **Gold's** number and should not be fused with the 5090's 30.39 — different card.)
+
+## Retired verdict — and why (read this if you're diffing the repo)
+
+An earlier version of this file also carried a **"our stack ~1.65–1.69× faster"** row that
+compared *our speculative decode* against llama.cpp's **un-drafted base**. **We are removing it,
+and the honest reason is that it flattered us:** it was a stack-vs-base comparison that withheld
+llama.cpp's own drafter, and it was only defensible while llama.cpp had no working gemma-4 drafter.
+
+That was true against llama.cpp build **`06938ac`** (the assistant/DFlash head was a coupled
+next-n head with no own K/V, not usable as `--model-draft`). It **expired** upstream: build
+**`7bd8282`** added native DFlash *and* DSpark support, so llama.cpp now speculates on gemma-4.
+The fair, spec-vs-spec comparison — where llama.cpp runs its own drafter — lives in the main
+[README](../../README.md#head-to-head-vs-llamacpp--rtx-5090-laptop-discrete-blackwell) and is the
+authoritative one. A dated claim is falsifiable; that's why we're dating it rather than deleting it.
 
 ## Files
 - `bench_llamacpp_server.py` — the harness (launches GPU0-pinned llama-server, feeds exact ids).
