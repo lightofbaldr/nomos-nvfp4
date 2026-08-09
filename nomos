@@ -30,11 +30,26 @@ VOCAB = 262144
 BLOCK = 16
 
 # Verify budget is BOX-DEPENDENT, exactly like the quant dict below — do not flatten it.
-#   discrete (x86_64, NVFP4 W4A4): VB 5-8 is one plateau (7 and 8 indistinguishable), and
-#     VB>=9 falls off a ~39% cliff — the MMQ_SMALL S=5..8 window ending. Measured 5090,
-#     BLOCK_ATTN=0, every point 12/12 lossless: 5=51.91 6=52.76 7=52.85 8=53.34 9=32.51.
-#   GB10 (aarch64, Q4_0, int8 acts/dp4a): 9 IS the genuine champion and the cliff is absent —
-#     that is where the published 21.88 lives.
+#
+# DISCRETE (x86_64, NVFP4 W4A4, bf16 KV read). Measured RTX 5090, BLOCK_ATTN=0, ntok=96,
+# every point 12/12 token-exact:
+#     VB    5      6      7      8   |   9     10     12     14     16
+#   spec  51.91  52.76  52.85  53.34 | 32.51  31.18  27.48  24.38  22.58
+# A STEP at 8->9 (-39%, the MMQ_SMALL S=5..8 window ending) AND a monotonic decline after
+# it. It does NOT recover: by VB=16 speculation (22.58) is slower than base decode (~23),
+# i.e. net-negative. Base was flat across the sweep, so the decay is in the spec path.
+# Two effects, not one — widening the window could recover the step, but the slope would
+# continue, so that fix has a bounded payoff. VB 5-8 is one plateau (7 and 8 are within
+# 0.9%, inside the ~2.5% base drift measured on that sweep — neither is "the champion").
+#
+# GB10 (aarch64, Q4_0, int8 acts/dp4a). Measured by Kvasir, KV_I4_BLOCK=32, 12/12 at every
+# point: VB 7=22.80  8=22.98  9=23.38  10=23.45. NO CLIFF through 10 — a +2.9% monotonic
+# rise, so the S=5..8 window does not bite under int8 acts. 9 and 10 are within 0.3%,
+# inside a 1.6% base spread: 9 is a SAFE DEFAULT, not a measured champion, and 11+ is
+# unprobed. (The older "9 is the champion, that is where 21.88 lives" claim showed only
+# that 9 was USED. That curve is also at KV_I4_BLOCK=32, which is not the shipped default,
+# and was sequential rather than interleaved.)
+#
 # A flat default fixes one arch by silently degrading the other. Same box-scoping rule the
 # 2x2 sweep established for kv_i4_block.
 VB_BY_ARCH = {"aarch64": 9, "x86_64": 8}
