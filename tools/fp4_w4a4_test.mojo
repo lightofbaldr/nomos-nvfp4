@@ -4,7 +4,7 @@ gpu_matmul_nvfp4_w4a4_dev (GPU-quant activation -> native FP4 MMA -> post-scale)
 compare to the fp32 reference act@weight^T. Both operands FP4, so RMSE lands in the FP4
 band (~10-20%). Run: pixi run mojo run -I . --target-accelerator sm_121a tools/fp4_w4a4_test.mojo
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.random import random_ui64
 from std.math import sqrt

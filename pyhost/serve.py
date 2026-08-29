@@ -36,14 +36,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from host import KernelLM, H          # noqa: E402
 from grammar import ToolGrammar        # noqa: E402
 from agent import parse_call           # noqa: E402  (Gemma <|"|>-arg parser → (name, dict))
-
-MODEL_ID = os.environ.get("NOMOS_MODEL_ID", "nomos-gemma4-31b")
-TOOL_OPEN = 48     # <|tool_call>
-TOOL_CLOSE = 49    # <tool_call|>
+from serve_protocol import load_serve_protocol  # noqa: E402
 # Prompt-length ceiling. With NOMOS_BATCHED_PREFILL=1 the engine fully materialises the causal
 # attention scores — lib/engine_prefill.mojo:145, NH * S * S * 4 bytes, plus a bf16 copy at :150
 # (NH * S * S * 2). That is QUADRATIC in prompt length: ~192 bytes * S^2, i.e. 768 MiB at 2k
-# tokens but 4.7 GiB at 5k. Engine + drafter leave only ~3.7 GiB free on Gold, so an ordinary
+# tokens but 4.7 GiB at 5k. Engine + drafter leave only ~3.7 GiB free on the RTX PRO 4000, so an ordinary
 # OpenWebUI prompt (history + tool definitions) walks off the cliff. The failure is NOT
 # recoverable: cudaMalloc failing inside the kernel is a Mojo ABORT that kills the daemon
 # outright — observed repeatedly on 2026-08-05, the exact allocation being
@@ -60,10 +57,6 @@ TOOL_CLOSE = 49    # <tool_call|>
 # The real fix is tiled/flash-style scores that never materialise S^2; RUNBOOK 3c already
 # queues it as the context-ceiling build.
 MAX_PROMPT_TOKENS = int(os.environ.get("NOMOS_MAX_PROMPT_TOKENS", "2900"))
-
-CHANNEL_OPEN = 100   # <|channel>
-CHANNEL_END = 101    # <channel|>
-
 
 class Engine:
     """The serial logits engine + tokenizer, loaded once at app startup.
@@ -82,7 +75,15 @@ class Engine:
             from kernel_client import KernelClient
             self.lm = KernelClient(sock)
         else:
-            self.lm = KernelLM()
+            self.lm = KernelLM(vocab_size=len(self.tok))
+        # The compiled profile, not an HTTP model string or a vocab-size heuristic,
+        # selects the chat protocol. Marker IDs themselves come from the tokenizer and
+        # are validated as single control tokens by load_serve_protocol().
+        self.profile_id = self.lm.model_id()
+        self.protocol = load_serve_protocol(self.tok, self.profile_id)
+        self.model_name = self.protocol.default_model_name
+        print(f"[serve] profile={self.profile_id} protocol={self.protocol.kind} "
+              f"model={self.model_name}", flush=True)
         self.spec_loaded = False
         self.spec_vb = int(os.environ.get("SPEC_VB", "8"))
         dflash_dir = os.environ.get("DFLASH_DIR")
@@ -96,15 +97,7 @@ class Engine:
                 # Keep the endpoint available on base greedy if a configured drafter cannot
                 # load. The startup log makes the degraded mode explicit.
                 print(f"[serve] DFlash load failed; using base decode: {e}", flush=True)
-        # The model ends a turn with <turn|> (id 106), NOT <end_of_turn>. Build the stop
-        # set from whichever turn markers actually exist in this tokenizer + eos + the
-        # tool-call close, so generation halts at the turn boundary (no post-answer ramble).
-        stop = {self.tok.eos_token_id, TOOL_CLOSE}
-        for marker in ("<turn|>", "<end_of_turn>"):
-            tid = self.tok.convert_tokens_to_ids(marker)
-            if isinstance(tid, int) and tid >= 0 and tid != self.tok.unk_token_id:
-                stop.add(tid)
-        self.stop = sorted(stop)
+        self.stop = self.protocol.stop_ids
         self.lock = threading.Lock()
 
 
@@ -137,59 +130,61 @@ class ChatReq(BaseModel):
     enable_thinking: bool = True
 
 
-def _normalize(messages: list[dict]) -> list[dict]:
-    """Fold OpenAI roles into a Gemma-renderable user/assistant stream.
-
-    Gemma has no system/tool roles; we fold system into a leading user instruction and tool
-    results into user messages, and render prior assistant tool_calls as their literal
-    <|tool_call> text so the model sees its own actions. Good enough for v0; native-template
-    fidelity is a Phase-1 refinement.
-    """
-    out: list[dict] = []
-    pending_sys = ""
-    for m in messages:
-        role, content = m.get("role"), m.get("content") or ""
-        if role == "system":
-            pending_sys += content + "\n\n"
-        elif role == "tool":
-            name = m.get("name") or m.get("tool_call_id") or "tool"
-            out.append({"role": "user", "content": f"[Result of {name}]\n{content}"})
-        elif role == "assistant":
-            txt = content
-            for tc in m.get("tool_calls") or []:
-                fn = tc.get("function", {})
-                raw = fn.get("arguments", "")
-                try:
-                    args = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                except json.JSONDecodeError:
-                    args = {}
-                body = ",".join(f'{k}:<|"|>{v}<|"|>' for k, v in args.items())
-                txt += f"<|tool_call>call:{fn.get('name', '')}{{{body}}}<tool_call|>"
-            out.append({"role": "assistant", "content": txt})
-        else:  # user
-            if pending_sys:
-                content, pending_sys = f"[Instructions: {pending_sys.strip()}]\n\n{content}", ""
-            out.append({"role": "user", "content": content})
-    if pending_sys:  # system with no following user
-        out.append({"role": "user", "content": f"[Instructions: {pending_sys.strip()}]"})
-    return out
-
-
-def _visible(text: str) -> str:
-    """Strip the Gemma thinking channel + turn markers → user-visible content."""
-    if "<channel|>" in text:
+def _visible(text: str, thinking: bool = False) -> str:
+    """Strip thinking channel + turn markers → user-visible content. When `thinking` is on but the
+    reasoning was truncated before its close marker, there is no answer yet → return empty."""
+    if thinking and "</think>" not in text and "<channel|>" not in text:
+        # thinking was on but generation was truncated mid-reasoning (no close marker) — there is no
+        # answer yet; the whole output is unclosed reasoning and belongs in reasoning_content, not here.
+        return ""
+    if "<channel|>" in text:                 # gemma thought channel
         text = text.split("<channel|>")[-1]
-    for marker in ("<end_of_turn>", "<turn|>"):
+    if "</think>" in text:                    # qwen3 reasoning: content is after the think block
+        text = text.split("</think>")[-1]
+    for marker in ("<end_of_turn>", "<turn|>", "<|im_end|>", "<|im_start|>", "<|endoftext|>", "<think>", "</think>"):
         text = text.replace(marker, "")
     return text.strip()
 
 
-def _thought(text: str) -> str:
-    """The Gemma thinking channel's content — the exact complement of _visible().
+def parse_qwen_tool(text: str):
+    """Parse a qwen3 Hermes tool call: <tool_call>{"name":..,"arguments":{..}}</tool_call>.
+    Returns (name, args_dict) for the first well-formed call, else None."""
+    import re
+    m = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    name = obj.get("name")
+    if not name:
+        return None
+    args = obj.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {}
+    return name, (args if isinstance(args, dict) else {})
+
+
+def _thought(text: str, thinking: bool = False) -> str:
+    """The thinking channel's content — the exact complement of _visible().
 
     rsplit mirrors _visible()'s split(...)[-1]: whatever _visible keeps as content, this
-    returns as reasoning, so between them no generated token is discarded. Empty when the
-    model never closed the channel (then _visible returns the whole text as content)."""
+    returns as reasoning, so between them no generated token is discarded. When `thinking`
+    is on and the channel was never closed (truncated mid-reasoning), the whole output is the
+    thought and _visible returns empty; with thinking off, unclosed text stays ordinary content."""
+    if "</think>" in text:                    # qwen3 reasoning block (generation starts inside <think>)
+        head = text.rsplit("</think>", 1)[0]
+        for marker in ("<think>", "<end_of_turn>", "<turn|>"):
+            head = head.replace(marker, "")
+        return head.strip()
+    if thinking and "<channel|>" not in text:  # unclosed reasoning (truncated): the whole output IS the thought
+        for marker in ("<think>", "<end_of_turn>", "<turn|>"):
+            text = text.replace(marker, "")
+        return text.strip()
     if "<channel|>" not in text:
         return ""
     head = text.rsplit("<channel|>", 1)[0]
@@ -215,26 +210,27 @@ def health():
     eng: Engine | None = getattr(app.state, "engine", None)
     if eng is None:
         return JSONResponse(status_code=503,
-                            content={"status": "starting", "model": MODEL_ID, "ready": False})
+                            content={"status": "starting", "model": "loading", "ready": False})
     if not eng.lock.acquire(blocking=False):
-        return {"status": "ok", "model": MODEL_ID, "ready": True,
+        return {"status": "ok", "model": eng.model_name, "ready": True,
                 "engine": "busy", "spec": eng.spec_loaded}
     try:
         eng.lm.cache_len()
     except Exception as e:  # noqa: BLE001
         return JSONResponse(status_code=503,
-                            content={"status": "error", "model": MODEL_ID, "ready": False,
+                            content={"status": "error", "model": eng.model_name, "ready": False,
                                      "detail": f"engine unreachable: {e}"})
     finally:
         eng.lock.release()
-    return {"status": "ok", "model": MODEL_ID, "ready": True,
+    return {"status": "ok", "model": eng.model_name, "ready": True,
             "engine": "ok", "spec": eng.spec_loaded}
 
 
 @app.get("/v1/models")
 def models() -> dict:
+    eng: Engine = app.state.engine
     return {"object": "list",
-            "data": [{"id": MODEL_ID, "object": "model", "owned_by": "light-of-baldr"}]}
+            "data": [{"id": eng.model_name, "object": "model", "owned_by": "light-of-baldr"}]}
 
 
 def _build_inputs(req: ChatReq, eng: "Engine"):
@@ -244,26 +240,28 @@ def _build_inputs(req: ChatReq, eng: "Engine"):
     tc = req.tool_choice
     # tool_choice "required" or a named-function dict forces a tool call (pydantic-ai output_type).
     force_tool = use_tools and (tc == "required" or isinstance(tc, dict))
-    # Forcing DISABLES the thinking channel. Otherwise the force depends on the model emitting
-    # <channel|> to CLOSE thinking before the grammar can require <|tool_call> — which it may never
-    # do on a long prompt (it answers in prose, output-validation fails). With thinking off the
-    # grammar forces the tool call from the first token. Non-forced requests keep the always-on
-    # thinking channel (vLLM/llama.cpp/Google design): pre-fill the thought OPENER so the model
-    # starts inside <|channel>thought and reliably closes with <channel|>.
-    thinking = req.enable_thinking and not force_tool
-    msgs = _normalize(req.messages)
-    s = eng.tok.apply_chat_template(
-        msgs, tokenize=False, add_generation_prompt=True, enable_thinking=thinking,
-        tools=req.tools if use_tools else None,
-    )
-    if thinking:
-        s += "<|channel>thought\n"
+    # On Gemma, forcing disables the thinking channel: otherwise the force depends on the model
+    # emitting <channel|> before grammar can require <|tool_call>. Muse never takes that shortcut:
+    # reasoning is a locked quality contract, so ATEM always generates to=self before handing off.
+    # The protocol owns this distinction; separating reasoning from answer content never disables
+    # generation.
+    thinking = eng.protocol.resolve_thinking(req.enable_thinking, force_tool)
+    try:
+        msgs = eng.protocol.normalize(req.messages)
+        s = eng.tok.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=thinking,
+            tools=req.tools if use_tools else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    s = eng.protocol.finish_prompt(s, thinking)
     ids = list(np.asarray(eng.tok(s, add_special_tokens=False).input_ids, dtype=np.int64))
     if os.environ.get("NOMOS_DEBUG_RAW"):
         print(f"[dbg] ---- {len(req.messages)} msgs use_tools={use_tools} force={force_tool} "
               f"thinking={thinking} tc={tc!r} ntok={len(ids)} ----", flush=True)
         print(f"[dbg] RENDERED PROMPT >>>\n{s}\n<<< END PROMPT", flush=True)
-    gram = ToolGrammar(eng.tok, tool_names, force=force_tool, thinking=thinking) if use_tools else None
+    gram = (ToolGrammar(eng.tok, tool_names, force=force_tool, thinking=thinking)
+            if use_tools and eng.protocol.uses_gemma_grammar else None)
     return ids, gram, thinking
 
 
@@ -291,7 +289,7 @@ def _stream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool = True)
     content token-by-token; a tool call is buffered (grammar-completed) then emitted as one
     tool_calls delta. Holds the engine lock for the whole generation (serial kernel)."""
     created = int(time.time())
-    cid, model = f"chatcmpl-{created}", (req.model or MODEL_ID)
+    cid, model = f"chatcmpl-{created}", (req.model or eng.model_name)
     with eng.lock:
         if gram:
             gram.reset()
@@ -314,9 +312,35 @@ def _stream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool = True)
                 ids, max_new_tokens=req.max_tokens, stop_ids=eng.stop,
                 temperature=req.temperature, top_p=req.top_p,
                 top_k=req.top_k, processor=gram)
+        if eng.protocol.kind == "atem":
+            parser = eng.protocol.stream_parser(eng.tok)
+            for tok in token_source:
+                for field, delta in parser.feed(tok):
+                    if delta:
+                        yield _sse(cid, created, model, {field: delta})
+                if parser.saw_stop:
+                    break
+            parsed, residual = parser.finish()
+            for field, delta in residual:
+                if delta:
+                    yield _sse(cid, created, model, {field: delta})
+            if os.environ.get("NOMOS_DEBUG_RAW"):
+                raw = eng.tok.decode(parser.raw_ids, skip_special_tokens=False)
+                print(f"[dbg] ATEM stream raw={raw[:400]!r} parsed={parsed}", flush=True)
+            if parsed.tool_call:
+                name, args = parsed.tool_call
+                yield _sse(cid, created, model, {"tool_calls": [{
+                    "index": 0, "id": f"call_{created}", "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args)}}]})
+                finish = "tool_calls"
+            else:
+                finish = "stop" if parser.saw_stop else "length"
+            yield _sse(cid, created, model, {}, finish=finish)
+            yield "data: [DONE]\n\n"
+            return
         for tok in token_source:
             if phase == "think":
-                if tok == CHANNEL_END:
+                if tok == eng.protocol.channel_end_id:
                     phase = "emit"
                     continue
                 # Stream the thought channel instead of dropping it. It goes out as
@@ -331,7 +355,7 @@ def _stream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool = True)
                     think_emitted = full
                 continue
             if phase == "emit":
-                if tok == TOOL_OPEN:
+                if tok == eng.protocol.tool_open_id:
                     phase, tool_ids = "tool", [tok]
                     continue
                 if tok in eng.stop:
@@ -344,7 +368,7 @@ def _stream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool = True)
                     emitted = full
             else:  # tool
                 tool_ids.append(tok)
-                if tok == TOOL_CLOSE:
+                if tok == eng.protocol.tool_close_id:
                     break
         if os.environ.get("NOMOS_DEBUG_RAW"):
             print(f"[dbg] stream-end phase={phase} nvis={len(visible_ids)} "
@@ -411,7 +435,9 @@ def chat(req: ChatReq, request: Request):
     # choose it. Whether spec decode was engaged was twice inferred from a stack trace and
     # once inferred wrongly; base decode is a plausible-looking number, so a silent fallback
     # reads as a kernel regression. Cheap at one line per chat request.
-    print(f"[serve] req stream={req.stream} temp={req.temperature} tools={gram is not None} "
+    use_tools = bool(req.tools) and req.tool_choice != "none"
+    print(f"[serve] req stream={req.stream} temp={req.temperature} tools={use_tools} "
+          f"protocol={eng.protocol.kind} grammar={gram is not None} "
           f"spec_loaded={eng.spec_loaded} -> decoder="
           f"{'DFLASH-SPEC' if _use_spec(req, eng, gram) else 'base'} "
           f"prompt_tokens={len(ids)} max_tokens={req.max_tokens}", flush=True)
@@ -447,7 +473,15 @@ def chat(req: ChatReq, request: Request):
         dt = time.time() - t0
     raw = eng.tok.decode(out, skip_special_tokens=False)
 
-    call = parse_call(raw) if gram is not None else None
+    parsed_atem = eng.protocol.parse_reply(raw) if eng.protocol.kind == "atem" else None
+    if parsed_atem is not None:
+        call = parsed_atem.tool_call
+    elif eng.protocol.kind == "qwen":
+        call = parse_qwen_tool(raw)
+    elif gram is not None:
+        call = parse_call(raw)
+    else:
+        call = None
     if os.environ.get("NOMOS_DEBUG_RAW"):
         print(f"[dbg] nonstream raw={raw[:400]!r}  parsed={call}", flush=True)
     if call:
@@ -457,8 +491,14 @@ def chat(req: ChatReq, request: Request):
             "function": {"name": name, "arguments": json.dumps(args)}}]}
         finish = "tool_calls"
     else:
-        message = {"role": "assistant", "content": _visible(raw)}
-        thought = _thought(raw)
+        if parsed_atem is not None:
+            message = {"role": "assistant", "content": parsed_atem.content}
+            # Muse reasoning is mandatory generation state. Keep it out of content, but expose
+            # it through the same reasoning_content field as Gemma's thinking channel.
+            thought = parsed_atem.reasoning
+        else:
+            message = {"role": "assistant", "content": _visible(raw, thinking)}
+            thought = _thought(raw, thinking)
         if thought:  # surfaced alongside content, never in place of it
             message["reasoning_content"] = thought
         finish = "stop" if (out and out[-1] in eng.stop) else "length"
@@ -467,7 +507,7 @@ def chat(req: ChatReq, request: Request):
         "id": f"chatcmpl-{int(t0 * 1000)}",
         "object": "chat.completion",
         "created": int(t0),
-        "model": req.model or MODEL_ID,
+        "model": req.model or eng.model_name,
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         "usage": {"prompt_tokens": len(ids), "completion_tokens": len(out),
                   "total_tokens": len(ids) + len(out)},

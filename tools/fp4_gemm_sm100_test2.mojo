@@ -8,7 +8,7 @@ per (m,n), unlike the all-ones case. This catches a wrong store-map (which a uni
 tile hides) and verifies per-value E2M1 dequant. Scale-layout (SF-atom) is still
 unit here; test 3 varies scales. E2M1 nibbles 0..7 = {0,.5,1,1.5,2,3,4,6}.
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from lib.fp4_gemm_sm100 import gpu_fp4_gemm_sm100, gpu_nvfp4_sf_scatter
 

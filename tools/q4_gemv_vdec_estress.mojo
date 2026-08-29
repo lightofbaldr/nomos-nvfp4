@@ -20,7 +20,7 @@ ADDITIVE only — does not touch the 4 staged files pulled into canonical.
       -Xlinker -lcudart -Xlinker -lcublas -Xlinker -lm
   gpurun ./build/q4_vdec_estress
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.collections import List
 

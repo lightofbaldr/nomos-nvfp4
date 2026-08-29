@@ -1,0 +1,25 @@
+{
+  "prompts": [
+    {
+      "id": "en_short",
+      "bucket": "prose",
+      "ids": [760, 6511, 314, 9338, 369]
+    },
+    {
+      "id": "code_short",
+      "bucket": "code",
+      "ids": [727, 73111, 1393, 1590, 198, 262, 413, 307, 2564, 220, 16, 25, 198, 285, 460]
+    },
+    {
+      "id": "reason_short",
+      "bucket": "reasoning",
+      "ids": [2592, 264, 5257, 33060, 220, 21, 15, 8491, 303, 220, 16, 13, 20, 3979, 11, 1141, 5289, 4478, 369]
+    }
+  ],
+  "weights": {
+    "prose": 0.3333333333,
+    "code": 0.3333333333,
+    "reasoning": 0.3333333334
+  },
+  "source": "Qwen3.8-27B bf16 golden prompt_ids; replay verbatim, never re-tokenize"
+}

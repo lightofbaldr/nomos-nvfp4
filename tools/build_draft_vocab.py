@@ -24,7 +24,7 @@ import collections, json, os, pathlib, sys
 import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUT = pathlib.Path(os.environ.get("DRAFT_VOCAB_OUT", pathlib.Path.home() / "kvasir/bench/draft_vocab"))
+OUT = pathlib.Path(os.environ.get("DRAFT_VOCAB_OUT", pathlib.Path.home() / "an earlier branch/draft_vocab"))
 OUT.mkdir(parents=True, exist_ok=True)
 TOK_DIR = os.environ.get("TOK_DIR", os.path.expanduser("~/models/gemma-4-31b-it"))
 VOCAB = 262144

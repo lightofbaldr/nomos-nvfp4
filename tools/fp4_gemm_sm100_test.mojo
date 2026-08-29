@@ -9,7 +9,7 @@ Then C[m,n] = sum_{k<K} 1*1 = K. Every C must equal K (=128). A clean first sign
 that the tcgen05 pipeline + SF-atom staging + fragment store are wired right; the
 random + CPU-dequant parity pass comes once this passes.
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from lib.fp4_gemm_sm100 import gpu_fp4_gemm_sm100, gpu_nvfp4_sf_scatter
 

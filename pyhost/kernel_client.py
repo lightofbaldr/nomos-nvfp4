@@ -66,13 +66,17 @@ class KernelClient(_GenMixin):
             (rc,) = struct.unpack_from("<i", resp, 0)
             if rc != 0:
                 raise RuntimeError(f"engine daemon rc={rc}")
-            # Check the frame length explicitly: np.frombuffer's "buffer is smaller than
-            # requested size" IS the desync signature, and naming it beats that bare ValueError.
-            if len(resp) < 4 + 4 * VOCAB:
+            # The payload is profile-sized (Gemma 262144, Muse 202048). Validate its
+            # structure rather than imposing Gemma's size on every daemon response.
+            payload_bytes = len(resp) - 4
+            if payload_bytes <= 0 or payload_bytes % 4 != 0:
                 raise RuntimeError(
-                    f"short logits frame: got {len(resp)} bytes, want {4 + 4 * VOCAB} "
+                    f"malformed logits frame: got {len(resp)} bytes "
                     "(engine daemon connection desynced)")
-            return np.frombuffer(resp, dtype=np.float32, count=VOCAB, offset=4)
+            count = payload_bytes // 4
+            if count > VOCAB:
+                raise RuntimeError(f"oversized logits frame: {count} values (max {VOCAB})")
+            return np.frombuffer(resp, dtype=np.float32, count=count, offset=4)
         except Exception:
             self._dirty = True
             raise
@@ -110,6 +114,10 @@ class KernelClient(_GenMixin):
 
     def cache_len(self) -> int:
         return self._rc_call(struct.pack("<B", wire.OP_CACHE_LEN))
+
+    def model_id(self) -> int:
+        """Return the model profile compiled into the daemon's kernel."""
+        return self._rc_call(struct.pack("<B", wire.OP_MODEL_ID))
 
     def dflash_load(self, dflash_dir: str) -> None:
         if not dflash_dir.endswith("/"):

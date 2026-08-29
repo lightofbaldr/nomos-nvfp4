@@ -21,11 +21,11 @@ UInt64 → UnsafePointer reinterpret can disappear; signatures will accept
 DeviceBuffer directly.
 """
 
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim, grid_dim
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim, grid_dim
 from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
 from std.memory import UnsafePointer
-from std.math import exp, cos, sin, tanh
+from std.math import exp, log, cos, sin, tanh, floor, ceil
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,6 +194,56 @@ def gpu_gelu_mul_mojo(
     )
 
 
+# Muse-Glimmer MLP: dst = silu(gate) * other.
+def silu_mul_kernel(
+    dst: UnsafePointer[Float32, MutAnyOrigin],
+    gate: UnsafePointer[Float32, MutAnyOrigin],
+    other: UnsafePointer[Float32, MutAnyOrigin],
+    n_arg: Int32,
+):
+    var n = Int(n_arg)
+    var i = block_idx.x * block_dim.x + thread_idx.x
+    if i < n:
+        var v = gate[i]
+        dst[i] = (v / (1.0 + exp(-v))) * other[i]
+
+
+def gpu_silu_mul_mojo(
+    ctx: DeviceContext, d_dst: UInt64, d_gate: UInt64, d_other: UInt64, n: Int
+) raises:
+    var threads = 256
+    var blocks = (n + threads - 1) // threads
+    var k = ctx.compile_function[silu_mul_kernel]()
+    ctx.enqueue_function(
+        k, _as_f32_ptr(d_dst), _as_f32_ptr(d_gate), _as_f32_ptr(d_other), Int32(n),
+        grid_dim=blocks, block_dim=threads,
+    )
+
+
+# Muse-Glimmer attention gate: attn *= sigmoid(gate_proj(layer_input)).
+def sigmoid_mul_inplace_kernel(
+    x: UnsafePointer[Float32, MutAnyOrigin],
+    gate: UnsafePointer[Float32, MutAnyOrigin],
+    n_arg: Int32,
+):
+    var n = Int(n_arg)
+    var i = block_idx.x * block_dim.x + thread_idx.x
+    if i < n:
+        x[i] = x[i] / (1.0 + exp(-gate[i]))
+
+
+def gpu_sigmoid_mul_inplace_mojo(
+    ctx: DeviceContext, d_x: UInt64, d_gate: UInt64, n: Int
+) raises:
+    var threads = 256
+    var blocks = (n + threads - 1) // threads
+    var k = ctx.compile_function[sigmoid_mul_inplace_kernel]()
+    ctx.enqueue_function(
+        k, _as_f32_ptr(d_x), _as_f32_ptr(d_gate), Int32(n),
+        grid_dim=blocks, block_dim=threads,
+    )
+
+
 # ── silu: x[i] = x[i] * sigmoid(x[i])  (SwiGLU gate; Llama-style MLPs) ────────
 # Ported from M3's eagle3 commit (6c09c79) for the EAGLE-3 drafter SwiGLU.
 def silu_kernel(
@@ -303,6 +353,46 @@ def gpu_embed_copy_fp32_mojo(ctx: DeviceContext, d_x: UInt64, d_src: UInt64,
     )
 
 
+# Qwen3.5 stores each attention head's projection as [query, gate].  The
+# projection therefore cannot be split with one contiguous memcpy: rows are
+# [h0.q, h0.g, h1.q, h1.g, ...].
+def split_q_gate_interleaved_kernel(
+    q: UnsafePointer[Float32, MutAnyOrigin],
+    gate: UnsafePointer[Float32, MutAnyOrigin],
+    raw: UnsafePointer[Float32, MutAnyOrigin],
+    qd_arg: Int32,
+    hd_arg: Int32,
+    n_arg: Int32,
+):
+    var qd = Int(qd_arg)
+    var hd = Int(hd_arg)
+    var n = Int(n_arg)
+    var i = block_idx.x * block_dim.x + thread_idx.x
+    if i < n:
+        var row = i // qd
+        var col = i - row * qd
+        var head = col // hd
+        var lane = col - head * hd
+        var src = row * (2 * qd) + head * (2 * hd) + lane
+        q[i] = raw[src]
+        gate[i] = raw[src + hd]
+
+
+def gpu_split_q_gate_interleaved_mojo(
+    ctx: DeviceContext, d_q: UInt64, d_gate: UInt64, d_raw: UInt64,
+    rows: Int, qd: Int, hd: Int,
+) raises:
+    var n = rows * qd
+    var threads = 256
+    var blocks = (n + threads - 1) // threads
+    var k = ctx.compile_function[split_q_gate_interleaved_kernel]()
+    ctx.enqueue_function(
+        k, _as_f32_ptr(d_q), _as_f32_ptr(d_gate), _as_f32_ptr(d_raw),
+        Int32(qd), Int32(hd), Int32(n),
+        grid_dim=blocks, block_dim=threads,
+    )
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 3. RoPE — per-head position-dependent rotation
 # ═════════════════════════════════════════════════════════════════════════════
@@ -340,9 +430,7 @@ def rope_kernel(
     # layers rope_dim == hd so these collapse to the same; for full-attn
     # layers (proportional RoPE, rope_dim < hd) they differ.
     var exponent = (2.0 * Float32(idx)) / Float32(hd)
-    var ln_theta: Float32 = 9.21034037   # ln(10000), Gemma-4 default
-    if theta == 1000000.0:
-        ln_theta = 13.81551056
+    var ln_theta = log(theta)
     var inv_freq = exp(-exponent * ln_theta)
     var angle = Float32(pos) * inv_freq
     var c = cos(angle)
@@ -392,9 +480,7 @@ def rope_kernel_batched(
     var pos = base_pos + token
     var row_off = (token * n_heads + head) * hd
     var exponent = (2.0 * Float32(idx)) / Float32(hd)
-    var ln_theta: Float32 = 9.21034037
-    if theta == 1000000.0:
-        ln_theta = 13.81551056
+    var ln_theta = log(theta)
     var inv_freq = exp(-exponent * ln_theta)
     var angle = Float32(pos) * inv_freq
     var c = cos(angle)
@@ -416,6 +502,83 @@ def gpu_rope_batched_mojo(ctx: DeviceContext, d_x: UInt64, base_pos: Int, S: Int
     ctx.enqueue_function(
         k, _as_f32_ptr(d_x), Int32(base_pos), Int32(S), Int32(n_heads), Int32(hd), theta, Int32(rope_dim),
         grid_dim=(n_heads, blocks_y, S), block_dim=threads,
+    )
+
+
+# ── YaRN RoPE for target models ─────────────────────────────────────────────────────
+# Mirrors transformers.modeling_rope_utils._compute_yarn_parameters. The
+# correction bounds are derived on device from beta/theta/original_max rather
+# than copied from a particular model (the DSpark helper's [14,29] is not OLMo).
+def yarn_rope_kernel_batched(
+    x: UnsafePointer[Float32, MutAnyOrigin],
+    base_pos_arg: Int32, S_arg: Int32, n_heads_arg: Int32, hd_arg: Int32,
+    theta: Float32, factor: Float32, original_max_arg: Int32,
+    beta_fast: Float32, beta_slow: Float32, attention_factor: Float32,
+):
+    var S = Int(S_arg)
+    var n_heads = Int(n_heads_arg)
+    var hd = Int(hd_arg)
+    var token = block_idx.z
+    var head = block_idx.x
+    var idx = thread_idx.x + block_idx.y * block_dim.x
+    var half = hd // 2
+    if token >= S or head >= n_heads or idx >= half:
+        return
+
+    # HF truncate=True: floor(low), ceil(high), clamped to [0, dim-1].
+    var dim = Float32(hd)
+    var original_max = Float32(Int(original_max_arg))
+    var denom = Float32(2.0) * log(theta)
+    var low_f = dim * log(original_max / (beta_fast * Float32(2.0 * 3.141592653589793))) / denom
+    var high_f = dim * log(original_max / (beta_slow * Float32(2.0 * 3.141592653589793))) / denom
+    var low = floor(low_f)
+    var high = ceil(high_f)
+    if low < 0.0: low = 0.0
+    if high > dim - 1.0: high = dim - 1.0
+    if high == low: high += 0.001
+
+    var ramp = (Float32(idx) - low) / (high - low)
+    if ramp < 0.0: ramp = 0.0
+    if ramp > 1.0: ramp = 1.0
+    var exponent = Float32(2 * idx) / dim
+    var inv_extrap = exp(-exponent * log(theta))
+    var inv_interp = inv_extrap / factor
+    # HF: interpolation*ramp + extrapolation*(1-ramp).
+    var inv_freq = inv_interp * ramp + inv_extrap * (1.0 - ramp)
+    var angle = Float32(Int(base_pos_arg) + token) * inv_freq
+    var c = cos(angle) * attention_factor
+    var s = sin(angle) * attention_factor
+    var off = (token * n_heads + head) * hd
+    var a = x[off + idx]
+    var b = x[off + idx + half]
+    x[off + idx] = a * c - b * s
+    x[off + idx + half] = a * s + b * c
+
+
+def gpu_yarn_rope_batched_mojo(
+    ctx: DeviceContext, d_x: UInt64, base_pos: Int, S: Int, n_heads: Int,
+    hd: Int, theta: Float32, factor: Float32, original_max: Int,
+    beta_fast: Float32, beta_slow: Float32, attention_factor: Float32,
+) raises:
+    var threads = 128 if hd // 2 >= 128 else hd // 2
+    if threads <= 0: threads = 1
+    var blocks_y = (hd // 2 + threads - 1) // threads
+    var k = ctx.compile_function[yarn_rope_kernel_batched]()
+    ctx.enqueue_function(
+        k, _as_f32_ptr(d_x), Int32(base_pos), Int32(S), Int32(n_heads),
+        Int32(hd), theta, factor, Int32(original_max), beta_fast, beta_slow,
+        attention_factor, grid_dim=(n_heads, blocks_y, S), block_dim=threads,
+    )
+
+
+def gpu_yarn_rope_mojo(
+    ctx: DeviceContext, d_x: UInt64, pos: Int, n_heads: Int, hd: Int,
+    theta: Float32, factor: Float32, original_max: Int,
+    beta_fast: Float32, beta_slow: Float32, attention_factor: Float32,
+) raises:
+    gpu_yarn_rope_batched_mojo(
+        ctx, d_x, pos, 1, n_heads, hd, theta, factor, original_max,
+        beta_fast, beta_slow, attention_factor,
     )
 
 

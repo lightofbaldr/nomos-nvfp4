@@ -3,7 +3,7 @@ Quantize a [n_rows, dim] bf16 buffer (per-row absmax INT8) then dequant, report
 RMSE/||X|| — INT8 should be near-lossless (well under 1%). Run:
   pixi run mojo run -I . --target-accelerator sm_121a tools/kv_quant_test.mojo
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.random import random_ui64
 from std.math import sqrt

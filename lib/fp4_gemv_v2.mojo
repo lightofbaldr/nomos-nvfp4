@@ -31,10 +31,11 @@ Same device-address ABI + NVFP4 blob layout as lib/fp4_weights (dequant math reu
 import — single source of truth for the codec). Requires Mojo >=1.0.0b3 +
 --target-accelerator sm_121a.
 """
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim, grid_dim, barrier
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim, grid_dim
+from max.gpu import barrier
 from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
-from std.gpu.memory import AddressSpace
+from max.gpu.memory import AddressSpace
 from std.memory import UnsafePointer, bitcast
 from layout import row_major
 from layout import stack_allocation
@@ -426,7 +427,7 @@ def gpu_lm_head_greedy_dev(
 # ═════════════════════════════════════════════════════════════════════════════
 # v3 GEMV: VECTORIZED ARITHMETIC E2M1 DECODE (the real raw-kernel lever).
 #
-# v1/v2 measured ~3.3-3.6x OVER the HBM roofline on every HBM-bound shape (UNIT_A_RESULTS_v1.md):
+# v1/v2 measured ~3.3-3.6x OVER the HBM roofline on every HBM-bound shape (internal notes):
 # the bottleneck is NOT memory (weight read is already coalesced+minimal) but the PER-ELEMENT
 # SCALAR DEQUANT in v1's inner loop (16 scalar iters/block: nibble shift+mask, sign branch,
 # e2m1_mag branch). v3 vectorizes that decode via a BRANCHLESS ARITHMETIC E2M1->fp32 bit-decode
@@ -536,7 +537,7 @@ def nvfp4_gemv_v3_kernel(
 
 
 comptime NVFP4_GEMV_SMAX = 8   # multirow verify readout: rows batched per launch
-# OUTPUT rows per warp. NCU on Gold/sm_120 (Codex, 095224b1) says both this kernel and the S=1
+# OUTPUT rows per warp. NCU on the RTX PRO 4000/sm_120 (Codex, 095224b1) says both this kernel and the S=1
 # v3 are L1/TEX load-path bound — lg_throttle is 66%/73% of the entire issue gap, DRAM is only
 # 4.97%/22.35% and compute 14.57%/32.70%, with zero spills. The limiter is activation load
 # INSTRUCTIONS, not bytes: every output warp re-traverses all K activations, so 704 MiB (S=1) /
@@ -564,7 +565,7 @@ def nvfp4_gemv_v3_multirow_kernel[SMAX: Int](
 
     WHY: the NVFP4 verify readout called the single-row GEMV once per row, and each call
     re-streams the WHOLE 749 MB embedding matrix to produce one row of logits. At S=5 that
-    is ~3.7 GB of weight traffic for 5 rows. Measured on Gold: read_lmhead = 23.22 ms/call,
+    is ~3.7 GB of weight traffic for 5 rows. Measured on the RTX PRO 4000: read_lmhead = 23.22 ms/call,
     31.6% of the whole verify. Reading the weights once cuts that by ~S.
 
     BIT-EXACT vs the single-row v3 kernel, by construction and not by hope:
@@ -664,6 +665,41 @@ def gpu_matmul_nvfp4_fused_v3_multirow_dev(
             kern,
             _as_u8_ptr(d_w_nvfp4), _as_f32_ptr(d_in_fp32), _as_f32_ptr(d_out_fp32),
             global_scale, Int32(K), Int32(N), Int32(nb), Int32(S), Int32(row_base),
+            grid_dim=blocks, block_dim=NVFP4_WARPS_PER_BLOCK * WARP_SIZE,
+        )
+        row_base += rows
+
+
+def gpu_matmul_nvfp4_fused_v3_s1_r4_dev(
+    ctx: DeviceContext,
+    d_out_fp32: UInt64,     # [N]
+    d_in_fp32: UInt64,      # [K]
+    d_w_nvfp4: UInt64,
+    global_scale: Float32,
+    K: Int,
+    N: Int,
+) raises:
+    """Decode-only R=4 launch of the exact multirow kernel, specialized to S=SMAX=1.
+
+    Keeping SMAX at one avoids paying the verify wrapper's eight accumulator columns in the
+    M=1 lm-head path. The kernel still preserves v3's per-output block traversal, sequential
+    t=0..15 accumulation, and warp reduction; only four adjacent output rows share each
+    activation load.
+    """
+    var nb = (K * N) // FP4_GROUP
+    var kern = ctx.compile_function[nvfp4_gemv_v3_multirow_kernel[1]]()
+    var rows_per_launch = 32768
+    var row_base = 0
+    while row_base < N:
+        var rows = N - row_base
+        if rows > rows_per_launch:
+            rows = rows_per_launch
+        var rows_per_blk = NVFP4_WARPS_PER_BLOCK * NVFP4_GEMV_ROWS
+        var blocks = (rows + rows_per_blk - 1) // rows_per_blk
+        ctx.enqueue_function(
+            kern,
+            _as_u8_ptr(d_w_nvfp4), _as_f32_ptr(d_in_fp32), _as_f32_ptr(d_out_fp32),
+            global_scale, Int32(K), Int32(N), Int32(nb), Int32(1), Int32(row_base),
             grid_dim=blocks, block_dim=NVFP4_WARPS_PER_BLOCK * WARP_SIZE,
         )
         row_base += rows

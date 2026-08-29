@@ -5,7 +5,7 @@ Replaces the O(S²) per-token attention loop in engine_prefill (S calls ×
 prompt's attention for a layer is 5 launches: transpose-Q, batched Q·Kᵀ,
 causal softmax, batched scores·V, transpose-out.
 
-The GQA layout problem + fix (see docs/BATCHED_ATTENTION_PLAN.md):
+The GQA layout problem + fix (see internal notes):
   d_q_b is [S, nkv, kvg, l_hd] (token-major). A kv-head's kvg*S query rows
   are interleaved across tokens, so a strided GEMM can't read them. We first
   block-transpose Q to [nkv, S, kvg*l_hd] → then kv-head h is the contiguous
@@ -19,10 +19,11 @@ Not byte-identical (cuBLAS reduces N=S vs N=s+1 differently) — gate on greedy
 tokens / residual cosine, not bytes.
 """
 
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim, barrier
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
+from max.gpu import barrier
 from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
-from std.gpu.memory import AddressSpace
+from max.gpu.memory import AddressSpace
 from std.memory import UnsafePointer, bitcast
 from std.math import exp
 from layout import row_major

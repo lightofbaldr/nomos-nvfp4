@@ -1,6 +1,6 @@
 [workspace]
 authors = ["Adam Kruger <adam@revelry-inc.com>"]
-channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+channels = ["https://conda.modular.com/max", "conda-forge"]
 name = "nomos-kernel"
 platforms = ["linux-aarch64", "linux-64"]
 version = "0.1.0"
@@ -10,11 +10,36 @@ serve = "bash pyhost/serve_nomos.sh up"     # arch-detect quant, start engine+se
 stop = "bash pyhost/serve_nomos.sh down"
 
 [dependencies]
-mojo = "==1.0.0b3.dev2026080106"
+mojo = "==1.0.0"
 python = ">=3.12"
 pytorch = ">=2.10.0,<3"
 torchvision = ">=0.26.0,<0.27"
-max-core = "==26.5.0.dev2026080106"
+max-core = "==26.5.0"
+
+# CUDA DECLARED EXPLICITLY. main's own nomos_cuda_budget.c does `#include <cuda_runtime_api.h>`
+# and the link needs -lcudart/-lcublas, but neither was ever declared here: cuBLAS arrived only
+# as an UNDECLARED TRANSITIVE of max-core, and cudart/headers not at all. main therefore only
+# ever built on a box that happens to carry a SYSTEM CUDA at /usr/local/cuda. That is the
+# "correct measurements of a configuration nobody runs" shape (2026-08-08) applied to a build:
+# green for a reason unrelated to what the project declares.
+#
+# THE SHARP EDGE THIS FIXES (root-caused 2026-08-15, and the reason "the CUDA issue" recurred
+# on EVERY branch switch): `.pixi/envs/default` is ONE shared environment, reconciled against
+# whichever manifest is checked out. an earlier branch declares CUDA; main did not. So
+# checking out main and running `pixi install` REMOVED cudart/cublas from the env, and checking
+# out the branch put them back. Measured live: 3 libcudart files -> 0 on switching to main, and
+# back to 3 on returning. Worse, `pixi install` currently panics at the pypi stage AFTER the
+# conda changes land, so it can strip CUDA and then die, leaving a half-configured env and a
+# build that fails with "cannot find -lcudart" for reasons nothing on the branch explains.
+# Declaring CUDA on BOTH branches makes the shared env stable across switches.
+#
+# SCOPED TO linux-64 ON PURPOSE. This workspace declares two platforms (linux-aarch64 for
+# the GB10 dev box / GB10, linux-64 for the 5090). These are the x86 CUDA packages; forcing them to
+# solve for aarch64 too is what made `pixi install` panic (aarch64 wants the sbsa layout).
+# Per-target is also the honest shape: every arch builds its own .so, and a .so is never
+# copied across arches.
+
+[target.linux-64.dependencies]
 cuda-version = ">=12.8"
 cuda-cudart-dev = ">=13.3.29,<14"
 libcublas-dev = ">=13.6.0.2,<14"

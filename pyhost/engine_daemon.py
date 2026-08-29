@@ -61,6 +61,8 @@ def _serve_conn(conn: socket.socket, lm: KernelLM, state: dict) -> None:
                 resp = struct.pack("<i", lm.cache_len())
             elif op == wire.OP_PING:
                 resp = struct.pack("<i", 0)
+            elif op == wire.OP_MODEL_ID:
+                resp = struct.pack("<i", lm.model_id())
             elif op == wire.OP_DFLASH_LOAD:
                 dflash_dir = body[1:].decode()
                 lm.dflash_load(dflash_dir)

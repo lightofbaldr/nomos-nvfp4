@@ -3,7 +3,7 @@ Quantize a [M,K] activation to NVFP4 on the GPU, dequant on the host (per-token 
 e4m3 block scale × E2M1), and report RMSE/||A|| — must land in the FP4 band (a few %),
 not garbage. Run: pixi run mojo run -I . --target-accelerator sm_121a tools/fp4_act_test.mojo
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.random import random_ui64
 from std.math import sqrt

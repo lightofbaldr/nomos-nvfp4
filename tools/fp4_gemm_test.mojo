@@ -4,7 +4,7 @@ Proves C[M,N]=A@Bᵀ on the NVFP4 tensor core bit-exact vs a host block-scaled r
 across: real K depth (D=5376, FF=21504), multi-tile M/N, and M/N padding. Run from repo root:
   pixi run mojo run --target-accelerator sm_121a tools/fp4_gemm_test.mojo
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.random import random_ui64
 from lib.fp4_gemm import fp4_gemm_kernel

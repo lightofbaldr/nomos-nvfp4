@@ -8,7 +8,7 @@ Compile+run:
       -Xlinker -lcudart -Xlinker -lcublas -Xlinker -lm
   gpurun ./build/v3_parity
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.collections import List
 

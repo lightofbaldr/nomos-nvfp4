@@ -9,19 +9,21 @@ The per-token global is applied AFTER the MMA (× weight_global). e4m3 is encode
 (b3 has no f32→f8e4m3fn cast); decode reuses lib/fp4_weights.e4m3_decode. Mojo 1.0.0b3 +
 --target-accelerator sm_121a. Layout matches lib/fp4_gemm: packed low nibble=elem 2j, high=2j+1.
 """
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim, grid_dim, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim, grid_dim
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
 from std.memory import UnsafePointer, stack_allocation
 from std.ffi import external_call
 from lib.fp4_weights import e4m3_decode
-from lib.fp4_gemm import gpu_fp4_gemm, gpu_fp4_gemm_ps, qa_fuse_route
+from lib.fp4_gemm import gpu_fp4_gemm, gpu_fp4_gemm_ps, gpu_fp4_gemm_ps_grouped4, qa_fuse_route
 from lib.fp4_gemm import gpu_fp4_gemm_ps_m, qa_fuse_route_m
-from lib.fp4_gemm import _qa_fuse_env_off
+from lib.fp4_gemm import _qa_fuse_env_off, _fp4_old_kernel_forced
 # NVFP4 encode helpers live in lib/fp4_gemm since R2 Phase B (the in-GEMM A-tile
 # encode needs them there; fp4_act imports fp4_gemm so they moved to avoid a cycle).
-from lib.fp4_gemm import E2M1_MAX, E4M3_MAX, _f32_to_e4m3_byte, _e2m1_nibble
+from lib.fp4_gemm import E2M1_MAX, E4M3_MAX, FP4_SMEM_WARPS, FP4_TK_STAGE
+from lib.fp4_gemm import _f32_to_e4m3_byte, _e2m1_nibble
 from lib.fp4_gemm_sm100 import gpu_fp4_gemm_sm100, gpu_nvfp4_sf_scatter
 
 
@@ -544,6 +546,59 @@ def gpu_matmul_nvfp4_w4a4_prequant_dev(
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(d_act_global)),
         weight_global, Int32(M), Int32(N),
         grid_dim=blocks, block_dim=threads,
+    )
+
+
+def w4a4_prequant_grouped4_route(
+    K: Int, N0: Int, N1: Int, N2: Int, N3: Int,
+) -> Bool:
+    """Whether all four segments fit the exact NS=3/TK=4 fused-postscale base tile.
+
+    Environment kill switches are resolved once by engine_decode before the layer loop;
+    this per-layer predicate stays pure geometry so the experiment does not add repeated
+    getenv/list-allocation overhead.
+    """
+    return (
+        K % (FP4_TK_STAGE * 64) == 0
+        and N0 % (8 * FP4_SMEM_WARPS) == 0
+        and N1 % (8 * FP4_SMEM_WARPS) == 0
+        and N2 % (8 * FP4_SMEM_WARPS) == 0
+        and N3 % (8 * FP4_SMEM_WARPS) == 0
+    )
+
+
+def w4a4_prequant_grouped4_env_enabled() -> Bool:
+    """Honor the existing fused-postscale and old-kernel kill switches exactly once."""
+    return not _qa_fuse_env_off() and not _fp4_old_kernel_forced()
+
+
+def gpu_matmul_nvfp4_w4a4_prequant_grouped4_dev(
+    ctx: DeviceContext,
+    d_out0: UInt64, d_w0: UInt64, weight_global0: Float32, N0: Int,
+    d_out1: UInt64, d_w1: UInt64, weight_global1: Float32, N1: Int,
+    d_out2: UInt64, d_w2: UInt64, weight_global2: Float32, N2: Int,
+    d_out3: UInt64, d_w3: UInt64, weight_global3: Float32, N3: Int,
+    d_act_packed: UInt64, d_act_bs: UInt64, d_act_global: UInt64,
+    K: Int,
+) raises:
+    """Grouped decode projection over four separately encoded NVFP4 weight blobs.
+
+    Each blob keeps its own scale-byte base, packed-byte offset, global multiplier,
+    and output pointer. The shared activation was already quantized once by the caller.
+    """
+    var nb0 = (N0 * K) // 16
+    var nb1 = (N1 * K) // 16
+    var nb2 = (N2 * K) // 16
+    var nb3 = (N3 * K) // 16
+    gpu_fp4_gemm_ps_grouped4(
+        ctx,
+        d_out0, d_out1, d_out2, d_out3,
+        d_act_packed, d_act_bs, d_act_global,
+        d_w0 + UInt64(nb0), d_w1 + UInt64(nb1),
+        d_w2 + UInt64(nb2), d_w3 + UInt64(nb3),
+        d_w0, d_w1, d_w2, d_w3,
+        weight_global0, weight_global1, weight_global2, weight_global3,
+        N0, N1, N2, N3, K,
     )
 
 

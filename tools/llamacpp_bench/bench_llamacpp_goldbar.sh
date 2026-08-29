@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Fair same-card llama.cpp bench on Gold GPU0 over the 12-prompt gold bar.
+# Fair same-card llama.cpp bench on the RTX PRO 4000 GPU0 over the 12-prompt gold bar.
 # Pinned to physical GPU0 by UUID so it can NEVER land on GPU1 (llama-server)
 # or GPU2 (ollama). Raw completion mode (-no-cnv): the gold-bar prompts are
 # already gemma-4 chat-formatted, so we must NOT re-apply a chat template.
 # Greedy (--temp 0), n=96 (== PERF_NTOK), fa on, full offload (-ngl 99).
 #
-# NOTE: the only ~4-bit gemma GGUF on Gold is the 26B-A4B *MoE* (25.23B total,
+# NOTE: the only ~4-bit gemma GGUF on the RTX PRO 4000 is the 26B-A4B *MoE* (25.23B total,
 # ~4B active) -- NOT the gemma-4-31B *dense* model our 21.7/50 numbers use.
 # So this measures llama.cpp on a structurally lighter model; see report caveats.
 set -euo pipefail

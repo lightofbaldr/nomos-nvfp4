@@ -42,10 +42,10 @@ Parity gates (tools/):
 
 All additive. lib/q4_weights.mojo and the _mm_dev seam UNTOUCHED.
 """
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim
-from std.gpu.memory import AddressSpace
-from std.gpu import barrier
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
+from max.gpu.memory import AddressSpace
+from max.gpu import barrier
 from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
 from std.memory import UnsafePointer, bitcast
 from layout import row_major

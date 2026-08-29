@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fair same-card llama.cpp decode bench on Gold GPU0 over the 12-prompt gold bar.
+"""Fair same-card llama.cpp decode bench on the RTX PRO 4000 GPU0 over the 12-prompt gold bar.
 
 Drives our OWN llama-server (this build's llama-cli is stuck in an interactive
 loop) pinned to physical GPU0 by UUID so it can NEVER touch GPU1 (the other

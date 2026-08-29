@@ -16,11 +16,12 @@ Layout:
 Drop-in for lib/softmax_gpu.mojo — same Python-level signature.
 """
 
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim, barrier
-from std.gpu.primitives import block
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
+from max.gpu import barrier
+from max.gpu.primitives import block
 from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
-from std.gpu.memory import AddressSpace
+from max.gpu.memory import AddressSpace
 from std.memory import UnsafePointer
 from std.math import exp
 from layout import row_major

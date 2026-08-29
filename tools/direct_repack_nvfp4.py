@@ -2,7 +2,7 @@
 """FAITHFUL direct-repack: RedHat compressed-tensors NVFP4 -> Nomos kernel .nvfp4,
 preserving packed BYTES + E4M3 scale BYTES verbatim (NO dequant/requant).
 Header multiplicative global = 1.0 / source weight_global_scale (CT stores a divisor;
-vLLM inverts on load). Per nano_codex's #1 finding.
+vLLM inverts on load). Per Nano's #1 finding.
 
 Kernel .nvfp4 = 24B header [n:i64, n16:i64, gs:f32, pad:f32] + bs[N,K/16] u8(E4M3) + packed[N,K/2] u8.
 Includes a parity gate: decode(my repack) vs CT dequant -> expect ~0 rel error.

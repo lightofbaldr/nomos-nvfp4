@@ -8,8 +8,8 @@ Drop-in for the libcast.so external_call, wrapper takes UInt64 device pointers
 so call sites don't need to change.
 """
 
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
 from std.memory import UnsafePointer, bitcast
 
 
@@ -41,4 +41,31 @@ def gpu_fp32_to_bf16_mojo(
     ctx.enqueue_function(
         k, inp_ptr, dst_ptr, Int32(n),
         grid_dim=blocks, block_dim=threads,
+    )
+
+
+def bf16_to_fp32_kernel(
+    inp: UnsafePointer[UInt16, MutAnyOrigin],
+    dst: UnsafePointer[Float32, MutAnyOrigin],
+    n_arg: Int32,
+):
+    var n = Int(n_arg)
+    var idx = block_idx.x * block_dim.x + thread_idx.x
+    if idx < n:
+        var bits = SIMD[DType.uint16, 1](inp[idx])
+        dst[idx] = bitcast[DType.bfloat16, 1](bits).cast[DType.float32]()[0]
+
+
+def gpu_bf16_to_fp32_mojo(
+    ctx: DeviceContext, d_in_bf16: UInt64, d_out_fp32: UInt64, n: Int
+) raises:
+    """Widen packed BF16 device values to FP32 (used for small norm vectors)."""
+    var threads = 256
+    var blocks = (n + threads - 1) // threads
+    var k = ctx.compile_function[bf16_to_fp32_kernel]()
+    ctx.enqueue_function(
+        k,
+        UnsafePointer[UInt16, MutAnyOrigin](unsafe_from_address=Int(d_in_bf16)),
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(d_out_fp32)),
+        Int32(n), grid_dim=blocks, block_dim=threads,
     )

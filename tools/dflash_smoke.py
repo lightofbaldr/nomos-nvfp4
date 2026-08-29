@@ -101,4 +101,4 @@ lib.nomos_decode_step(ht, base_seed, logits.ctypes.data)
 base_next = int(np.argmax(logits))
 print(f"lossless spot-check: verify_tgt[0]={tgt[0]} vs base_decode_next={base_next} "
       f"({'MATCH' if tgt[0]==base_next else 'MISMATCH'})", flush=True)
-print("SMOKE OK: DFlash Q4 block-draft path RUNS on Gold discrete (no MMU fault).", flush=True)
+print("SMOKE OK: DFlash Q4 block-draft path RUNS on the RTX PRO 4000 discrete (no MMU fault).", flush=True)

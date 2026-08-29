@@ -57,7 +57,7 @@ prior step's `hs` (skip fc — hs is already dB-wide). This is the EAGLE-3
 autoregressive h_next recurrence (fixes #4 — re-using seed taps drafts every
 token from STALE seed context, which tanks acceptance depth).
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import UnsafePointer
 from std.ffi import external_call, c_int, c_size_t
@@ -86,7 +86,7 @@ from lib.eagle3_d2t import eagle3_argmax_d2t
 comptime D2D = 3  # cudaMemcpyDeviceToDevice
 comptime DRAFT_VOCAB = 32000   # real draft_vocab_size (was 32768 — padded tail → OOB d2t)
 comptime TARGET_VOCAB = 262144
-# Weight modes (D2, Gold NVFP4 port). NVFP4 = drafter-study/eagle3-flat blobs on the
+# Weight modes (D2, discrete NVFP4 port). NVFP4 = drafter-study/eagle3-flat blobs on the
 # R2 W4A4 path (prequant dedup + fused postscale). GOLD = the same weights as EXACT
 # checkpoint bf16 (fp32 blob -> bf16 device, lossless) + fp32-activation GEMV — the
 # quant-BYPASS mode for the G2 wiring-parity gate vs the HF Eagle3DraftModel. Q8 is
@@ -623,7 +623,7 @@ def eagle3_commit_prefix(
 def release_eagle3_drafter_handle(handle: UInt64):
     if handle == 0:
         return
-    var ptr = UnsafePointer[Eagle3Drafter, MutExternalOrigin](
+    var ptr = UnsafePointer[Eagle3Drafter, MutUntrackedOrigin](
         unsafe_from_address=Int(handle)
     )
     if ptr[0].w_fc != 0: cuda_free(ptr[0].w_fc)

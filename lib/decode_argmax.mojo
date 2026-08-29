@@ -16,9 +16,10 @@ design", host.py docstring). So we match it exactly with:
 Greedy-only (temp<=0). Sampling (temp>0) / grammar steps keep the full-logits host
 path (the serve falls back to nomos_decode_step for those).
 """
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim, grid_dim, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim, grid_dim
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.memory import UnsafePointer
 from std.math import exp, tanh
 from layout import row_major
@@ -46,6 +47,7 @@ def argmax_logits_kernel(
     logits: UnsafePointer[Float32, MutAnyOrigin],
     n_arg: Int32,
     cap: Float32,
+    multiplier: Float32,
 ):
     # Mojo dev2026080106: bare Int/UInt no longer conform to DevicePassable — GPU
     # kernel args must be fixed-width. Take Int32 and widen once here so the body
@@ -66,7 +68,7 @@ def argmax_logits_kernel(
     var best_i = Int32(0)
     var i = tid
     while i < n:
-        var v = logits[i]
+        var v = logits[i] * multiplier
         if cap > Float32(0.0):
             v = cap * tanh(v / cap)
         if v > best:
@@ -195,6 +197,7 @@ def device_decode_token(
     pen_ids: List[Int32],    # unused in A1 (greedy has no rep-penalty); kept for ABI compat
     rep_penalty: Float32,    # unused in A1
     softcap: Float32 = 30.0,
+    multiplier: Float32 = 1.0,
 ) raises -> Int:
     _ = pen_ids
     _ = rep_penalty
@@ -209,7 +212,7 @@ def device_decode_token(
     # fused softcap+argmax (one block, parallel shared-mem reduce)
     var d_tok = cuda_malloc(4)
     var k_am = ctx.compile_function[argmax_logits_kernel]()
-    ctx.enqueue_function(k_am, _as_i32_ptr(d_tok), lp, Int32(vocab), softcap,
+    ctx.enqueue_function(k_am, _as_i32_ptr(d_tok), lp, Int32(vocab), softcap, multiplier,
                          grid_dim=1, block_dim=ARGMAX_TPB)
     ctx.synchronize()
 
@@ -226,6 +229,7 @@ def device_decode_token_into_stream(
     vocab: Int,
     d_tok: UInt64,
     softcap: Float32 = 30.0,
+    multiplier: Float32 = 1.0,
 ) raises -> Int:
     var lp = _as_f32_ptr(d_logits)
 
@@ -236,6 +240,7 @@ def device_decode_token_into_stream(
         lp,
         Int32(vocab),
         softcap,
+        multiplier,
         grid_dim=1,
         block_dim=ARGMAX_TPB,
     )

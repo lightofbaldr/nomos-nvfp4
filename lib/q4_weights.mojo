@@ -14,8 +14,8 @@ GPU blob layout (host strips the 16-byte .q4 file header): contiguous
 Element i: block = i//32, j = i%32. The (q+8) nibble lives in packed[block*16 + j//2]
 (low nibble for even j, high for odd). w = (nibble - 8) * scale[block].
 """
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
 from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
 from std.memory import UnsafePointer, bitcast
 from lib.cuda import cuda_malloc, cuda_upload_u8

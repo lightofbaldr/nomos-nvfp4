@@ -17,10 +17,11 @@ These complement lib/ops_gpu_mojo.mojo (the trivial kernels). Together
 they cover all 11 kernels in ops_kernel.cu.
 """
 
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim, barrier
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
+from max.gpu import barrier
 from std.gpu.primitives.warp import sum as warp_sum, WARP_SIZE
-from std.gpu.memory import AddressSpace
+from max.gpu.memory import AddressSpace
 from std.memory import UnsafePointer
 from std.math import sqrt
 from layout import row_major
@@ -44,6 +45,7 @@ def rmsnorm_kernel(
     y: UnsafePointer[Float32, MutAnyOrigin],
     w: UnsafePointer[Float32, MutAnyOrigin],
     d_arg: Int32,
+    eps: Float32,
 ):
     var d = Int(d_arg)
     var smem = stack_allocation[
@@ -82,7 +84,7 @@ def rmsnorm_kernel(
     barrier()
 
     var sum_sq = smem[0]
-    var rms_inv = Scalar[DType.float32](1.0) / sqrt(sum_sq / Scalar[DType.float32](d) + EPS_RMSNORM)
+    var rms_inv = Scalar[DType.float32](1.0) / sqrt(sum_sq / Scalar[DType.float32](d) + eps)
 
     # Phase 4: apply
     var j = tid
@@ -92,12 +94,13 @@ def rmsnorm_kernel(
 
 
 def gpu_rmsnorm_mojo(
-    ctx: DeviceContext, d_x: UInt64, d_y: UInt64, d_w: UInt64, d: Int
+    ctx: DeviceContext, d_x: UInt64, d_y: UInt64, d_w: UInt64, d: Int,
+    eps: Float32 = EPS_RMSNORM,
 ) raises:
     var threads = 256 if d < 1024 else 1024
     var k = ctx.compile_function[rmsnorm_kernel]()
     ctx.enqueue_function(
-        k, _as_f32_ptr(d_x), _as_f32_ptr(d_y), _as_f32_ptr(d_w), Int32(d),
+        k, _as_f32_ptr(d_x), _as_f32_ptr(d_y), _as_f32_ptr(d_w), Int32(d), eps,
         grid_dim=1, block_dim=threads,
     )
 
@@ -110,6 +113,7 @@ def rmsnorm_inplace_kernel(
     x: UnsafePointer[Float32, MutAnyOrigin],
     w: UnsafePointer[Float32, MutAnyOrigin],
     d_arg: Int32,
+    eps: Float32,
 ):
     var d = Int(d_arg)
     var smem = stack_allocation[
@@ -144,7 +148,7 @@ def rmsnorm_inplace_kernel(
     barrier()
 
     var sum_sq = smem[0]
-    var rms_inv = Scalar[DType.float32](1.0) / sqrt(sum_sq / Scalar[DType.float32](d) + EPS_RMSNORM)
+    var rms_inv = Scalar[DType.float32](1.0) / sqrt(sum_sq / Scalar[DType.float32](d) + eps)
 
     var j = tid
     while j < d:
@@ -153,12 +157,13 @@ def rmsnorm_inplace_kernel(
 
 
 def gpu_rmsnorm_inplace_mojo(
-    ctx: DeviceContext, d_x: UInt64, d_w: UInt64, d: Int
+    ctx: DeviceContext, d_x: UInt64, d_w: UInt64, d: Int,
+    eps: Float32 = EPS_RMSNORM,
 ) raises:
     var threads = 256 if d < 1024 else 1024
     var k = ctx.compile_function[rmsnorm_inplace_kernel]()
     ctx.enqueue_function(
-        k, _as_f32_ptr(d_x), _as_f32_ptr(d_w), Int32(d),
+        k, _as_f32_ptr(d_x), _as_f32_ptr(d_w), Int32(d), eps,
         grid_dim=1, block_dim=threads,
     )
 
@@ -244,6 +249,7 @@ def rmsnorm_kernel_batched(
     y: UnsafePointer[Float32, MutAnyOrigin],
     w: UnsafePointer[Float32, MutAnyOrigin],
     d_arg: Int32,
+    eps: Float32,
 ):
     var d = Int(d_arg)
     var smem = stack_allocation[
@@ -275,7 +281,7 @@ def rmsnorm_kernel_batched(
             smem[0] = total
     barrier()
     var sum_sq = smem[0]
-    var rms_inv = Scalar[DType.float32](1.0) / sqrt(sum_sq / Scalar[DType.float32](d) + EPS_RMSNORM)
+    var rms_inv = Scalar[DType.float32](1.0) / sqrt(sum_sq / Scalar[DType.float32](d) + eps)
     var j = tid
     while j < d:
         y[row_off + j] = Float32(x[row_off + j] * Float32(rms_inv) * w[j])
@@ -283,12 +289,13 @@ def rmsnorm_kernel_batched(
 
 
 def gpu_rmsnorm_batched_mojo(
-    ctx: DeviceContext, d_x: UInt64, d_y: UInt64, d_w: UInt64, d: Int, S: Int
+    ctx: DeviceContext, d_x: UInt64, d_y: UInt64, d_w: UInt64, d: Int, S: Int,
+    eps: Float32 = EPS_RMSNORM,
 ) raises:
     var threads = 256 if d < 1024 else 1024
     var k = ctx.compile_function[rmsnorm_kernel_batched]()
     ctx.enqueue_function(
-        k, _as_f32_ptr(d_x), _as_f32_ptr(d_y), _as_f32_ptr(d_w), Int32(d),
+        k, _as_f32_ptr(d_x), _as_f32_ptr(d_y), _as_f32_ptr(d_w), Int32(d), eps,
         grid_dim=S, block_dim=threads,
     )
 
@@ -297,6 +304,7 @@ def rmsnorm_inplace_kernel_batched(
     x: UnsafePointer[Float32, MutAnyOrigin],
     w: UnsafePointer[Float32, MutAnyOrigin],
     d_arg: Int32,
+    eps: Float32,
 ):
     var d = Int(d_arg)
     var smem = stack_allocation[
@@ -328,7 +336,7 @@ def rmsnorm_inplace_kernel_batched(
             smem[0] = total
     barrier()
     var sum_sq = smem[0]
-    var rms_inv = Scalar[DType.float32](1.0) / sqrt(sum_sq / Scalar[DType.float32](d) + EPS_RMSNORM)
+    var rms_inv = Scalar[DType.float32](1.0) / sqrt(sum_sq / Scalar[DType.float32](d) + eps)
     var j = tid
     while j < d:
         x[row_off + j] = Float32(x[row_off + j] * Float32(rms_inv) * w[j])
@@ -336,12 +344,13 @@ def rmsnorm_inplace_kernel_batched(
 
 
 def gpu_rmsnorm_inplace_batched_mojo(
-    ctx: DeviceContext, d_x: UInt64, d_w: UInt64, d: Int, S: Int
+    ctx: DeviceContext, d_x: UInt64, d_w: UInt64, d: Int, S: Int,
+    eps: Float32 = EPS_RMSNORM,
 ) raises:
     var threads = 256 if d < 1024 else 1024
     var k = ctx.compile_function[rmsnorm_inplace_kernel_batched]()
     ctx.enqueue_function(
-        k, _as_f32_ptr(d_x), _as_f32_ptr(d_w), Int32(d),
+        k, _as_f32_ptr(d_x), _as_f32_ptr(d_w), Int32(d), eps,
         grid_dim=S, block_dim=threads,
     )
 
@@ -354,6 +363,8 @@ def rmsnorm_no_weight_kernel(
     x: UnsafePointer[Float32, MutAnyOrigin],
     n_heads_arg: Int32,
     hd_arg: Int32,
+    eps: Float32,
+    scale: Float32,
 ):
     var n_heads = Int(n_heads_arg)
     var hd = Int(hd_arg)
@@ -394,23 +405,24 @@ def rmsnorm_no_weight_kernel(
     barrier()
 
     var sum_sq = smem[0]
-    var rms_inv = Scalar[DType.float32](1.0) / sqrt(sum_sq / Scalar[DType.float32](hd) + EPS_RMSNORM)
+    var rms_inv = Scalar[DType.float32](1.0) / sqrt(sum_sq / Scalar[DType.float32](hd) + eps)
 
     var j = tid
     while j < hd:
-        x[row_off + j] = Float32(x[row_off + j] * Float32(rms_inv))
+        x[row_off + j] = Float32(x[row_off + j] * Float32(rms_inv) * scale)
         j += n_threads
 
 
 def gpu_rmsnorm_no_weight_mojo(
-    ctx: DeviceContext, d_x: UInt64, n_heads: Int, hd: Int
+    ctx: DeviceContext, d_x: UInt64, n_heads: Int, hd: Int,
+    eps: Float32 = EPS_RMSNORM, scale: Float32 = 1.0,
 ) raises:
     var threads = 64 if hd < 256 else 256
     if threads < 32:
         threads = 32
     var k = ctx.compile_function[rmsnorm_no_weight_kernel]()
     ctx.enqueue_function(
-        k, _as_f32_ptr(d_x), Int32(n_heads), Int32(hd),
+        k, _as_f32_ptr(d_x), Int32(n_heads), Int32(hd), eps, scale,
         grid_dim=n_heads, block_dim=threads,
     )
 
@@ -424,6 +436,7 @@ def qk_norm_kernel(
     w: UnsafePointer[Float32, MutAnyOrigin],
     n_heads_arg: Int32,
     hd_arg: Int32,
+    eps: Float32,
 ):
     var n_heads = Int(n_heads_arg)
     var hd = Int(hd_arg)
@@ -464,7 +477,7 @@ def qk_norm_kernel(
     barrier()
 
     var sum_sq = smem[0]
-    var rms_inv = Scalar[DType.float32](1.0) / sqrt(sum_sq / Scalar[DType.float32](hd) + EPS_RMSNORM)
+    var rms_inv = Scalar[DType.float32](1.0) / sqrt(sum_sq / Scalar[DType.float32](hd) + eps)
 
     var j = tid
     while j < hd:
@@ -473,13 +486,14 @@ def qk_norm_kernel(
 
 
 def gpu_qk_norm_mojo(
-    ctx: DeviceContext, d_x: UInt64, d_w: UInt64, n_heads: Int, hd: Int
+    ctx: DeviceContext, d_x: UInt64, d_w: UInt64, n_heads: Int, hd: Int,
+    eps: Float32 = EPS_RMSNORM,
 ) raises:
     var threads = 64 if hd < 256 else 256
     if threads < 32:
         threads = 32
     var k = ctx.compile_function[qk_norm_kernel]()
     ctx.enqueue_function(
-        k, _as_f32_ptr(d_x), _as_f32_ptr(d_w), Int32(n_heads), Int32(hd),
+        k, _as_f32_ptr(d_x), _as_f32_ptr(d_w), Int32(n_heads), Int32(hd), eps,
         grid_dim=n_heads, block_dim=threads,
     )

@@ -9,10 +9,11 @@ There is deliberately no 1/sqrt(head_dim) and no attention softcap here. The
 engine's existing bf16/fp32 attention is raw GEMM -> raw softmax -> GEMM.
 """
 
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim, barrier
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
+from max.gpu import barrier
 from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
-from std.gpu.memory import AddressSpace
+from max.gpu.memory import AddressSpace
 from std.memory import UnsafePointer
 from std.math import round, exp
 from layout import row_major

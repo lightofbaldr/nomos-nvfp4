@@ -43,7 +43,7 @@ def main():
     if decode:
         import warnings; warnings.filterwarnings("ignore")
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(os.path.expanduser("~/models/gemma-4-31b-it"))
+        tok = AutoTokenizer.from_pretrained("~/models/gemma-4-31b-it")
     bad = 0
     for pid, seq in ids.items():
         mr, d2, tl = max_run(seq), distinct_2gram(seq), tail_loop(seq)

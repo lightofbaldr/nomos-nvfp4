@@ -6,8 +6,8 @@ mutate the production 31B ``GemmaEngine``: target verify stays on the green
 """
 
 from std.collections import List
-from std.gpu import block_dim, block_idx, thread_idx
-from std.gpu.host import DeviceContext
+from std.gpu.primitives import block_dim, block_idx, thread_idx
+from max.gpu.host import DeviceContext
 from std.math import sqrt, tanh
 from std.memory import UnsafePointer, alloc
 
@@ -98,7 +98,7 @@ def _e2b_shared_source_layer(layer: Int) -> Int:
 def _host_write_i32_4(ptr: UInt64, a: Int, b: Int, c: Int, d: Int):
     if ptr == 0:
         return
-    var out = UnsafePointer[Int32, MutExternalOrigin](
+    var out = UnsafePointer[Int32, MutUntrackedOrigin](
         unsafe_from_address=Int(ptr)
     )
     out[0] = Int32(a)
@@ -120,7 +120,7 @@ def _host_write_i32_8(
 ):
     if ptr == 0:
         return
-    var out = UnsafePointer[Int32, MutExternalOrigin](
+    var out = UnsafePointer[Int32, MutUntrackedOrigin](
         unsafe_from_address=Int(ptr)
     )
     out[0] = Int32(a)
@@ -1155,7 +1155,7 @@ def init_e2b_draft_handle_with_context(
 def release_e2b_draft_handle(handle: UInt64):
     if handle == 0:
         return
-    var ptr = UnsafePointer[E2BDraftEngine, MutExternalOrigin](
+    var ptr = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](
         unsafe_from_address=Int(handle)
     )
 

@@ -25,7 +25,13 @@ ABI conventions:
 from std.memory import UnsafePointer, alloc
 from std.ffi import external_call, c_size_t
 from std.math import sqrt
-from lib.gemma4_engine import GemmaEngine, init_engine_handle, release_engine_handle, D, VOCAB, TOTAL_LAYERS, SLIDING_WINDOW
+from lib.gemma4_engine import GemmaEngine, init_engine_handle, release_engine_handle, D, VOCAB, TOTAL_LAYERS, SLIDING_WINDOW, _env_float
+from lib.model_config import (
+    MODEL_ID, EAGLE3_TAPS, DRAFTER_EMBED_SQRT_SCALE, RMS_EPS_FINAL,
+    HAS_LINEAR_ATTENTION, GDN_NUM_V_HEADS, GDN_KEY_HEAD_DIM,
+    GDN_VALUE_HEAD_DIM, GDN_CONV_DIM, GDN_CONV_KERNEL,
+)
+from lib.gdn_scan import gpu_gdn_bf16_to_f32
 from lib.mtp_drafter import MTPDrafter, mtp_draft_k, release_mtp_drafter_handle
 from lib.engine_prefill import prefill_batch_impl
 from lib.eagle3_drafter import (
@@ -60,9 +66,18 @@ from lib.dflash_drafter import (
     dflash_draft_block_nvfp4,
     dflash_project_context,
     dflash_forward_block_embeddings,
+    dflash_markov_bias,
+    dflash_markov_sample_logits,
     release_dflash_drafter_handle,
 )
-from lib.cuda import cuda_malloc, cuda_free, cuda_memcpy, cuda_sync, cuda_upload
+from lib.dflash_profile import (
+    dflash_profile_tap_layers,
+    eagle3_profile_tap_layers,
+    validate_dflash_profile_metadata,
+)
+from lib.io import file_size_bytes
+from lib.cuda import cuda_malloc, cuda_free, cuda_memcpy, cuda_sync, cuda_upload, cuda_download
+from lib.gemma4_ops import rmsnorm
 from lib.engine_init import _read_env_bytes
 from lib.kv_cache_quant import (
     gpu_append_quant_kv_i4,
@@ -76,7 +91,7 @@ def _read_cstr(ptr: Int64) raises -> String:
     """Read a NUL-terminated C string from address `ptr` into a Mojo String."""
     if ptr == 0:
         return String("")
-    var p = UnsafePointer[UInt8, MutExternalOrigin](unsafe_from_address=Int(ptr))
+    var p = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(ptr))
     var s = String("")
     var i = 0
     while True:
@@ -91,13 +106,13 @@ def _read_cstr(ptr: Int64) raises -> String:
 
 def _read_int32_array_into(ptr: Int64, n: Int, mut out: List[Int]) raises:
     """Read `n` Int32 values from address `ptr` into `out`."""
-    var p = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(ptr))
+    var p = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(ptr))
     for i in range(n):
         out.append(Int(p[i]))
 
 def _write_int32_array(ptr: Int64, ref values: List[Int], capacity: Int) raises -> Int:
     """Write min(len(values), capacity) values to `ptr` as Int32. Returns count written."""
-    var p = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(ptr))
+    var p = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(ptr))
     var n = len(values) if len(values) < capacity else capacity
     for i in range(n):
         p[i] = Int32(values[i])
@@ -112,6 +127,17 @@ def _env_is_one(name: String) -> Bool:
 # ─────────────────────────────────────────────────────────────────────────────
 # Library version
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@export
+def nomos_model_id() -> Int32:
+    """Which MODEL PROFILE this .so was compiled for (lib/model_profiles/*.mojo).
+
+    Exists so the host can ask the KERNEL what it is instead of trusting a filename or
+    a build log. One .so serves exactly one model geometry, so loading the wrong weights
+    cannot work and should fail at the front door -- see tools/check_model_identity.py.
+    """
+    return Int32(MODEL_ID)
 
 
 @export
@@ -158,7 +184,7 @@ def nomos_shutdown(handle: Int64) -> Int32:
     """Free a context allocated by nomos_init. Idempotent."""
     if handle == 0:
         return Int32(0)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](
         unsafe_from_address=Int(handle)
     )
     if engine_ptr[0].mtp_ptr != 0:
@@ -215,7 +241,7 @@ def nomos_lm_draft_load_with_target(
         var ms = Int(max_seq)
         if ms <= 0:
             ms = 1024
-        var ep = UnsafePointer[GemmaEngine, MutExternalOrigin](
+        var ep = UnsafePointer[GemmaEngine, MutUntrackedOrigin](
             unsafe_from_address=Int(target_handle)
         )
         var handle = UInt64(0)
@@ -251,12 +277,12 @@ def nomos_lm_draft_prefill(
     """
     if draft_handle == 0 or ids_ptr == 0 or out_token_ptr == 0 or n <= Int32(0):
         return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutExternalOrigin](unsafe_from_address=Int(draft_handle))
+    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
     try:
         var ids = List[Int]()
         _read_int32_array_into(ids_ptr, Int(n), ids)
         var tok = dp[0].prefill(ids)
-        UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(tok)
+        UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(tok)
         return Int32(0)
     except e:
         print("[nomos_lm_draft_prefill EXC]", e, " n=", Int(n))
@@ -283,12 +309,12 @@ def nomos_lm_draft_debug_prefill(
     """
     if draft_handle == 0 or ids_ptr == 0 or out_token_ptr == 0 or n <= Int32(0):
         return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutExternalOrigin](unsafe_from_address=Int(draft_handle))
+    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
     try:
         var ids = List[Int]()
         _read_int32_array_into(ids_ptr, Int(n), ids)
         var tok = dp[0].prefill_debug_last(ids, UInt64(out_hs_ptr), UInt64(out_logits_ptr))
-        UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(tok)
+        UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(tok)
         return Int32(0)
     except e:
         print("[nomos_lm_draft_debug_prefill EXC]", e, " n=", Int(n))
@@ -317,14 +343,14 @@ def nomos_lm_draft_debug_prefill_layer(
     """
     if draft_handle == 0 or ids_ptr == 0 or out_token_ptr == 0 or n <= Int32(0):
         return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutExternalOrigin](unsafe_from_address=Int(draft_handle))
+    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
     try:
         var ids = List[Int]()
         _read_int32_array_into(ids_ptr, Int(n), ids)
         var tok = dp[0].prefill_debug_layer(
             ids, Int(trace_layer), UInt64(out_phase_ptr), UInt64(out_meta_ptr)
         )
-        UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(tok)
+        UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(tok)
         return Int32(0)
     except e:
         print("[nomos_lm_draft_debug_prefill_layer EXC]", e, " n=", Int(n), " layer=", Int(trace_layer))
@@ -354,7 +380,7 @@ def nomos_lm_draft_debug_prefill_layer_attn(
     """
     if draft_handle == 0 or ids_ptr == 0 or out_token_ptr == 0 or n <= Int32(0):
         return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutExternalOrigin](unsafe_from_address=Int(draft_handle))
+    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
     try:
         var ids = List[Int]()
         _read_int32_array_into(ids_ptr, Int(n), ids)
@@ -366,7 +392,7 @@ def nomos_lm_draft_debug_prefill_layer_attn(
             UInt64(out_attn_ptr),
             UInt64(out_attn_meta_ptr),
         )
-        UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(tok)
+        UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(tok)
         return Int32(0)
     except e:
         print("[nomos_lm_draft_debug_prefill_layer_attn EXC]", e, " n=", Int(n), " layer=", Int(trace_layer))
@@ -378,10 +404,10 @@ def nomos_lm_draft_step_token(draft_handle: Int64, token: Int32, out_token_ptr: 
     """Append one token to the draft model and write its greedy next-token prediction."""
     if draft_handle == 0 or out_token_ptr == 0:
         return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutExternalOrigin](unsafe_from_address=Int(draft_handle))
+    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
     try:
         var tok = dp[0].step_token(Int(token))
-        UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(tok)
+        UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(tok)
         return Int32(0)
     except e:
         print("[nomos_lm_draft_step_token EXC]", e, " token=", Int(token))
@@ -404,11 +430,11 @@ def nomos_lm_draft_draft(
     """
     if draft_handle == 0 or out_ptr == 0 or k <= Int32(0):
         return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutExternalOrigin](unsafe_from_address=Int(draft_handle))
+    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
     try:
         var drafts = List[Int32]()
         var n = dp[0].draft_k(Int(seed_token), Int(k), drafts)
-        var op = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_ptr))
+        var op = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_ptr))
         for i in range(n):
             op[i] = drafts[i]
         return Int32(n)
@@ -434,7 +460,7 @@ def nomos_lm_draft_draft_conf(
     """
     if draft_handle == 0 or out_ptr == 0 or out_conf_ptr == 0 or k <= Int32(0):
         return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutExternalOrigin](unsafe_from_address=Int(draft_handle))
+    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
     try:
         var drafts = List[Int32]()
         var confs = List[Float32]()
@@ -442,13 +468,13 @@ def nomos_lm_draft_draft_conf(
         var n = dp[0].draft_k_conf(
             Int(seed_token), Int(k), drafts, confs, gaps
         )
-        var op = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_ptr))
-        var cp = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_conf_ptr))
+        var op = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_ptr))
+        var cp = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_conf_ptr))
         for i in range(n):
             op[i] = drafts[i]
             cp[i] = confs[i]
         if out_gap_ptr != 0:
-            var gp = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_gap_ptr))
+            var gp = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_gap_ptr))
             for i in range(n):
                 gp[i] = gaps[i]
         return Int32(n)
@@ -478,15 +504,15 @@ def nomos_lm_draft_draft_until(
     """
     if draft_handle == 0 or out_ptr == 0 or out_conf_ptr == 0 or k_max <= Int32(0):
         return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutExternalOrigin](unsafe_from_address=Int(draft_handle))
+    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
     try:
         var drafts = List[Int32]()
         var confs = List[Float32]()
         var n = dp[0].draft_until_conf(
             Int(seed_token), Int(k_max), p_min, drafts, confs
         )
-        var op = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_ptr))
-        var cp = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_conf_ptr))
+        var op = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_ptr))
+        var cp = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_conf_ptr))
         for i in range(n):
             op[i] = drafts[i]
             cp[i] = confs[i]
@@ -509,7 +535,7 @@ def nomos_lm_draft_draft_until(
 def nomos_lm_draft_cache_len(draft_handle: Int64) -> Int32:
     if draft_handle == 0:
         return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutExternalOrigin](unsafe_from_address=Int(draft_handle))
+    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
     return Int32(dp[0].cache_len())
 
 
@@ -517,7 +543,7 @@ def nomos_lm_draft_cache_len(draft_handle: Int64) -> Int32:
 def nomos_lm_draft_set_len(draft_handle: Int64, n: Int32) -> Int32:
     if draft_handle == 0 or n < Int32(0):
         return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutExternalOrigin](unsafe_from_address=Int(draft_handle))
+    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
     dp[0].set_cache_len(Int(n))
     return Int32(0)
 
@@ -526,7 +552,7 @@ def nomos_lm_draft_set_len(draft_handle: Int64, n: Int32) -> Int32:
 def nomos_lm_draft_reset(draft_handle: Int64) -> Int32:
     if draft_handle == 0:
         return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutExternalOrigin](unsafe_from_address=Int(draft_handle))
+    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
     dp[0].reset()
     return Int32(0)
 
@@ -554,7 +580,7 @@ def nomos_generate(
         return Int32(-1)
     if n_prompt <= 0 or max_new_tokens <= 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     # Per-call sampling: snapshot the engine defaults so a request's overrides
     # do NOT persist into later requests (2026-06-14: overrides were leaking via
     # engine state). When no override is passed, saved==current → restore is a
@@ -572,6 +598,10 @@ def nomos_generate(
         var prompt = List[Int]()
         _read_int32_array_into(prompt_ptr, Int(n_prompt), prompt)
         var out = List[Int]()
+        # This export owns a complete independent request.  Reset both the
+        # append-only KV lengths and any recurrent GDN pools before prefill;
+        # otherwise a reused handle leaks the previous request into this one.
+        engine_ptr[0].reset_kv_cache()
         engine_ptr[0].run_inference(prompt, Int(max_new_tokens), False, out)
         engine_ptr[0].temp = saved_temp
         engine_ptr[0].top_p = saved_top_p
@@ -595,13 +625,19 @@ def nomos_prefill(handle: Int64, ids_ptr: Int64, n: Int32, logits_out_ptr: Int64
     -99 = exception."""
     if handle == 0 or n <= Int32(0) or ids_ptr == 0 or logits_out_ptr == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     try:
         var prompt = List[Int]()
         _read_int32_array_into(ids_ptr, Int(n), prompt)
+        # nomos_prefill is the authoritative FRESH-request boundary.  Clearing
+        # only cache lengths was sufficient for attention-only Gemma/Muse, but
+        # Qwen's recurrent GDN pools otherwise carried request N into request
+        # N+1.  Continuations use nomos_prefill_cont and deliberately bypass
+        # this reset.
+        engine_ptr[0].reset_kv_cache()
         var dflash_loaded = engine_ptr[0].dflash_ptr != 0
         if dflash_loaded:
-            var dp_reset = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+            var dp_reset = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
                 unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
             dp_reset[0].reset()
         # #74: a success return MUST mean the buffer was written. The chunked-prefill defect
@@ -609,7 +645,7 @@ def nomos_prefill(handle: Int64, ids_ptr: Int64, n: Int32, logits_out_ptr: Int64
         # was already in its own buffer -- zeros on a fresh one, the PREVIOUS REQUEST'S LOGITS
         # otherwise. That is the failure that reads as a clean result. Poison the first and last
         # element, then verify the callee overwrote them.
-        var _lp0 = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(logits_out_ptr))
+        var _lp0 = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(logits_out_ptr))
         _lp0[0] = Float32(-1.0e30)
         _lp0[VOCAB - 1] = Float32(-1.0e30)
         engine_ptr[0].prefill_logits(prompt, logits_out_ptr)
@@ -618,7 +654,7 @@ def nomos_prefill(handle: Int64, ids_ptr: Int64, n: Int32, logits_out_ptr: Int64
                   "Refusing to report success (#74).")
             return Int32(-4)
         if dflash_loaded:
-            var dp = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+            var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
                 unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
             if dp[0].cache_len() + 1 > DFLASH_MAX_CTX:
                 return Int32(-3)
@@ -641,7 +677,7 @@ def nomos_decode_step(handle: Int64, token: Int32, logits_out_ptr: Int64) -> Int
     to logits_out_ptr. The host does sampling + grammar. 0 = ok, -1 = bad arg, -99 = exc."""
     if handle == 0 or logits_out_ptr == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     try:
         engine_ptr[0].step_logits(Int(token), logits_out_ptr)
         return Int32(0)
@@ -656,7 +692,7 @@ def nomos_mtp_load(handle: Int64, dir_ptr: Int64) -> Int32:
     0 = ok, -1 = bad arg, -99 = exception."""
     if handle == 0 or dir_ptr == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     try:
         var dir = _read_cstr(dir_ptr)
         var mp = alloc[MTPDrafter](1)
@@ -675,17 +711,17 @@ def nomos_mtp_draft(handle: Int64, seed_token: Int32, k: Int32, out_ptr: Int64) 
     negative on error (-2 = MTP not loaded; call nomos_mtp_load first)."""
     if handle == 0 or out_ptr == 0 or k <= Int32(0):
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].mtp_ptr == 0:
         return Int32(-2)
     try:
-        var dp = UnsafePointer[MTPDrafter, MutExternalOrigin](
+        var dp = UnsafePointer[MTPDrafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].mtp_ptr))
         dp[0].engine_ptr = UInt64(handle)        # GemmaEngine address — the shared-KV read
         var drafts = List[Int32]()
         mtp_draft_k(engine_ptr[0].ctx, dp[0], engine_ptr[0].d_lmhead_in, Int(seed_token),
                     engine_ptr[0].d_embed_lmhead, Int(k), drafts)
-        var op = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_ptr))
+        var op = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_ptr))
         var n = len(drafts) if len(drafts) < Int(k) else Int(k)
         for i in range(n):
             op[i] = drafts[i]
@@ -703,7 +739,7 @@ def nomos_mtp_verify(handle: Int64, drafts_ptr: Int64, k: Int32, start_pos: Int3
     0=ok, -1=bad arg, -99=exc."""
     if handle == 0 or drafts_ptr == 0 or logits_out == 0 or k <= Int32(0):
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     try:
         var drafts = List[Int]()
         _read_int32_array_into(drafts_ptr, Int(k), drafts)
@@ -737,7 +773,7 @@ def nomos_verify_fused(
         return Int32(-1)
     if Int(n_rows) > MAX_VERIFY_ROWS:
         return Int32(-3)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     try:
         var tokens = List[Int]()
         _read_int32_array_into(tokens_ptr, Int(n_rows), tokens)
@@ -772,7 +808,7 @@ def nomos_verify_exact_next_token(
         return Int32(-1)
     if num_acc < Int32(0) or num_acc >= n_rows:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     try:
         var tokens = List[Int]()
         _read_int32_array_into(tokens_ptr, Int(n_rows), tokens)
@@ -788,7 +824,7 @@ def nomos_verify_exact_next_token(
             if logits[i] > best:
                 best = logits[i]
                 best_i = i
-        UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(best_i)
+        UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(best_i)
         return Int32(0)
     except e:
         print("[nomos_verify_exact_next_token EXC]", e,
@@ -811,11 +847,12 @@ def nomos_debug_prefill_all_layers(
     """
     if handle == 0 or ids_ptr == 0 or out_ptr == 0 or n <= Int32(0):
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     var d_rows = UInt64(0)
     try:
         var prompt = List[Int]()
         _read_int32_array_into(ids_ptr, Int(n), prompt)
+        engine_ptr[0].reset_kv_cache()
         d_rows = cuda_malloc(Int(n) * TOTAL_LAYERS * D * 4)
         var layers = List[Int]()
         for layer in range(TOTAL_LAYERS):
@@ -838,6 +875,105 @@ def nomos_debug_prefill_all_layers(
 
 
 @export
+def nomos_debug_final_norm(
+    handle: Int64,
+    ids_ptr: Int64,
+    n: Int32,
+    out_ptr: Int64,
+) -> Int32:
+    """Capture the last prompt row after the model's final RMSNorm.
+
+    out_ptr is host Float32[D]. This deliberately runs the ordinary production
+    prefill/logits path, then applies the same host RMSNorm implementation used
+    by decode to the retained final residual. It is a separate fresh-state debug
+    arm; callers must not use it as the source for a subsequent state comparison.
+    """
+    if handle == 0 or ids_ptr == 0 or out_ptr == 0 or n <= Int32(0):
+        return Int32(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    try:
+        var prompt = List[Int]()
+        _read_int32_array_into(ids_ptr, Int(n), prompt)
+        engine_ptr[0].reset_kv_cache()
+
+        # prefill_logits requires a full host logits sink. The values are not
+        # consumed here; the call is used so this debug surface follows exactly
+        # the same prefill route as production.
+        var logits = List[Float32](capacity=VOCAB)
+        for _ in range(VOCAB):
+            logits.append(0.0)
+        engine_ptr[0].prefill_logits(prompt, Int64(Int(logits.unsafe_ptr())))
+
+        var residual = List[Float32](capacity=D)
+        var normed = List[Float32](capacity=D)
+        for _ in range(D):
+            residual.append(0.0)
+            normed.append(0.0)
+        cuda_download(residual, engine_ptr[0].d_x_buf, D)
+        rmsnorm(normed, residual, engine_ptr[0].final_norm, D, RMS_EPS_FINAL)
+
+        var out = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_ptr))
+        for i in range(D):
+            out[i] = normed[i]
+        return Int32(0)
+    except e:
+        print("[nomos_debug_final_norm EXC]", e)
+        return Int32(-99)
+
+
+@export
+def nomos_debug_gdn_state(
+    handle: Int64,
+    recurrent_out_ptr: Int64,
+    conv_out_ptr: Int64,
+) -> Int32:
+    """Capture Qwen3.5 GDN state as host fp32 arrays after production prefill.
+
+    Common ABI: non-GDN engines return -2 loudly. The Qwen second engine wires
+    this export to its native-bf16 recurrent/conv pools and must CAST bf16 to
+    fp32; a raw byte copy into these host buffers is never valid.
+    """
+    if handle == 0 or recurrent_out_ptr == 0 or conv_out_ptr == 0:
+        return Int32(-1)
+    if not HAS_LINEAR_ATTENTION:
+        return Int32(-2)
+    try:
+        var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](
+            unsafe_from_address=Int(handle)
+        )
+        if engine_ptr[0].gdn_state.n_gdn != 48:
+            print("[nomos_debug_gdn_state] expected 48 ordered GDN slots, got",
+                  engine_ptr[0].gdn_state.n_gdn)
+            return Int32(-3)
+        var rec_n = (
+            engine_ptr[0].gdn_state.n_gdn * GDN_NUM_V_HEADS
+            * GDN_KEY_HEAD_DIM * GDN_VALUE_HEAD_DIM
+        )
+        var conv_n = (
+            engine_ptr[0].gdn_state.n_gdn * GDN_CONV_DIM
+            * GDN_CONV_KERNEL
+        )
+        var d_rec_f32 = cuda_malloc(rec_n * 4)
+        var d_conv_f32 = cuda_malloc(conv_n * 4)
+        gpu_gdn_bf16_to_f32(
+            engine_ptr[0].ctx, d_rec_f32,
+            engine_ptr[0].gdn_state.rec_base, rec_n,
+        )
+        gpu_gdn_bf16_to_f32(
+            engine_ptr[0].ctx, d_conv_f32,
+            engine_ptr[0].gdn_state.conv_base, conv_n,
+        )
+        engine_ptr[0].ctx.synchronize()
+        cuda_memcpy(UInt64(recurrent_out_ptr), d_rec_f32, rec_n * 4, 2)
+        cuda_memcpy(UInt64(conv_out_ptr), d_conv_f32, conv_n * 4, 2)
+        cuda_free(d_rec_f32); cuda_free(d_conv_f32)
+        return Int32(0)
+    except e:
+        print("[nomos_debug_gdn_state EXC]", e)
+        return Int32(-99)
+
+
+@export
 def nomos_debug_kv_block32_q8_ab(
     handle: Int64,
     layer_i: Int32,
@@ -856,7 +992,7 @@ def nomos_debug_kv_block32_q8_ab(
         return Int32(-1)
     if layer_i < Int32(0) or layer_i >= Int32(TOTAL_LAYERS):
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](
         unsafe_from_address=Int(handle)
     )
     if not engine_ptr[0].kv_int4_block32:
@@ -947,7 +1083,7 @@ def nomos_debug_kv_block32_q8_ab(
                     fv = i
                 vd += 1
 
-        var oi = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_i32))
+        var oi = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_i32))
         oi[0] = Int32(hd)
         oi[1] = Int32(nkv)
         oi[2] = Int32(kd)
@@ -956,7 +1092,7 @@ def nomos_debug_kv_block32_q8_ab(
         oi[5] = Int32(fv)
         oi[6] = Int32(nblocks)
         oi[7] = Int32(q8_bytes)
-        var of = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_f32))
+        var of = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_f32))
         for i in range(4):
             of[i] = scales[i]
 
@@ -1022,7 +1158,7 @@ def nomos_debug_kv_append_ab(
     if base_pos < Int32(0):
         return Int32(-1)
 
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](
         unsafe_from_address=Int(handle)
     )
     if not engine_ptr[0].kv_quant or not engine_ptr[0].kv_int4:
@@ -1125,7 +1261,7 @@ def nomos_debug_kv_append_ab(
         if out_decode_v != 0:
             cuda_memcpy(UInt64(out_decode_v), d_dv + byte_off, hcache, 2)
         if out_f32 != 0:
-            var fp = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_f32))
+            var fp = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_f32))
             for i in range(4):
                 fp[i] = scales[i]
 
@@ -1145,7 +1281,7 @@ def nomos_debug_kv_append_ab(
         var k_scale_equal = 1 if scales[0] == scales[1] else 0
         var v_scale_equal = 1 if scales[2] == scales[3] else 0
 
-        var outp = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_i32))
+        var outp = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_i32))
         outp[0] = Int32(layer)
         outp[1] = Int32(Int(base_pos))
         outp[2] = Int32(rows)
@@ -1219,7 +1355,7 @@ def nomos_debug_kv_append_overwrite_ab(
     if base_pos < Int32(0):
         return Int32(-1)
 
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](
         unsafe_from_address=Int(handle)
     )
     if not engine_ptr[0].kv_quant or not engine_ptr[0].kv_int4:
@@ -1352,7 +1488,7 @@ def nomos_debug_kv_append_overwrite_ab(
         if out_decode_v != 0:
             cuda_memcpy(UInt64(out_decode_v), d_dv + byte_off, hcache, 2)
         if out_f32 != 0:
-            var fp = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_f32))
+            var fp = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_f32))
             for i in range(4):
                 fp[i] = scales[i]
 
@@ -1372,7 +1508,7 @@ def nomos_debug_kv_append_overwrite_ab(
         var k_scale_equal = 1 if scales[0] == scales[1] else 0
         var v_scale_equal = 1 if scales[2] == scales[3] else 0
 
-        var outp = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_i32))
+        var outp = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_i32))
         outp[0] = Int32(layer)
         outp[1] = Int32(Int(base_pos))
         outp[2] = Int32(rows)
@@ -1472,7 +1608,7 @@ def nomos_debug_qkv_source_ab(
     if head_i < Int32(0) or start_pos < Int32(0):
         return Int32(-1)
 
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](
         unsafe_from_address=Int(handle)
     )
 
@@ -1506,6 +1642,12 @@ def nomos_debug_qkv_source_ab(
             bat_v.append(0.0)
 
         var orig_len = engine_ptr[0].cache_len()
+        # The batched leg mutates Qwen's recurrent/conv pools.  Rewinding only
+        # cache_len makes the subsequent decode leg start from the wrong state,
+        # so snapshot the full non-appendable state at the shared prefix.
+        @parameter
+        if HAS_LINEAR_ATTENTION:
+            engine_ptr[0].gdn_state.snapshot_for_verify()
         engine_ptr[0].set_cache_len(Int(start_pos))
         prefill_batch_impl(
             engine_ptr[0],
@@ -1521,12 +1663,24 @@ def nomos_debug_qkv_source_ab(
             Int64(Int(bat_v.unsafe_ptr())),
         )
         engine_ptr[0].set_cache_len(Int(start_pos))
+        @parameter
+        if HAS_LINEAR_ATTENTION:
+            engine_ptr[0].gdn_state.restore_verify_snapshot()
 
         if row > 0:
             var tmp_logits = List[Float32](capacity=VOCAB)
             for _ in range(VOCAB):
                 tmp_logits.append(0.0)
-            for i in range(row):
+            var replay_start = 0
+            if Int(start_pos) == 0:
+                # step_logits is continuation-only and deliberately drops a leading
+                # BOS. Seed a fresh sequential replay through prefill_logits instead;
+                # otherwise the debug leg silently omits token 0 on real prompts.
+                var seed = List[Int]()
+                seed.append(tokens[0])
+                engine_ptr[0].prefill_logits(seed, Int64(Int(tmp_logits.unsafe_ptr())))
+                replay_start = 1
+            for i in range(replay_start, row):
                 engine_ptr[0].step_logits(tokens[i], Int64(Int(tmp_logits.unsafe_ptr())))
 
         engine_ptr[0].debug_decode_qkv_source(
@@ -1537,6 +1691,10 @@ def nomos_debug_qkv_source_ab(
             Int64(Int(dec_v.unsafe_ptr())),
         )
         engine_ptr[0].set_cache_len(Int(start_pos))
+        @parameter
+        if HAS_LINEAR_ATTENTION:
+            engine_ptr[0].gdn_state.restore_verify_snapshot()
+            engine_ptr[0].gdn_state.finish_verify_transaction()
 
         var k_first = -1
         var k_count = 0
@@ -1558,16 +1716,16 @@ def nomos_debug_qkv_source_ab(
         var n_ba = Float64(0.0)
 
         var ko = head * hd
-        var dec_k_bytes = UnsafePointer[UInt8, MutExternalOrigin](
+        var dec_k_bytes = UnsafePointer[UInt8, MutUntrackedOrigin](
             unsafe_from_address=Int(dec_k.unsafe_ptr())
         )
-        var bat_k_bytes = UnsafePointer[UInt8, MutExternalOrigin](
+        var bat_k_bytes = UnsafePointer[UInt8, MutUntrackedOrigin](
             unsafe_from_address=Int(bat_k.unsafe_ptr())
         )
-        var dec_v_bytes = UnsafePointer[UInt8, MutExternalOrigin](
+        var dec_v_bytes = UnsafePointer[UInt8, MutUntrackedOrigin](
             unsafe_from_address=Int(dec_v.unsafe_ptr())
         )
-        var bat_v_bytes = UnsafePointer[UInt8, MutExternalOrigin](
+        var bat_v_bytes = UnsafePointer[UInt8, MutUntrackedOrigin](
             unsafe_from_address=Int(bat_v.unsafe_ptr())
         )
         for i in range(hd):
@@ -1605,10 +1763,10 @@ def nomos_debug_qkv_source_ab(
                     v_first = i
                 v_count += 1
 
-        var dec_n_bytes = UnsafePointer[UInt8, MutExternalOrigin](
+        var dec_n_bytes = UnsafePointer[UInt8, MutUntrackedOrigin](
             unsafe_from_address=Int(dec_norm.unsafe_ptr())
         )
-        var bat_n_bytes = UnsafePointer[UInt8, MutExternalOrigin](
+        var bat_n_bytes = UnsafePointer[UInt8, MutUntrackedOrigin](
             unsafe_from_address=Int(bat_norm.unsafe_ptr())
         )
         for i in range(D):
@@ -1630,31 +1788,31 @@ def nomos_debug_qkv_source_ab(
                 n_count += 1
 
         if out_decode_k != 0:
-            var p = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_decode_k))
+            var p = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_decode_k))
             for i in range(hd):
                 p[i] = dec_k[ko + i]
         if out_batch_k != 0:
-            var p = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_batch_k))
+            var p = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_batch_k))
             for i in range(hd):
                 p[i] = bat_k[ko + i]
         if out_decode_v != 0:
-            var p = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_decode_v))
+            var p = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_decode_v))
             for i in range(hd):
                 p[i] = dec_v[ko + i]
         if out_batch_v != 0:
-            var p = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_batch_v))
+            var p = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_batch_v))
             for i in range(hd):
                 p[i] = bat_v[ko + i]
         if out_decode_normed != 0:
-            var p = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_decode_normed))
+            var p = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_decode_normed))
             for i in range(D):
                 p[i] = dec_norm[i]
         if out_batch_normed != 0:
-            var p = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_batch_normed))
+            var p = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_batch_normed))
             for i in range(D):
                 p[i] = bat_norm[i]
 
-        var outp = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_i32))
+        var outp = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_i32))
         outp[0] = Int32(layer)
         outp[1] = Int32(Int(start_pos))
         outp[2] = Int32(rows)
@@ -1677,7 +1835,7 @@ def nomos_debug_qkv_source_ab(
         outp[19] = Int32(0)
 
         if out_f32 != 0:
-            var fp = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_f32))
+            var fp = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_f32))
             fp[0] = Float32(k_max)
             fp[1] = Float32(v_max)
             fp[2] = Float32(n_max)
@@ -1693,6 +1851,14 @@ def nomos_debug_qkv_source_ab(
         return Int32(0)
     except e:
         engine_ptr[0].set_cache_len(Int(start_pos))
+        @parameter
+        if HAS_LINEAR_ATTENTION:
+            if engine_ptr[0].gdn_state.snapshot_valid:
+                try:
+                    engine_ptr[0].gdn_state.restore_verify_snapshot()
+                except restore_e:
+                    print("[nomos_debug_qkv_source_ab restore EXC]", restore_e)
+                engine_ptr[0].gdn_state.finish_verify_transaction()
         print("[nomos_debug_qkv_source_ab EXC]", e,
               " start=", Int(start_pos), " row=", Int(row_i),
               " n_rows=", Int(n_rows), " layer=", Int(layer_i))
@@ -1721,7 +1887,18 @@ def nomos_debug_omlp_stage_ab(
       8 post-RoPE Q, 9 q8-Q-as-f32 plus q-scale tail,
       10 K/V q8 views plus K/V scale tails as consumed by attention,
       11 raw packed INT4 K/V source bytes plus source scales,
-      12 pre-softmax QK scores [nh,klen].
+      12 pre-softmax QK scores [nh,klen],
+      13 GDN recurrent core [6144], 14 GDN gated-norm output [6144],
+      15 GDN out-projection [D], 16 GDN post-attention residual [D],
+      17 GDN post-MLP residual [D], 18 GDN input norm [D],
+      19 GDN raw QKV projection [10240], 20 GDN raw Z projection [6144],
+      21/22 GDN raw A/B projections [48], 23/24 prepared decay/beta [48],
+      25 GDN post-convolution QKV [10240]. Stages 13..25 compare the
+      batched GDN formulation directly with the production S=1 decode route.
+      In particular, a nonzero stage 25 characterizes the raw batched-prefill
+      formulation; it is not a verdict on NOMOS_VERIFY_GDN_FAST_EXACT.  Gate
+      that production verify route with GDN state parity and token identity.
+      26 post-Q-norm Q before RoPE [layer_qd].
 
     out_i32: Int32[16]
       [0]=layer [1]=start_pos [2]=n_rows [3]=row [4]=stage [5]=token
@@ -1743,10 +1920,10 @@ def nomos_debug_omlp_stage_ab(
         return Int32(-1)
     if layer_i < Int32(0) or layer_i >= Int32(TOTAL_LAYERS):
         return Int32(-1)
-    if stage_i < Int32(0) or stage_i > Int32(12) or start_pos < Int32(0):
+    if stage_i < Int32(0) or stage_i > Int32(26) or start_pos < Int32(0):
         return Int32(-1)
 
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](
         unsafe_from_address=Int(handle)
     )
     try:
@@ -1758,8 +1935,14 @@ def nomos_debug_omlp_stage_ab(
         _read_int32_array_into(tokens_ptr, rows, tokens)
 
         var dim = D
-        if stage == 0 or stage == 8:
+        if stage == 0 or stage == 8 or stage == 26:
             dim = engine_ptr[0].layer_qd[layer]
+        elif stage == 13 or stage == 14 or stage == 20:
+            dim = 6144
+        elif stage == 19 or stage == 25:
+            dim = 10240
+        elif stage == 21 or stage == 22 or stage == 23 or stage == 24:
+            dim = 48
         elif stage == 9:
             var l_hd = engine_ptr[0].layer_hd[layer]
             var l_qd = engine_ptr[0].layer_qd[layer]
@@ -1805,6 +1988,9 @@ def nomos_debug_omlp_stage_ab(
             bat.append(0.0)
 
         var orig_len = engine_ptr[0].cache_len()
+        @parameter
+        if HAS_LINEAR_ATTENTION:
+            engine_ptr[0].gdn_state.snapshot_for_verify()
         engine_ptr[0].set_cache_len(Int(start_pos))
         prefill_batch_impl(
             engine_ptr[0],
@@ -1824,12 +2010,24 @@ def nomos_debug_omlp_stage_ab(
             Int64(Int(bat.unsafe_ptr())),
         )
         engine_ptr[0].set_cache_len(Int(start_pos))
+        @parameter
+        if HAS_LINEAR_ATTENTION:
+            engine_ptr[0].gdn_state.restore_verify_snapshot()
 
         if row > 0:
             var tmp_logits = List[Float32](capacity=VOCAB)
             for _ in range(VOCAB):
                 tmp_logits.append(0.0)
-            for i in range(row):
+            var replay_start = 0
+            if Int(start_pos) == 0:
+                # Match the real fresh-request route for token 0. Feeding BOS through
+                # step_logits makes continue-mode drop it and creates a false layer-0
+                # decode-vs-batched cliff in this diagnostic.
+                var seed = List[Int]()
+                seed.append(tokens[0])
+                engine_ptr[0].prefill_logits(seed, Int64(Int(tmp_logits.unsafe_ptr())))
+                replay_start = 1
+            for i in range(replay_start, row):
                 engine_ptr[0].step_logits(tokens[i], Int64(Int(tmp_logits.unsafe_ptr())))
 
         engine_ptr[0].debug_decode_omlp_stage(
@@ -1839,6 +2037,10 @@ def nomos_debug_omlp_stage_ab(
             Int64(Int(dec.unsafe_ptr())),
         )
         engine_ptr[0].set_cache_len(Int(start_pos))
+        @parameter
+        if HAS_LINEAR_ATTENTION:
+            engine_ptr[0].gdn_state.restore_verify_snapshot()
+            engine_ptr[0].gdn_state.finish_verify_transaction()
 
         var first = -1
         var count = 0
@@ -1846,10 +2048,10 @@ def nomos_debug_omlp_stage_ab(
         var dot = Float64(0.0)
         var da = Float64(0.0)
         var ba = Float64(0.0)
-        var dec_bytes = UnsafePointer[UInt8, MutExternalOrigin](
+        var dec_bytes = UnsafePointer[UInt8, MutUntrackedOrigin](
             unsafe_from_address=Int(dec.unsafe_ptr())
         )
-        var bat_bytes = UnsafePointer[UInt8, MutExternalOrigin](
+        var bat_bytes = UnsafePointer[UInt8, MutUntrackedOrigin](
             unsafe_from_address=Int(bat.unsafe_ptr())
         )
         for i in range(dim):
@@ -1871,15 +2073,15 @@ def nomos_debug_omlp_stage_ab(
                 count += 1
 
         if out_decode != 0:
-            var p = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_decode))
+            var p = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_decode))
             for i in range(dim):
                 p[i] = dec[i]
         if out_batch != 0:
-            var p = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_batch))
+            var p = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_batch))
             for i in range(dim):
                 p[i] = bat[i]
 
-        var outp = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_i32))
+        var outp = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_i32))
         outp[0] = Int32(layer)
         outp[1] = Int32(Int(start_pos))
         outp[2] = Int32(rows)
@@ -1971,7 +2173,7 @@ def nomos_debug_omlp_stage_ab(
             outp[15] = Int32(0)
 
         if out_f32 != 0:
-            var fp = UnsafePointer[Float32, MutExternalOrigin](unsafe_from_address=Int(out_f32))
+            var fp = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_f32))
             fp[0] = Float32(max_delta)
             fp[1] = Float32(dot / sqrt(da * ba)) if da > 0.0 and ba > 0.0 else Float32(0.0)
             fp[2] = Float32(sqrt(da))
@@ -1979,6 +2181,14 @@ def nomos_debug_omlp_stage_ab(
         return Int32(0)
     except e:
         engine_ptr[0].set_cache_len(Int(start_pos))
+        @parameter
+        if HAS_LINEAR_ATTENTION:
+            if engine_ptr[0].gdn_state.snapshot_valid:
+                try:
+                    engine_ptr[0].gdn_state.restore_verify_snapshot()
+                except restore_e:
+                    print("[nomos_debug_omlp_stage_ab restore EXC]", restore_e)
+                engine_ptr[0].gdn_state.finish_verify_transaction()
         print("[nomos_debug_omlp_stage_ab EXC]", e,
               " start=", Int(start_pos), " row=", Int(row_i),
               " n_rows=", Int(n_rows), " layer=", Int(layer_i),
@@ -2010,16 +2220,16 @@ def nomos_eagle3_load(handle: Int64, dir_ptr: Int64) -> Int32:
         return Int32(-1)
     if not _env_is_one(String("NOMOS_EAGLE")):
         return Int32(-3)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    if EAGLE3_TAPS == 0:
+        print("[nomos_eagle3_load] ERROR: this model profile has no EAGLE-3 assistant")
+        return Int32(-4)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     try:
         var dir = _read_cstr(dir_ptr)
         var ep = alloc[Eagle3Drafter](1)
         ep.init_pointee_move(Eagle3Drafter(dir, _eagle_mode_env()))
         engine_ptr[0].eagle3_ptr = UInt64(Int(ep))
-        var tap_layers = List[Int]()
-        tap_layers.append(1)
-        tap_layers.append(29)
-        tap_layers.append(56)
+        var tap_layers = eagle3_profile_tap_layers()
         engine_ptr[0].configure_drafter_taps(
             ep[0].d_taps_buf,   # arm the L[1,29,56] taps (decode_step fills them)
             ep[0].d_verify_taps_buf,
@@ -2033,16 +2243,16 @@ def nomos_eagle3_load(handle: Int64, dir_ptr: Int64) -> Int32:
 
 @export
 def nomos_dflash_load(handle: Int64, dir_ptr: Int64) -> Int32:
-    """Load converted DFlash drafter weights and arm six target taps.
+    """Load converted Muse DFlash weights and arm five target taps.
 
     This establishes the device-resident weights/scratch and target tap capture
-    layout [1,12,23,35,46,57]. Use nomos_dflash_forward_synth for the staged
+    layout [1,13,25,37,49]. Use nomos_dflash_forward_synth for the staged
     synthetic-golden forward over host-provided target_hidden/noise_embedding.
     0=ok, -1=bad arg, -99=exception.
     """
     if handle == 0 or dir_ptr == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     try:
         if engine_ptr[0].dflash_ptr != 0:
             release_dflash_drafter_handle(engine_ptr[0].dflash_ptr)
@@ -2050,17 +2260,19 @@ def nomos_dflash_load(handle: Int64, dir_ptr: Int64) -> Int32:
             engine_ptr[0].clear_drafter_taps()
 
         var dir = _read_cstr(dir_ptr)
+        if (file_size_bytes(dir + "fc_weight.q4") <= 0 and
+            file_size_bytes(dir + "fc_weight.q8") <= 0 and
+            file_size_bytes(dir + "fc.weight.bf16") <= 0):
+            print("[nomos_dflash_load] ERROR: no drafter weights under '", dir,
+                  "' -- expected fc_weight.q4, fc_weight.q8, or fc.weight.bf16. Refusing to build a",
+                  "drafter from null pointers.")
+            return Int32(-2)
+        validate_dflash_profile_metadata(dir)
         var dp = alloc[DFlashDrafter](1)
-        dp.init_pointee_move(DFlashDrafter(dir))
+        dp.init_pointee_move(DFlashDrafter(dir, engine_ptr[0].ctx, engine_ptr[0].handle))
         engine_ptr[0].dflash_ptr = UInt64(Int(dp))
 
-        var tap_layers = List[Int]()
-        tap_layers.append(1)
-        tap_layers.append(12)
-        tap_layers.append(23)
-        tap_layers.append(35)
-        tap_layers.append(46)
-        tap_layers.append(57)
+        var tap_layers = dflash_profile_tap_layers()
         engine_ptr[0].configure_drafter_taps(
             dp[0].d_taps_buf,
             dp[0].d_verify_taps_buf,
@@ -2074,14 +2286,14 @@ def nomos_dflash_load(handle: Int64, dir_ptr: Int64) -> Int32:
 
 @export
 def nomos_dflash_get_taps(handle: Int64, out_ptr: Int64) -> Int32:
-    """D2H-copy the live six-tap target residuals as fp32 [6, D]."""
+    """D2H-copy the live n-tap target residuals as fp32 [tap_count, D]."""
     if handle == 0 or out_ptr == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].dflash_ptr == 0:
         return Int32(-2)
     try:
-        var dp = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+        var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].dflash_ptr)
         )
         cuda_memcpy(UInt64(out_ptr), dp[0].d_taps_buf, DFLASH_FC_IN * 4, 2)
@@ -2093,20 +2305,20 @@ def nomos_dflash_get_taps(handle: Int64, out_ptr: Int64) -> Int32:
 
 @export
 def nomos_dflash_project_context(handle: Int64, taps_ptr: Int64, out_context: Int64) -> Int32:
-    """Gold-diff helper: hidden_norm(fc([6,5376] taps)) -> [5376] context.
+    """gold-diff helper: hidden_norm(fc([tap_count,D] taps)) -> [D] context.
 
-    If taps_ptr is non-zero, it is a host fp32[6*5376] input and is uploaded into
+    If taps_ptr is non-zero, it is a host fp32[tap_count*D] input and is uploaded into
     the DFlash live tap buffer first. If taps_ptr is zero, the already armed live
-    tap buffer is used. out_context is host fp32[5376].
+    tap buffer is used. out_context is host fp32[D].
     0=ok, -1=bad arg, -2=DFlash not loaded, -99=exception.
     """
     if handle == 0 or out_context == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].dflash_ptr == 0:
         return Int32(-2)
     try:
-        var dp = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+        var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
         if taps_ptr != 0:
             cuda_memcpy(dp[0].d_taps_buf, UInt64(taps_ptr), DFLASH_FC_IN * 4, 1)
@@ -2131,24 +2343,92 @@ def nomos_dflash_forward_synth(
 ) -> Int32:
     """Synthetic-golden DFlash forward.
 
-    Inputs are host fp32 target_hidden[ctx_len,6*5376] and
-    noise_embedding[16,5376]. out_trace is host fp32 laid out as:
-      fc_out[ctx_len,5376], ctx_fused[ctx_len,5376],
-      layer0_out[16,5376]..layer4_out[16,5376], final_norm[16,5376].
+    Inputs are host fp32 target_hidden[ctx_len,tap_count*D] and
+    noise_embedding[16,D]. out_trace is host fp32 laid out as:
+      fc_out[ctx_len,D], ctx_fused[ctx_len,D],
+      layer0_out[16,D]..layer4_out[16,D], final_norm[16,D].
     This path intentionally stops before target lm_head; it gates drafter math
     against dflash/dflash_synth_goldens.npz.
-    0=ok, -1=bad arg, -2=DFlash not loaded, -99=exception.
+
+    Debug sentinel: ctx_len=-1 copies the most recent production draft trace as
+    noise[16,D], layer_out[5,16,D], final[16,D], logits[15,VOCAB]. This requires
+    NOMOS_DFLASH_TRACE=1 before drafter load.
+    DSpark sentinels reuse this ABI without adding public symbols:
+      ctx_len=-2: target_hidden_ptr=int32[block] token ids; out_trace=f32[block,V]
+                  receives the raw rank-256 Markov bias.
+      ctx_len=-3: target_hidden_ptr=int32[1] anchor; noise_embedding_ptr=f32[candidates,V]
+                  base logits; out_trace=int32[candidates] receives sequential
+                  Markov-biased greedy ids (each row conditions on the prior pick).
+    0=ok, -1=bad arg, -2=DFlash not loaded, -3=trace disabled, -99=exception.
     """
-    if handle == 0 or target_hidden_ptr == 0 or noise_embedding_ptr == 0 or out_trace == 0:
+    if handle == 0 or out_trace == 0:
         return Int32(-1)
-    if ctx_len < Int32(0) or Int(ctx_len) > DFLASH_CTX_BATCH:
+    if ctx_len < Int32(-3) or Int(ctx_len) > DFLASH_CTX_BATCH:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].dflash_ptr == 0:
         return Int32(-2)
     try:
-        var dp = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+        var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
+        if ctx_len == Int32(-3):
+            if target_hidden_ptr == 0 or noise_embedding_ptr == 0:
+                return Int32(-1)
+            var anchor_values = List[Int]()
+            _read_int32_array_into(target_hidden_ptr, 1, anchor_values)
+            cuda_memcpy(
+                dp[0].d_logits, UInt64(noise_embedding_ptr),
+                DFLASH_CANDIDATES * VOCAB * 4, 1,
+            )
+            dflash_markov_sample_logits(
+                engine_ptr[0].ctx, dp[0], anchor_values[0]
+            )
+            engine_ptr[0].ctx.synchronize()
+            cuda_memcpy(
+                UInt64(out_trace), dp[0].d_decode_ids,
+                DFLASH_CANDIDATES * 4, 2,
+            )
+            cuda_sync()
+            return Int32(0)
+        if ctx_len == Int32(-2):
+            if target_hidden_ptr == 0:
+                return Int32(-1)
+            var markov_ids = List[Int]()
+            _read_int32_array_into(target_hidden_ptr, DFLASH_BLOCK, markov_ids)
+            dflash_markov_bias(engine_ptr[0].ctx, dp[0], markov_ids)
+            engine_ptr[0].ctx.synchronize()
+            cuda_memcpy(
+                UInt64(out_trace), dp[0].d_markov_bias,
+                DFLASH_BLOCK * VOCAB * 4, 2,
+            )
+            cuda_sync()
+            return Int32(0)
+        if ctx_len == Int32(-1):
+            if not dp[0].trace_enabled:
+                return Int32(-3)
+            var out_debug = UInt64(out_trace)
+            var block_bytes_debug = UInt64(DFLASH_BLOCK * DFLASH_HIDDEN * 4)
+            cuda_memcpy(out_debug, dp[0].d_target_hidden, Int(block_bytes_debug), 2)
+            out_debug += block_bytes_debug
+            cuda_memcpy(
+                out_debug,
+                dp[0].d_layer_out,
+                DFLASH_LAYERS * DFLASH_BLOCK * DFLASH_HIDDEN * 4,
+                2,
+            )
+            out_debug += UInt64(DFLASH_LAYERS) * block_bytes_debug
+            cuda_memcpy(out_debug, dp[0].d_final_norm, Int(block_bytes_debug), 2)
+            out_debug += block_bytes_debug
+            cuda_memcpy(
+                out_debug,
+                dp[0].d_logits,
+                DFLASH_CANDIDATES * VOCAB * 4,
+                2,
+            )
+            cuda_sync()
+            return Int32(0)
+        if target_hidden_ptr == 0 or noise_embedding_ptr == 0:
+            return Int32(-1)
         var clen = Int(ctx_len)
         if clen > 0:
             cuda_memcpy(
@@ -2202,8 +2482,8 @@ def nomos_dflash_verify_fused(
     """Fused DFlash target verify/context-capture rows.
 
     tokens_ptr: Int32[n_rows]. logits_out may be zero when the host only wants
-    tap capture for DFlash context prefill. Captures six-tap rows
-    [1,12,23,35,46,57] into the DFlash verify-tap cache; host then calls
+    tap capture for DFlash context prefill. Captures n-tap rows
+    [1,13,25,37,49] into the DFlash verify-tap cache; host then calls
     nomos_dflash_append_verify_context(start_row,n_rows) for the accepted prefix.
     0=ok, -1=bad arg, -2=DFlash not loaded, -3=too many rows, -99=exception.
     """
@@ -2211,25 +2491,80 @@ def nomos_dflash_verify_fused(
         return Int32(-1)
     if Int(n_rows) > DFLASH_MAX_VERIFY_ROWS:
         return Int32(-3)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].dflash_ptr == 0:
         return Int32(-2)
     try:
-        var dp = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+        var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
+        if HAS_LINEAR_ATTENTION:
+            # Transaction boundary: both target and drafter context must describe
+            # exactly the committed prefix before the first speculative row mutates
+            # recurrent state. No call between this snapshot and prefill touches GDN.
+            if engine_ptr[0].dflash_verify_pending:
+                raise Error("DFlash verify started with an uncommitted GDN transaction")
+            if engine_ptr[0].cache_len() != Int(start_pos):
+                raise Error("DFlash verify start_pos does not match target cache length")
+            if dp[0].cache_len() != Int(start_pos):
+                raise Error("DFlash verify start_pos does not match drafter context length")
         dp[0].last_verify_rows = Int(n_rows)
         var tokens = List[Int]()
         _read_int32_array_into(tokens_ptr, Int(n_rows), tokens)
-        prefill_batch_impl(
-            engine_ptr[0],
-            tokens,
-            Int(start_pos),
-            logits_out,
-            Int(n_rows) - 1,
-            Int(n_rows),
+        if HAS_LINEAR_ATTENTION:
+            engine_ptr[0].gdn_state.snapshot_for_verify()
+            engine_ptr[0].dflash_verify_pending = True
+            engine_ptr[0].dflash_verify_start = Int(start_pos)
+            engine_ptr[0].dflash_verify_rows = Int(n_rows)
+            engine_ptr[0].dflash_verify_tokens = tokens.copy()
+        var gdn_decode_order = (
+            HAS_LINEAR_ATTENTION and
+            _env_float("NOMOS_VERIFY_GDN_DECODE_ORDER", 0.0) > Float32(0.5)
         )
+        var gdn_fast_exact = (
+            gdn_decode_order and
+            _env_float("NOMOS_VERIFY_GDN_FAST_EXACT", 0.0) > Float32(0.5)
+        )
+        if gdn_decode_order and not gdn_fast_exact:
+            # Correctness reference: execute the exact production S=1 target
+            # route for every verify input. This reproduces not only the GDN
+            # BF16 state round-trip cadence but also M=1 projections, softmax,
+            # residuals and MLPs that feed the next GDN layer. Copy each live
+            # tap row into the existing fused-verify cache; no ABI change.
+            for row in range(Int(n_rows)):
+                if engine_ptr[0].cache_len() != Int(start_pos) + row:
+                    raise Error("decode-order verify target length drift")
+                var row_logits = (
+                    logits_out + Int64(row * VOCAB * 4)
+                    if logits_out != 0 else Int64(0)
+                )
+                engine_ptr[0].step_logits(tokens[row], row_logits)
+                engine_ptr[0].ctx.synchronize()
+                cuda_memcpy(
+                    dp[0].d_verify_taps_buf + UInt64(row * DFLASH_FC_IN * 4),
+                    dp[0].d_taps_buf,
+                    DFLASH_FC_IN * 4,
+                    3,
+                )
+            engine_ptr[0].ctx.synchronize()
+        else:
+            prefill_batch_impl(
+                engine_ptr[0],
+                tokens,
+                Int(start_pos),
+                logits_out,
+                Int(n_rows) - 1,
+                Int(n_rows),
+            )
         return Int32(0)
     except e:
+        if HAS_LINEAR_ATTENTION and engine_ptr[0].dflash_verify_pending:
+            try:
+                engine_ptr[0].gdn_state.restore_verify_snapshot()
+                engine_ptr[0].set_cache_len(engine_ptr[0].dflash_verify_start)
+                engine_ptr[0].gdn_state.finish_verify_transaction()
+                engine_ptr[0].dflash_verify_pending = False
+            except:
+                pass
         print("[nomos_dflash_verify_fused EXC]", e)
         return Int32(-99)
 
@@ -2241,32 +2576,94 @@ def nomos_dflash_append_verify_context(
     """Append captured target tap rows into the DFlash context KV cache.
 
     start_row/n_rows address rows from the most recent nomos_dflash_verify_fused
-    call. Each row is projected as hidden_norm(fc(raw six-tap concat)) and its
+    call. Each row is projected as hidden_norm(fc(raw n-tap concat)) and its
     per-layer K/V context is appended at the current DFlash cache length.
     Returns the new DFlash cache length, or a negative status.
     """
     if handle == 0 or start_row < Int32(0) or n_rows < Int32(0):
         return Int32(-1)
     if Int(n_rows) == 0:
-        var engine_zero = UnsafePointer[GemmaEngine, MutExternalOrigin](
+        var engine_zero = UnsafePointer[GemmaEngine, MutUntrackedOrigin](
             unsafe_from_address=Int(handle))
         if engine_zero[0].dflash_ptr == 0:
             return Int32(-2)
-        var dp_zero = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+        var dp_zero = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_zero[0].dflash_ptr))
         return Int32(dp_zero[0].cache_len())
     if Int(n_rows) > DFLASH_CTX_BATCH:
         return Int32(-3)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].dflash_ptr == 0:
         return Int32(-2)
     try:
-        var dp = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+        var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
         if Int(start_row) + Int(n_rows) > dp[0].last_verify_rows:
             return Int32(-1)
         if dp[0].cache_len() + Int(n_rows) > DFLASH_MAX_CTX:
             return Int32(-3)
+        if HAS_LINEAR_ATTENTION:
+            # Target verify inputs are [seed, draft_0, ...]. If a drafts are
+            # accepted, exactly 1+a INPUT rows become committed. The correction
+            # token is a verifier logit and is not processed until the next cycle.
+            if not engine_ptr[0].dflash_verify_pending:
+                raise Error("DFlash GDN commit requested without a verify snapshot")
+            if Int(start_row) != 0:
+                raise Error("DFlash GDN rollback only supports a prefix of verify rows")
+            var committed = Int(n_rows)
+            var verify_start = engine_ptr[0].dflash_verify_start
+            var verify_rows = engine_ptr[0].dflash_verify_rows
+            if committed <= 0 or committed > verify_rows:
+                raise Error("DFlash GDN committed row count is outside verify transaction")
+
+            # Rejected verify rows were never appended by today's call order, but
+            # truncate explicitly: correctness must not depend on that incidental
+            # ordering surviving a refactor.
+            dp[0].set_cache_len(verify_start)
+
+            if committed < verify_rows:
+                # Append-only softmax KV rolls back by logical length. Recurrent
+                # state cannot: restore the pre-verify pools, then replay the exact
+                # committed target-input prefix through the FULL model so every GDN
+                # layer sees qkv/a/b derived from the correct preceding layers.
+                engine_ptr[0].gdn_state.restore_verify_snapshot()
+                engine_ptr[0].set_cache_len(verify_start)
+                var replay = List[Int]()
+                for i in range(committed):
+                    replay.append(engine_ptr[0].dflash_verify_tokens[i])
+                var gdn_decode_order = (
+                    _env_float("NOMOS_VERIFY_GDN_DECODE_ORDER", 0.0) > Float32(0.5)
+                )
+                var gdn_fast_exact = (
+                    gdn_decode_order and
+                    _env_float("NOMOS_VERIFY_GDN_FAST_EXACT", 0.0) > Float32(0.5)
+                )
+                if gdn_decode_order and not gdn_fast_exact:
+                    for row in range(committed):
+                        if engine_ptr[0].cache_len() != verify_start + row:
+                            raise Error("decode-order rollback replay target length drift")
+                        engine_ptr[0].step_logits(replay[row], Int64(0))
+                        engine_ptr[0].ctx.synchronize()
+                        cuda_memcpy(
+                            dp[0].d_verify_taps_buf + UInt64(row * DFLASH_FC_IN * 4),
+                            dp[0].d_taps_buf,
+                            DFLASH_FC_IN * 4,
+                            3,
+                        )
+                    engine_ptr[0].ctx.synchronize()
+                else:
+                    prefill_batch_impl(
+                        engine_ptr[0], replay, verify_start,
+                        Int64(0), committed - 1, committed,
+                    )
+            else:
+                # Full accept: the first verify already produced the exact state.
+                engine_ptr[0].set_cache_len(verify_start + committed)
+
+            if engine_ptr[0].cache_len() != verify_start + committed:
+                raise Error("DFlash GDN rollback left target cache at wrong length")
+            if dp[0].cache_len() != verify_start:
+                raise Error("DFlash context was not truncated before committed append")
         dflash_append_context_rows(
             engine_ptr[0].ctx,
             dp[0],
@@ -2274,6 +2671,12 @@ def nomos_dflash_append_verify_context(
             Int(n_rows),
         )
         engine_ptr[0].ctx.synchronize()
+        if HAS_LINEAR_ATTENTION:
+            if dp[0].cache_len() != engine_ptr[0].cache_len():
+                raise Error("DFlash target/drafter cache lengths diverged after commit")
+            engine_ptr[0].gdn_state.finish_verify_transaction()
+            engine_ptr[0].dflash_verify_pending = False
+            engine_ptr[0].dflash_verify_tokens = List[Int]()
         return Int32(dp[0].cache_len())
     except e:
         print("[nomos_dflash_append_verify_context EXC]", e)
@@ -2284,10 +2687,10 @@ def nomos_dflash_append_verify_context(
 def nomos_dflash_cache_len(handle: Int64) -> Int32:
     if handle == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].dflash_ptr == 0:
         return Int32(-2)
-    var dp = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+    var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
         unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
     return Int32(dp[0].cache_len())
 
@@ -2296,10 +2699,10 @@ def nomos_dflash_cache_len(handle: Int64) -> Int32:
 def nomos_dflash_set_len(handle: Int64, n: Int32) -> Int32:
     if handle == 0 or n < Int32(0) or Int(n) > DFLASH_MAX_CTX:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].dflash_ptr == 0:
         return Int32(-2)
-    var dp = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+    var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
         unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
     dp[0].set_cache_len(Int(n))
     return Int32(0)
@@ -2309,10 +2712,10 @@ def nomos_dflash_set_len(handle: Int64, n: Int32) -> Int32:
 def nomos_dflash_reset(handle: Int64) -> Int32:
     if handle == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].dflash_ptr == 0:
         return Int32(-2)
-    var dp = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+    var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
         unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
     dp[0].reset()
     return Int32(0)
@@ -2327,7 +2730,7 @@ def nomos_dflash_draft_block(
 ) -> Int32:
     """Draft one DFlash block from [committed_token, mask*15].
 
-    The block embeddings are gathered from the target tied embedding table at
+    The block embeddings are gathered from the target embedding table at
     absolute positions [abs_start_pos, abs_start_pos+16). Returns 15 and writes
     greedy draft ids to out_ids[15]. Requires the target Q4 lm-head.
     """
@@ -2335,7 +2738,7 @@ def nomos_dflash_draft_block(
         return Int32(-1)
     if abs_start_pos < Int32(0):
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].dflash_ptr == 0:
         return Int32(-2)
     # NVFP4 (discrete-card) build: read out through d_embed_nvfp4; GB10 build: d_embed_q4.
@@ -2343,7 +2746,7 @@ def nomos_dflash_draft_block(
     if not use_nvfp4 and engine_ptr[0].d_embed_q4 == 0:
         return Int32(-3)
     try:
-        var dp = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+        var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
         var block = List[Float32](capacity=DFLASH_BLOCK * DFLASH_HIDDEN)
         for _ in range(DFLASH_BLOCK * DFLASH_HIDDEN):
@@ -2351,17 +2754,26 @@ def nomos_dflash_draft_block(
         for row in range(DFLASH_BLOCK):
             var tok = Int(committed_token)
             if row > 0:
-                tok = 4
+                tok = dp[0].mask_token_id
             _ = external_call["nomos_pread", c_size_t](
                 engine_ptr[0].embed_fd,
                 UnsafePointer(to=block[row * DFLASH_HIDDEN]),
                 c_size_t(DFLASH_HIDDEN * 4),
                 c_size_t(tok * DFLASH_HIDDEN * 4),
             )
-        var embed_scale = sqrt(Float32(DFLASH_HIDDEN))
-        for i in range(DFLASH_BLOCK * DFLASH_HIDDEN):
-            block[i] = block[i] * embed_scale
+        @parameter
+        if DRAFTER_EMBED_SQRT_SCALE:
+            var embed_scale = sqrt(Float32(DFLASH_HIDDEN))
+            for i in range(DFLASH_BLOCK * DFLASH_HIDDEN):
+                block[i] *= embed_scale
         cuda_upload(dp[0].d_block_h, block)
+        if dp[0].trace_enabled:
+            cuda_memcpy(
+                dp[0].d_target_hidden,
+                dp[0].d_block_h,
+                DFLASH_BLOCK * DFLASH_HIDDEN * 4,
+                3,
+            )
         cuda_sync()
         if use_nvfp4:
             dflash_draft_block_nvfp4(
@@ -2376,6 +2788,7 @@ def nomos_dflash_draft_block(
                 engine_ptr[0].d_w4a4_bs_sf,
                 engine_ptr[0].d_w4a4_wbs_sf,
                 engine_ptr[0].d_lmhead_cpad,
+                Int(committed_token),
                 Int(abs_start_pos),
             )
         else:
@@ -2383,6 +2796,7 @@ def nomos_dflash_draft_block(
                 engine_ptr[0].ctx,
                 dp[0],
                 engine_ptr[0].d_embed_q4,
+                Int(committed_token),
                 Int(abs_start_pos),
             )
         engine_ptr[0].ctx.synchronize()
@@ -2416,11 +2830,11 @@ def nomos_eagle3_verify_fused(
         return Int32(-1)
     if Int(n_rows) > MAX_VERIFY_ROWS:
         return Int32(-3)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].eagle3_ptr == 0:
         return Int32(-2)
     try:
-        var ep = UnsafePointer[Eagle3Drafter, MutExternalOrigin](
+        var ep = UnsafePointer[Eagle3Drafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].eagle3_ptr))
         ep[0].last_verify_rows = Int(n_rows)
         var tokens = List[Int]()
@@ -2448,10 +2862,10 @@ def nomos_eagle3_select_verify_tap(handle: Int64, row: Int32) -> Int32:
     """
     if handle == 0 or row < Int32(0) or Int(row) >= MAX_VERIFY_ROWS:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].eagle3_ptr == 0:
         return Int32(-2)
-    var ep = UnsafePointer[Eagle3Drafter, MutExternalOrigin](
+    var ep = UnsafePointer[Eagle3Drafter, MutUntrackedOrigin](
         unsafe_from_address=Int(engine_ptr[0].eagle3_ptr))
     if Int(row) >= ep[0].last_verify_rows:
         return Int32(-1)
@@ -2467,18 +2881,18 @@ def nomos_eagle3_select_verify_tap(handle: Int64, row: Int32) -> Int32:
 @export
 def nomos_eagle3_draft_from_taps(handle: Int64, taps_ptr: Int64, seed_token: Int32, k: Int32,
         out_draft_ids: Int64, out_target_ids: Int64, out_inter: Int64) -> Int32:
-    """Gold-diff entry. Upload FIXED taps [3*dB] (host fp32 at taps_ptr), draft k steps from
+    """gold-diff entry. Upload FIXED taps [3*dB] (host fp32 at taps_ptr), draft k steps from
     seed_token at position_start=1, write per-step draft_ids + target_ids (Int32) to
     out_draft_ids / out_target_ids, and (if out_inter!=0) the captured intermediates as fp32:
     fc_out[dB], then per step attn_out[nh*hd], o_out[dB], hidden_out[dB]. Returns the count
     drafted, or -1 bad arg / -2 not loaded / -99 exc."""
     if handle == 0 or taps_ptr == 0 or k <= Int32(0):
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].eagle3_ptr == 0:
         return Int32(-2)
     try:
-        var ep = UnsafePointer[Eagle3Drafter, MutExternalOrigin](
+        var ep = UnsafePointer[Eagle3Drafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].eagle3_ptr))
         var dB = ep[0].dB
         var nh_hd = ep[0].nh * ep[0].hd
@@ -2491,8 +2905,8 @@ def nomos_eagle3_draft_from_taps(handle: Int64, taps_ptr: Int64, seed_token: Int
         eagle3_draft_k(engine_ptr[0].ctx, ep[0], d_taps, 1, Int(seed_token), Int(engine_ptr[0].embed_fd), Int(k), drafts)
         cuda_free(d_taps)
         var n = len(drafts) if len(drafts) < Int(k) else Int(k)
-        var od = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_draft_ids))
-        var ot = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_target_ids))
+        var od = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_draft_ids))
+        var ot = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_target_ids))
         for i in range(n):
             od[i] = ep[0].cap_draft_ids[i]
             ot[i] = drafts[i]                  # drafts holds the target ids
@@ -2522,11 +2936,11 @@ def nomos_eagle3_head_logits(handle: Int64, taps_ptr: Int64, seed_token: Int32, 
     logits fp32[k, 32000]. Returns count drafted, -1 bad arg / -2 not loaded / -99 exc."""
     if handle == 0 or taps_ptr == 0 or k <= Int32(0):
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].eagle3_ptr == 0:
         return Int32(-2)
     try:
-        var ep = UnsafePointer[Eagle3Drafter, MutExternalOrigin](
+        var ep = UnsafePointer[Eagle3Drafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].eagle3_ptr))
         var dB = ep[0].dB
         ep[0].seq_len = 0                    # clean-slate drafter KV (single-shot gate run)
@@ -2541,11 +2955,11 @@ def nomos_eagle3_head_logits(handle: Int64, taps_ptr: Int64, seed_token: Int32, 
         cuda_free(d_taps)
         var n = len(drafts) if len(drafts) < Int(k) else Int(k)
         if out_draft_ids != 0:
-            var od = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_draft_ids))
+            var od = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_draft_ids))
             for i in range(n):
                 od[i] = ep[0].cap_draft_ids[i]
         if out_target_ids != 0:
-            var ot = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_target_ids))
+            var ot = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_target_ids))
             for i in range(n):
                 ot[i] = drafts[i]
         if out_logits != 0:
@@ -2572,17 +2986,17 @@ def nomos_eagle3_draft(handle: Int64, seed_token: Int32, k: Int32, out_target_id
     -2 not loaded / -99 exc."""
     if handle == 0 or out_target_ids == 0 or k <= Int32(0):
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].eagle3_ptr == 0:
         return Int32(-2)
     try:
-        var ep = UnsafePointer[Eagle3Drafter, MutExternalOrigin](
+        var ep = UnsafePointer[Eagle3Drafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].eagle3_ptr))
         var drafts = List[Int32]()
         # taps = the engine's L[1,29,56] tap in ep[0].d_taps_buf (last decode); seed_pos=1, shared embed
         ep[0].next_seed_token = Int(seed_token)
         eagle3_draft_k(engine_ptr[0].ctx, ep[0], ep[0].d_taps_buf, 1, Int(seed_token), Int(engine_ptr[0].embed_fd), Int(k), drafts)
-        var ot = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_target_ids))
+        var ot = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_target_ids))
         var n = len(drafts) if len(drafts) < Int(k) else Int(k)
         for i in range(n):
             ot[i] = drafts[i]
@@ -2615,11 +3029,11 @@ def nomos_eagle3_draft_trace(
     """
     if handle == 0 or k <= Int32(0):
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].eagle3_ptr == 0:
         return Int32(-2)
     try:
-        var ep = UnsafePointer[Eagle3Drafter, MutExternalOrigin](
+        var ep = UnsafePointer[Eagle3Drafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].eagle3_ptr))
         var dB = ep[0].dB
         var nh_hd = ep[0].nh * ep[0].hd
@@ -2630,11 +3044,11 @@ def nomos_eagle3_draft_trace(
         cuda_sync()
         var n = len(drafts) if len(drafts) < Int(k) else Int(k)
         if out_draft_ids != 0:
-            var od = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_draft_ids))
+            var od = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_draft_ids))
             for i in range(n):
                 od[i] = ep[0].cap_draft_ids[i]
         if out_target_ids != 0:
-            var ot = UnsafePointer[Int32, MutExternalOrigin](unsafe_from_address=Int(out_target_ids))
+            var ot = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_target_ids))
             for i in range(n):
                 ot[i] = drafts[i]
         if out_inter != 0:
@@ -2689,11 +3103,11 @@ def nomos_eagle3_commit(
         return Int32(-1)
     if prefix_count > Int32(0) and (prefix_tokens_ptr == 0 or prefix_taps_ptr == 0):
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].eagle3_ptr == 0:
         return Int32(-2)
     try:
-        var ep = UnsafePointer[Eagle3Drafter, MutExternalOrigin](
+        var ep = UnsafePointer[Eagle3Drafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].eagle3_ptr))
         var pc = Int(prefix_count)
         if ep[0].last_draft_base_len + pc > 1024:
@@ -2730,11 +3144,11 @@ def nomos_eagle3_get_taps(handle: Int64, out_ptr: Int64) -> Int32:
     aux-hidden tap) to host out_ptr fp32. For the bf16-vs-Q8 accept diagnostic. 0=ok, -1/-2 err, -99 exc."""
     if handle == 0 or out_ptr == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].eagle3_ptr == 0:
         return Int32(-2)
     try:
-        var ep = UnsafePointer[Eagle3Drafter, MutExternalOrigin](
+        var ep = UnsafePointer[Eagle3Drafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].eagle3_ptr))
         cuda_memcpy(UInt64(out_ptr), ep[0].d_taps_buf, 3 * ep[0].dB * 4, 2)   # D2H
         return Int32(0)
@@ -2751,11 +3165,11 @@ def nomos_eagle3_get_verify_taps(handle: Int64, row: Int32, out_ptr: Int64) -> I
     0=ok, -1=bad arg/stale row, -2=EAGLE not loaded, -99=exc."""
     if handle == 0 or out_ptr == 0 or row < Int32(0) or Int(row) >= MAX_VERIFY_ROWS:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].eagle3_ptr == 0:
         return Int32(-2)
     try:
-        var ep = UnsafePointer[Eagle3Drafter, MutExternalOrigin](
+        var ep = UnsafePointer[Eagle3Drafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].eagle3_ptr))
         if Int(row) >= ep[0].last_verify_rows:
             return Int32(-1)
@@ -2776,10 +3190,10 @@ def nomos_eagle3_reset(handle: Int64) -> Int32:
     """Reset the drafter's persistent KV (seq_len=0) for a new sequence. 0=ok, -1/-2 err."""
     if handle == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].eagle3_ptr == 0:
         return Int32(-2)
-    var ep = UnsafePointer[Eagle3Drafter, MutExternalOrigin](
+    var ep = UnsafePointer[Eagle3Drafter, MutUntrackedOrigin](
         unsafe_from_address=Int(engine_ptr[0].eagle3_ptr))
     ep[0].seq_len = 0
     ep[0].last_draft_base_len = 0
@@ -2795,7 +3209,7 @@ def nomos_decode_step_token(handle: Int64, token: Int32, out_token_ptr: Int64) -
     -99 = exception."""
     if handle == 0 or out_token_ptr == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     try:
         engine_ptr[0].step_token(Int(token), out_token_ptr)
         return Int32(0)
@@ -2805,10 +3219,12 @@ def nomos_decode_step_token(handle: Int64, token: Int32, out_token_ptr: Int64) -
 
 @export
 def nomos_kv_cache_len(handle: Int64) -> Int32:
-    """KV reuse: current cache valid length (positions filled), from layer 0. -1 = bad arg."""
+    """KV reuse: current cache valid length from the profile's authoritative
+    softmax-KV layer (layer 0 for Gemma/Muse, first full layer for GDN hybrids).
+    -1 = bad arg."""
     if handle == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     return Int32(engine_ptr[0].cache_len())
 
 @export
@@ -2817,7 +3233,7 @@ def nomos_kv_set_len(handle: Int64, n: Int32) -> Int32:
     continue-prefill of the new suffix. The KV memory [0,n) stays valid. 0 = ok, -1 = bad arg."""
     if handle == 0 or n < Int32(0):
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     engine_ptr[0].set_cache_len(Int(n))
     return Int32(0)
 
@@ -2828,7 +3244,7 @@ def nomos_prefill_cont(handle: Int64, ids_ptr: Int64, n: Int32, logits_out_ptr: 
     position logits to logits_out_ptr. 0 = ok, -1 = bad arg, -99 = exception."""
     if handle == 0 or n <= Int32(0) or ids_ptr == 0 or logits_out_ptr == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     try:
         var suffix = List[Int]()
         _read_int32_array_into(ids_ptr, Int(n), suffix)
@@ -2862,7 +3278,7 @@ def nomos_generate_stream(
         return Int32(-1)
     if cb_id == 0:
         return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     # Per-call sampling (see nomos_generate): snapshot defaults, restore after.
     var saved_temp = engine_ptr[0].temp
     var saved_top_p = engine_ptr[0].top_p
@@ -2877,6 +3293,9 @@ def nomos_generate_stream(
         var prompt = List[Int]()
         _read_int32_array_into(prompt_ptr, Int(n_prompt), prompt)
         var out = List[Int]()
+        # Streaming generation is also a complete independent request; it must
+        # share nomos_generate/nomos_prefill's fresh-state contract.
+        engine_ptr[0].reset_kv_cache()
         engine_ptr[0].run_inference(prompt, Int(max_new_tokens), False, out, cb_id)
         engine_ptr[0].temp = saved_temp
         engine_ptr[0].top_p = saved_top_p
@@ -2898,7 +3317,7 @@ def nomos_reset_kv(handle: Int64) -> Int32:
     if handle == 0:
         return Int32(-1)
     try:
-        var engine = UnsafePointer[GemmaEngine, MutExternalOrigin](unsafe_from_address=Int(handle))
+        var engine = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
         engine[0].reset_kv_cache()
         return Int32(0)
     except:

@@ -1,4 +1,4 @@
-# Fair same-card llama.cpp comparison (Gold, RTX PRO 4000 Blackwell sm_120, GPU0)
+# Fair same-card llama.cpp comparison (RTX PRO 4000 Blackwell sm_120, GPU0)
 
 Vanilla llama.cpp base-decode vs our NVFP4 kernel on the SAME card / model / quant /
 prompts, to close the "vs llama.cpp on this silicon" comparison for gemma-4-31B.
@@ -20,17 +20,17 @@ prompts, to close the "vs llama.cpp on this silicon" comparison for gemma-4-31B.
 | llama-bench tg96 (r=5) | 29.58 ± 0.09 | 1027 (pp96) |
 | server /completion, exact gold ids, 2x12 | 30.29 mean (29.9–30.5) | ~500–940 |
 
-llama.cpp base decode on Gold = **~30 tok/s**.
+llama.cpp base decode on the RTX PRO 4000 = **~30 tok/s**.
 
-## Base-decode reference (Gold, RTX PRO 4000)
+## Base-decode reference (RTX PRO 4000)
 
 | comparison | ours | llama.cpp | result |
 |---|---|---|---|
 | base-vs-base (pure kernel) | 21.7 | ~30 | **llama.cpp base ~1.36–1.40x FASTER** |
 
 - Vanilla llama.cpp base decode BEATS our NVFP4 base kernel on identical silicon/model/quant.
-  Our base kernel has headroom to close. (An honest Gold-box base-decode measurement; the
-  ~30 here is **Gold's** number and should not be fused with the 5090's 30.39 — different card.)
+  Our base kernel has headroom to close. (An honest discrete-box base-decode measurement; the
+  ~30 here is **the discrete box's** number and should not be fused with the 5090's 30.39 — different card.)
 
 ## Retired verdict — and why (read this if you're diffing the repo)
 

@@ -23,7 +23,7 @@ Invariants asserted:
       -Xlinker -L/usr/local/cuda/targets/sbsa-linux/lib -Xlinker -lcudart -Xlinker -lcublas -Xlinker -lm
   gpurun ./build/greedy_chk
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.collections import List
 

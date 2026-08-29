@@ -14,7 +14,7 @@ Each NVFP4 block = 16 K-elements sharing one scale. So with fp4_a=fp4_b=1:
 This depends on m (not n), and exercises BOTH the row (m) and k-block (kb) axes of the
 SF-atom layout — a wrong SF placement gives a wrong per-row sum.
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from lib.fp4_gemm_sm100 import gpu_fp4_gemm_sm100, gpu_nvfp4_sf_scatter
 

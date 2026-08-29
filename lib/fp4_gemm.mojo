@@ -18,11 +18,12 @@ so padded rows/cols never perturb live results.
 
 Toolchain: requires Mojo ≥1.0.0b3 + `--target-accelerator sm_121a` (the b3 NVPTX backend
 stamps PTX `.target sm_121a`; older nightlies stamp `sm_121` and the driver rejects the
-FP4 block-scale features). See STATE.md (2026-06-16).
+FP4 block-scale features). See the design notes (2026-06-16).
 """
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, barrier
-from std.gpu.memory import (
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx
+from max.gpu import barrier
+from max.gpu.memory import (
     AddressSpace,
     async_copy,
     async_copy_commit_group,
@@ -193,7 +194,7 @@ def fp4_gemm_kernel(
 # (NOMOS_FP4_OLD=1, or any shape with N%32!=0 / K%256!=0 falls back).
 # ─────────────────────────────────────────────────────────────────────────────
 # RTX PRO 6000 (Blackwell, 188 SMs, ~1.79 TB/s) re-tune sweep — HONEST NULL
-# (2026-07-08, inst 44270246, all L1 12/12): the Gold NS3/TK4/WARPS4 geometry
+# (2026-07-08, inst 44270246, all L1 12/12): the discrete NS3/TK4/WARPS4 geometry
 # stays optimal on the 188-SM card. Engine base decode is flat across geometry:
 #   NS3(ship) 48.5 | NS2 48.2 | WARPS8 48.2 tok/s ; NS4/TK6 worse (isolated probe,
 #   gateup regresses). The wave-quant hypothesis (NS4 wins on more SMs) did NOT
@@ -543,6 +544,172 @@ def fp4_gemm_kernel_smem_ps[NS: Int, TK: Int = FP4_TK_STAGE](
         d_out[ncol + 2 * q + 1] = c1 * ag0 * weight_global
 
 
+def fp4_gemm_kernel_smem_ps_grouped4[NS: Int, TK: Int = FP4_TK_STAGE](
+    d_out0: UnsafePointer[Float32, MutAnyOrigin],
+    d_out1: UnsafePointer[Float32, MutAnyOrigin],
+    d_out2: UnsafePointer[Float32, MutAnyOrigin],
+    d_out3: UnsafePointer[Float32, MutAnyOrigin],
+    a_bytes: UnsafePointer[UInt8, MutAnyOrigin],
+    a_sc: UnsafePointer[UInt8, MutAnyOrigin],
+    act_global: UnsafePointer[Float32, MutAnyOrigin],
+    b_bytes0: UnsafePointer[UInt8, MutAnyOrigin],
+    b_bytes1: UnsafePointer[UInt8, MutAnyOrigin],
+    b_bytes2: UnsafePointer[UInt8, MutAnyOrigin],
+    b_bytes3: UnsafePointer[UInt8, MutAnyOrigin],
+    b_sc0: UnsafePointer[UInt8, MutAnyOrigin],
+    b_sc1: UnsafePointer[UInt8, MutAnyOrigin],
+    b_sc2: UnsafePointer[UInt8, MutAnyOrigin],
+    b_sc3: UnsafePointer[UInt8, MutAnyOrigin],
+    weight_global0: Float32,
+    weight_global1: Float32,
+    weight_global2: Float32,
+    weight_global3: Float32,
+    N0_arg: Int32,
+    N1_arg: Int32,
+    N2_arg: Int32,
+    N3_arg: Int32,
+    K_arg: Int32,
+):
+    """Four-pointer variant of fp4_gemm_kernel_smem_ps for one shared A row.
+
+    block_idx.x selects one block-uniform output segment, then the body executes the
+    identical 32-column tile, K-stage traversal, MMA sequence, and fused-postscale
+    epilogue as fp4_gemm_kernel_smem_ps. Each segment retains its own packed weights,
+    scale bytes, weight global, and output buffer; no weight repack or rescale exists.
+    """
+    var N0 = Int(N0_arg)
+    var N1 = Int(N1_arg)
+    var N2 = Int(N2_arg)
+    var N3 = Int(N3_arg)
+    var K = Int(K_arg)
+    comptime TILE_N = 8 * FP4_SMEM_WARPS
+    var blocks0 = N0 // TILE_N
+    var blocks1 = N1 // TILE_N
+    var blocks2 = N2 // TILE_N
+    var blocks3 = N3 // TILE_N
+    var global_block = Int(block_idx.x)
+    if global_block >= blocks0 + blocks1 + blocks2 + blocks3:
+        return
+    var local_block = global_block
+    var d_out = d_out0
+    var b_bytes = b_bytes0
+    var b_sc = b_sc0
+    var weight_global = weight_global0
+    if global_block >= blocks0:
+        if global_block < blocks0 + blocks1:
+            local_block = global_block - blocks0
+            d_out = d_out1
+            b_bytes = b_bytes1
+            b_sc = b_sc1
+            weight_global = weight_global1
+        elif global_block < blocks0 + blocks1 + blocks2:
+            local_block = global_block - blocks0 - blocks1
+            d_out = d_out2
+            b_bytes = b_bytes2
+            b_sc = b_sc2
+            weight_global = weight_global2
+        else:
+            local_block = global_block - blocks0 - blocks1 - blocks2
+            d_out = d_out3
+            b_bytes = b_bytes3
+            b_sc = b_sc3
+            weight_global = weight_global3
+
+    # From this point through the epilogue, this is fp4_gemm_kernel_smem_ps verbatim
+    # except that local_block replaces block_idx.x after the block-uniform segment map.
+    comptime STAGE_B = (16 + 8 * FP4_SMEM_WARPS) * TK * 32 \
+        + (16 + 8 * FP4_SMEM_WARPS) * TK * 4
+    comptime OFF_BPK = 16 * TK * 32
+    comptime OFF_ASC = OFF_BPK + 8 * FP4_SMEM_WARPS * TK * 32
+    comptime OFF_BSC = OFF_ASC + 16 * TK * 4
+    var KB = K // 2
+    var NB = K // 16
+    var tid = Int(thread_idx.x)
+    var w = tid >> 5
+    var lane = tid & 31
+    var gid = lane >> 2
+    var q = lane & 3
+    var mrow = 0
+    var ncol_blk = local_block * TILE_N
+    var ncol = ncol_blk + w * 8
+
+    var sm = stack_allocation[
+        NS * STAGE_B, UInt8,
+        address_space = AddressSpace.SHARED, alignment=16,
+    ]()
+
+    var c0 = Float32(0)
+    var c1 = Float32(0)
+    var c2 = Float32(0)
+    var c3 = Float32(0)
+
+    var NT = K // (TK * 64)
+    var npre = NS - 1
+    if npre > NT:
+        npre = NT
+    for s in range(npre):
+        _stage_ktile[TK](sm + s * STAGE_B, a_bytes, b_bytes, a_sc, b_sc,
+                         tid, mrow, ncol_blk, s * (TK * 64), KB, NB)
+        async_copy_commit_group()
+
+    for kt in range(NT):
+        var pf = kt + NS - 1
+        if pf < NT:
+            _stage_ktile[TK](
+                sm + (pf % NS) * STAGE_B,
+                a_bytes, b_bytes, a_sc, b_sc,
+                tid, mrow, ncol_blk, pf * (TK * 64), KB, NB,
+            )
+            async_copy_commit_group()
+            async_copy_wait_group(Int32(NS - 1))
+        else:
+            async_copy_wait_group(0)
+        barrier()
+
+        var st = sm + (kt % NS) * STAGE_B
+        comptime for cc in range(TK):
+            var a0 = (st + cc * (16 * 32) + gid * 32 + q * 4).bitcast[UInt32]()[0]
+            var a1 = (st + cc * (16 * 32) + (gid + 8) * 32 + q * 4).bitcast[UInt32]()[0]
+            var a2 = (st + cc * (16 * 32) + gid * 32 + 16 + q * 4).bitcast[UInt32]()[0]
+            var a3 = (st + cc * (16 * 32) + (gid + 8) * 32 + 16 + q * 4).bitcast[UInt32]()[0]
+            var b0 = (st + OFF_BPK + cc * (8 * FP4_SMEM_WARPS * 32) + (w * 8 + gid) * 32 + q * 4)
+                .bitcast[UInt32]()[0]
+            var b1 = (st + OFF_BPK + cc * (8 * FP4_SMEM_WARPS * 32) + (w * 8 + gid) * 32 + 16 + q * 4)
+                .bitcast[UInt32]()[0]
+
+            var sca = UInt32(0)
+            if q == 0:
+                sca = (st + OFF_ASC + cc * (16 * 4) + gid * 4).bitcast[UInt32]()[0]
+            elif q == 1:
+                sca = (st + OFF_ASC + cc * (16 * 4) + (gid + 8) * 4).bitcast[UInt32]()[0]
+            var scb = UInt32(0)
+            if q == 0:
+                scb = (st + OFF_BSC + cc * (8 * FP4_SMEM_WARPS * 4) + (w * 8 + gid) * 4)
+                    .bitcast[UInt32]()[0]
+
+            comptime if _is_sm_120x_or_newer():
+                var r = inlined_assembly[
+                    (
+                        "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale"
+                        ".scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 {$0,$1,$2,$3},"
+                        " {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13}, {$14}, {0, 0},"
+                        " {$15}, {0, 0};"
+                    ),
+                    _RegisterPackType[Float32, Float32, Float32, Float32],
+                    constraints="=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f,r,r",
+                ](a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, sca, scb)
+                c0 = r[0]
+                c1 = r[1]
+                c2 = r[2]
+                c3 = r[3]
+        barrier()
+
+    if gid == 0:
+        var ag0 = act_global[0]
+        d_out[ncol + 2 * q] = c0 * ag0 * weight_global
+        d_out[ncol + 2 * q + 1] = c1 * ag0 * weight_global
+
+
 def _launch_ps[NS: Int, TK: Int = FP4_TK_STAGE](
     ctx: DeviceContext,
     d_out: UInt64, a_bytes: UInt64, b_bytes: UInt64,
@@ -562,6 +729,41 @@ def _launch_ps[NS: Int, TK: Int = FP4_TK_STAGE](
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(act_global)),
         weight_global, Int32(N), Int32(K),
         grid_dim=(N // (8 * FP4_SMEM_WARPS), 1),
+        block_dim=32 * FP4_SMEM_WARPS,
+    )
+
+
+def _launch_ps_grouped4[NS: Int, TK: Int = FP4_TK_STAGE](
+    ctx: DeviceContext,
+    d_out0: UInt64, d_out1: UInt64, d_out2: UInt64, d_out3: UInt64,
+    a_bytes: UInt64, a_sc: UInt64, act_global: UInt64,
+    b_bytes0: UInt64, b_bytes1: UInt64, b_bytes2: UInt64, b_bytes3: UInt64,
+    b_sc0: UInt64, b_sc1: UInt64, b_sc2: UInt64, b_sc3: UInt64,
+    weight_global0: Float32, weight_global1: Float32,
+    weight_global2: Float32, weight_global3: Float32,
+    N0: Int, N1: Int, N2: Int, N3: Int, K: Int,
+) raises:
+    var kern = ctx.compile_function[fp4_gemm_kernel_smem_ps_grouped4[NS, TK]]()
+    ctx.enqueue_function(
+        kern,
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(d_out0)),
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(d_out1)),
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(d_out2)),
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(d_out3)),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(a_bytes)),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(a_sc)),
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(act_global)),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(b_bytes0)),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(b_bytes1)),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(b_bytes2)),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(b_bytes3)),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(b_sc0)),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(b_sc1)),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(b_sc2)),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(b_sc3)),
+        weight_global0, weight_global1, weight_global2, weight_global3,
+        Int32(N0), Int32(N1), Int32(N2), Int32(N3), Int32(K),
+        grid_dim=((N0 + N1 + N2 + N3) // (8 * FP4_SMEM_WARPS), 1),
         block_dim=32 * FP4_SMEM_WARPS,
     )
 
@@ -624,6 +826,37 @@ def gpu_fp4_gemm_ps(
         return
     _launch_ps[3](ctx, d_out, a_bytes, b_bytes, a_sc, b_sc,
                   act_global, weight_global, N, K)
+
+
+def gpu_fp4_gemm_ps_grouped4(
+    ctx: DeviceContext,
+    d_out0: UInt64, d_out1: UInt64, d_out2: UInt64, d_out3: UInt64,
+    a_bytes: UInt64, a_sc: UInt64, act_global: UInt64,
+    b_bytes0: UInt64, b_bytes1: UInt64, b_bytes2: UInt64, b_bytes3: UInt64,
+    b_sc0: UInt64, b_sc1: UInt64, b_sc2: UInt64, b_sc3: UInt64,
+    weight_global0: Float32, weight_global1: Float32,
+    weight_global2: Float32, weight_global3: Float32,
+    N0: Int, N1: Int, N2: Int, N3: Int, K: Int,
+) raises:
+    """One launch over four independent B/output segments sharing one quantized A row.
+
+    This is the production NS=3/TK=4 fp4_gemm_kernel_smem_ps geometry. Callers must
+    require each N%32==0, K%256==0, and the ordinary qa_fuse_route kill switches.
+    """
+    if Float64(ctx.default_device_info.compute) < 12.0:
+        raise Error(
+            "NVFP4 W4A4 grouped fused-postscale GEMM requires sm_120/sm_121 "
+            "(compute>=12.0); run the ordinary projection dispatch on this device."
+        )
+    _launch_ps_grouped4[3](
+        ctx,
+        d_out0, d_out1, d_out2, d_out3,
+        a_bytes, a_sc, act_global,
+        b_bytes0, b_bytes1, b_bytes2, b_bytes3,
+        b_sc0, b_sc1, b_sc2, b_sc3,
+        weight_global0, weight_global1, weight_global2, weight_global3,
+        N0, N1, N2, N3, K,
+    )
 
 
 def gpu_fp4_gemm_ps_geo(

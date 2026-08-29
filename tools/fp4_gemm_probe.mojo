@@ -1,6 +1,6 @@
 """Standalone perf probe for the NVFP4 W4A4 decode GEMM (lib/fp4_gemm.fp4_gemm_kernel).
 
-The 3-second iteration harness for the sm_120 kernel sprint on Gold (RTX PRO 4000
+The 3-second iteration harness for the sm_120 kernel sprint on (RTX PRO 4000
 Blackwell, ~672 GB/s). Drives the EXACT kernel the engine calls in decode
 (`gpu_fp4_gemm` -> `fp4_gemm_kernel`, the `lib_fp4_gemm_fp4_gemm_kernel...` instance
 in nsys/ncu traces: 73.6% of decode GPU time, avg 216 us/instance, ~387 inst/token)
@@ -34,7 +34,7 @@ Env knobs (the fast iteration loop):
                           lib/fp4_act.gpu_matmul_nvfp4_w4a4_dev — what _mm_dev calls)
   FP4_PROBE_WCOPIES=N     weight copies (0 = auto to beat L2 [default]; 1 = L2-warm)
 
-Build (Gold, sm_120a — do NOT copy binaries across boxes):
+Build (discrete Blackwell, sm_120a — do NOT copy binaries across boxes):
   pixi run mojo build tools/fp4_gemm_probe.mojo -I . \
       --target-accelerator sm_120a -o build/fp4_gemm_probe \
       -Xlinker -L/usr/local/cuda/lib64 -Xlinker -lcudart -Xlinker -lm
@@ -43,7 +43,7 @@ Run (guards GPU0-free first):
   bash tools/run_fp4_probe.sh
 """
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.time import perf_counter_ns
 from std.ffi import external_call

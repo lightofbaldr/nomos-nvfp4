@@ -12,6 +12,7 @@ The mixin only uses backend primitives (prefill/step/prefill_cont/set_cache_len)
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import sys
 from typing import Callable, Iterable
@@ -24,7 +25,26 @@ _TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _TOOLS)
 import fp4_parity_harness as H  # noqa: E402
 
-VOCAB = 262144
+VOCAB = 262144  # maximum supported vocab / historical Gemma wire bound
+
+
+def _configured_vocab_size() -> int:
+    """Read the tokenizer/model vocab when the launcher supplied TOK_DIR.
+
+    Both supported tokenizer configs nest the text-model geometry under text_config.
+    Falling back to the historical maximum keeps standalone harnesses with no tokenizer
+    configured byte-for-byte compatible with the old host.
+    """
+    path = os.path.join(H.TOK_DIR, "config.json") if H.TOK_DIR else ""
+    try:
+        with open(path) as f:
+            config = json.load(f)
+        size = config.get("text_config", {}).get("vocab_size", config.get("vocab_size"))
+        if isinstance(size, int) and 0 < size <= VOCAB:
+            return size
+    except (OSError, ValueError, TypeError):
+        pass
+    return VOCAB
 
 LogitsProcessor = Callable[[int, list[int], np.ndarray], np.ndarray]
 
@@ -105,8 +125,10 @@ class _GenMixin:
 class KernelLM(_GenMixin):
     """In-process backend: loads the .so + model in THIS process via ctypes FFI."""
 
-    def __init__(self) -> None:
+    def __init__(self, vocab_size: int | None = None) -> None:
         self.lib = H.load_lib()
+        self.lib.nomos_model_id.argtypes = []
+        self.lib.nomos_model_id.restype = ctypes.c_int32
         self.lib.nomos_prefill.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int64]
         self.lib.nomos_prefill.restype = ctypes.c_int32
         self.lib.nomos_decode_step.argtypes = [ctypes.c_int64, ctypes.c_int32, ctypes.c_int64]
@@ -141,7 +163,30 @@ class KernelLM(_GenMixin):
         except AttributeError:
             self._dflash_avail = False
         self.h = H.init_engine(self.lib)
-        self._logits = np.zeros(VOCAB, dtype=np.float32)
+        # The compiled profile is the vocab AUTHORITY: the .so emits exactly this many logits per
+        # step, so the buffer is sized from the profile id — never from a tokenizer length (which
+        # may be padded or short). Fail closed if a caller-supplied (tokenizer) vocab can't fit the
+        # profile: that means TOK_DIR and the .so disagree ("what runs != what's configured").
+        try:
+            from models import PROFILE_VOCAB
+        except ImportError:
+            PROFILE_VOCAB = {}
+        _profile_vocab = PROFILE_VOCAB.get(int(self.lib.nomos_model_id()))
+        if _profile_vocab is not None:
+            if vocab_size is not None and vocab_size > _profile_vocab:
+                raise ValueError(
+                    f"tokenizer vocab {vocab_size} exceeds compiled profile "
+                    f"{int(self.lib.nomos_model_id())} vocab {_profile_vocab} — mispointed TOK_DIR vs .so?")
+            self.vocab_size = _profile_vocab
+        else:
+            self.vocab_size = vocab_size if vocab_size is not None else _configured_vocab_size()
+        if not 0 < self.vocab_size <= VOCAB:
+            raise ValueError(f"invalid host vocab size {self.vocab_size} (max {VOCAB})")
+        self._logits = np.zeros(self.vocab_size, dtype=np.float32)
+
+    def model_id(self) -> int:
+        """Return the model profile compiled into this kernel."""
+        return int(self.lib.nomos_model_id())
 
     def dflash_load(self, dflash_dir: str) -> None:
         """Load the DFlash block drafter for speculative decoding. Idempotent.
@@ -183,7 +228,7 @@ class KernelLM(_GenMixin):
         stop = set(int(s) for s in stop_ids)
         K = vb - 1
         out15 = np.zeros(15, dtype=np.int32)
-        vlogits = np.zeros((vb, VOCAB), dtype=np.float32)
+        vlogits = np.zeros((vb, self.vocab_size), dtype=np.float32)
         self.lib.nomos_dflash_reset(self.h)
         self.prefill(prompt_ids)                       # resets KV, fills self._logits
         seed = int(np.argmax(self._logits))

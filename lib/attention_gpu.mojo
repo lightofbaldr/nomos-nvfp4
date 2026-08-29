@@ -33,7 +33,7 @@ Function contract for attention_gpu_fp32:
 from std.math import exp
 from std.memory import UnsafePointer
 from std.collections import List
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 from lib.cuda import cuda_sync, cuda_upload, cuda_download, cuda_memcpy_2d, cuda_memcpy
 from lib.cuda import cuda_memcpy_2d_async

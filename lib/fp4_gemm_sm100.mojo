@@ -12,7 +12,7 @@ SWIZZLE_32B tile (32-byte swizzle atom == the slice width), so the MMA descripto
 with no swizzle-offset math. The 8x32B FP4 k-atom (`_select_k_atom_bits[SWIZZLE_32B]` upcast to
 4-bit) exactly matches one MMA_K slice.
 
-Design + recipe: docs/TCGEN05_W4A4_SM100_DESIGN.md ; docs/tcgen05_w4a4_design_findings.json
+Design + recipe: internal notes ; docs/tcgen05_w4a4_design_findings.json
 Dispatch: gpu_matmul_nvfp4_w4a4_dev (lib/fp4_act.mojo) routes here when _is_sm_100x().
 
 The TMADescriptor kernel params MUST carry `@__llvm_arg_metadata(<p>, `nvvm.grid_constant`)`
@@ -24,15 +24,16 @@ STATUS: BIT-EXACT on B200 — tools/fp4_gemm_sm100_test.mojo (all-ones) AND _tes
 vary-SCALES test (SF-atom TMEM staging), then wire the sm_100 dispatch in
 gpu_matmul_nvfp4_w4a4_dev. Until dispatched, the engine still runs W4A16 on sm_100.
 """
-from std.gpu.host import DeviceContext, DeviceBuffer
-from std.gpu import thread_idx, block_idx, block_dim, barrier, warp_id, lane_id
-from std.gpu.memory import AddressSpace, cp_async_bulk_tensor_shared_cluster_global
-from std.gpu.sync import (
+from max.gpu.host import DeviceContext, DeviceBuffer
+from std.gpu.primitives import thread_idx, block_idx, block_dim, warp_id, lane_id
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace, cp_async_bulk_tensor_shared_cluster_global
+from max.gpu.sync import (
     mbarrier_init,
     mbarrier_arrive_expect_tx_shared,
     mbarrier_try_wait_parity_shared,
 )
-from std.gpu.host.nvidia.tma import (
+from max.gpu.host.nvidia.tma import (
     TensorMapSwizzle,
     TMADescriptor,
     create_tma_descriptor,

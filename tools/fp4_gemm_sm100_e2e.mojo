@@ -10,7 +10,7 @@ Correctness pattern (per shape): A row m = FP4 nibble (m%8), B row n = (n%8), sc
 => C[m,n] = K * fp4(m%8) * fp4(n%8)  (fp4 lut {0,.5,1,1.5,2,3,4,6}); checked on a sampled
 grid for the huge (lm-head) shape. M is padded to 128 (the sm_100 MMA m-dim, == decode M=1).
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.time import perf_counter_ns
 from lib.fp4_gemm_sm100 import gpu_fp4_gemm_sm100, gpu_nvfp4_sf_scatter

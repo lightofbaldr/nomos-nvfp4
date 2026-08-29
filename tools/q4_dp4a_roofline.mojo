@@ -13,8 +13,8 @@ quant-launch overhead flagged. No nsys (CUDA trace is dead on GB10's iGPU) — s
       -Xlinker -lcudart -Xlinker -lcublas -Xlinker -lm
   gpurun ./build/q4_roof
 """
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
 from std.memory import UnsafePointer, bitcast
 from std.collections import List
 from std.time import perf_counter_ns

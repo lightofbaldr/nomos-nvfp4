@@ -14,9 +14,10 @@ precision via `act_precision()`: 8 = q8 dp4a (this, production), 32 = fp32 acts 
 research/high-precision). 16 (fp16) and 4 (q4 acts, end-state) are documented bolt-in
 seams — add a branch here + an act_precision() value, no structural change.
 """
-from std.gpu.host import DeviceContext
-from std.gpu import barrier, thread_idx, block_idx, block_dim
-from std.gpu.memory import (
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
+from max.gpu import barrier
+from max.gpu.memory import (
     AddressSpace,
     async_copy,
     async_copy_commit_group,

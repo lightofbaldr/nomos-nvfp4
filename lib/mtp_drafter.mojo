@@ -27,7 +27,7 @@ the assistant has NO own K/V; it attends the 31B's shared INT4 KV with the 31B's
 map (#431/#432). It is STUBBED here (q_proj + o_proj are real; the attend is zeroed and
 clearly marked) so the skeleton builds + runs end-to-end. `_mtp_attn` is filled in separately.
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import sqrt
 from std.memory import UnsafePointer
 from lib.q8_weights import load_to_gpu_q8, gpu_matmul_q8_fused_dev
@@ -237,7 +237,7 @@ def mtp_draft_k(ctx: DeviceContext, mut m: MTPDrafter, d_tap_h: UInt64, seed_tok
 def release_mtp_drafter_handle(handle: UInt64):
     if handle == 0:
         return
-    var ptr = UnsafePointer[MTPDrafter, MutExternalOrigin](
+    var ptr = UnsafePointer[MTPDrafter, MutUntrackedOrigin](
         unsafe_from_address=Int(handle)
     )
     if ptr[0].w_pre != 0: cuda_free(ptr[0].w_pre)

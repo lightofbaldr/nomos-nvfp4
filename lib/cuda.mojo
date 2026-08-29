@@ -14,8 +14,8 @@ from std.ffi import external_call, c_int
 from std.memory import UnsafePointer
 from std.collections import List
 from std.os import abort
-from std.gpu.host import DeviceContext
-from std.gpu.host._nvidia_cuda import CUDA, CUstream
+from max.gpu.host import DeviceContext
+from max.gpu.host._nvidia_cuda import CUDA, CUstream
 
 
 def cuda_malloc(bytes: Int) -> UInt64:

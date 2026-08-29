@@ -4,7 +4,7 @@ bf16 bits). Proves the GPU weight-dequant kernel matches the NVFP4 decode the en
 (tools/quantize_nvfp4.py) and the MMA use. Run from repo root:
   pixi run mojo run -I . --target-accelerator sm_121a tools/fp4_dequant_test.mojo
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.random import random_ui64
 from lib.fp4_weights import dequant_nvfp4_kernel, e4m3_decode, E2M1_MAG, FP4_GROUP

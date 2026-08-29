@@ -1,7 +1,7 @@
 #!/bin/bash
 # THE BLOCK-32 x READ-PATH MATRIX — one harness, every box.
 #
-# WHY THIS EXISTS. On 2026-08-02 NOMOS_KV_I4_BLOCK=32 measured +15.7% on Gold (PRO 4000) and
+# WHY THIS EXISTS. On 2026-08-02 NOMOS_KV_I4_BLOCK=32 measured +15.7% on the RTX PRO 4000 (PRO 4000) and
 # -10% on the demo laptop (5090) at the SAME COMMIT. Two different causes, both invisible from
 # one box:
 #   1. A silent-corruption bug. gpu_append_quant_kv_i4 writes the block-32 scale layout
@@ -10,7 +10,7 @@
 #      read it; the bf16 reader loaded Float32 at [nkv, cache_cap], reinterpreting TWO fp16 scales
 #      as ONE fp32. Garbage KV, no crash, acceptance -> EXACTLY 0.000 at every depth.
 #   2. A hardware-dependent cost. Routing around (1) via DP4A costs +37% verify on the 5090 but
-#      is the champion config on Gold. So the correct config is NOT the same on every card.
+#      is the champion config on the RTX PRO 4000. So the correct config is NOT the same on every card.
 #
 # Therefore: never quote a block-32 number without naming the box AND the read path.
 # This script runs the same three arms everywhere so those numbers are comparable.
@@ -19,7 +19,7 @@
 #
 #                    block=1              block=32
 #   bf16 (DP4A=0)      A                    B        <- B needs the 488deda dequant fix
-#   int8 (DP4A=1)      D                    C        <- C is the config Gold measured +15.7% on
+#   int8 (DP4A=1)      D                    C        <- C is the config the discrete box measured +15.7% on
 #
 #   A  bf16 / block-1    baseline. On the laptop this is the current best (46.58).
 #   B  bf16 / block-32   THE FIX. On a build without 488deda this arm is garbage BY CONSTRUCTION
@@ -29,7 +29,7 @@
 #
 # EVERY comparison needs its own control, and each edge answers exactly one question:
 #   A->B   does block-32 pay on the CHEAP verify path?   (the value of the fix)
-#   D->C   does block-32 pay on the int8 path?           (reproduces the Gold +15.7%)
+#   D->C   does block-32 pay on the int8 path?           (reproduces the discrete box +15.7%)
 #   A->D   what does the int8 read path itself COST?     (Prime's +37% on the 5090)
 #   B vs D the actual ship decision: fixed-block-32-on-bf16 vs today's best config
 #
@@ -48,7 +48,7 @@ REPO=$PWD
 
 # ── per-host paths. ~/.nomos_host_env is the canonical source, but it sets WEIGHTS/DFLASH_DIR
 #    UNCONDITIONALLY, so sourcing it CLOBBERS anything the caller exported. That forced hand-editing
-#    of host_env to run this matrix on two different boxes (both Gold's and the laptop's point at a
+#    of host_env to run this matrix on two different boxes (both the discrete box's and the laptop's point at a
 #    TUNED model), and a hand-edit you have to remember to revert is a trap of its own.
 #    Precedence is now: caller env > host_env > default.
 _CALLER_WEIGHTS="${WEIGHTS:-}"
@@ -127,7 +127,7 @@ else
   echo "                              That is the bug, not a result. Do not quote arm B."
 fi
 echo "  pinned  : SPEC_VB=$SPEC_VB PERF_NTOK=$PERF_NTOK PERF_REPEAT=$PERF_REPEAT"
-# ── GB10 CANNOT HOST ARMS A/B. Measured on Spark 2, 2026-08-02, arm A (DP4A=0, BLOCK=1 — so
+# ── GB10 CANNOT HOST ARMS A/B. Measured on the GB10 dev box, 2026-08-02, arm A (DP4A=0, BLOCK=1 — so
 #    write and read agree and the block-32 bug CANNOT be present): base decode 4.17 tok/s against
 #    a ~21.7 reference, and acceptance EXACTLY 0.000 at every depth, E=1.00. Something about
 #    dropping dp4a on the Q4_0 path kills acceptance on its own — cause not yet isolated (q8
@@ -170,7 +170,7 @@ for a in ${ARMS:-A B D C}; do
     A) run A 0 1  "bf16 read path, block-1  (baseline; the laptop's current best)" ;;
     B) run B 0 32 "bf16 read path, block-32 (THE FIX — needs 488deda)" ;;
     D) run D 1 1  "int8 read path, block-1  (control that makes C interpretable)" ;;
-    C) run C 1 32 "int8 read path, block-32 (Gold's +15.7% config; the +37% verify suspect)" ;;
+    C) run C 1 32 "int8 read path, block-32 (the discrete box's +15.7% config; the +37% verify suspect)" ;;
   esac
 done
 echo "MATRIX COMPLETE — report per-arm WEIGHTED / E[tok/cycle] / draft ms / verify ms."

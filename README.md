@@ -1,9 +1,10 @@
 # Nomos Kernel
 
-A pure-[Mojo](https://www.modular.com/mojo) inference kernel for **Gemma-4-31B** with
-**lossless speculative decoding** — 4-bit weights and activations all the way down,
-tensor-core batch verification, and streams that are **bit-identical to greedy
-decoding by construction**.
+A pure-[Mojo](https://www.modular.com/mojo) inference kernel for **Gemma-4-31B,
+OLMo-3.1-32B, Qwen3.8-27B, and Muse-Glimmer** — one repo, one build per model via a
+compile-time profile system (`--model`) — with **lossless speculative decoding**:
+4-bit weights and activations all the way down, tensor-core batch verification, and
+streams that are **bit-identical to greedy decoding by construction**.
 
 > **Status: pre-release.** Built and measured in the open on NVIDIA DGX Spark
 > (GB10, sm_121a). Discrete Blackwell (sm_120+, NVFP4 path) runs base decode
@@ -193,6 +194,7 @@ clean exports) · **greedy-id parity** (`tools/gold_parity_ids.py`) · **the bar
 ## Documentation
 
 - [BUILD.md](BUILD.md) — building on your GPU (per-architecture; `max-core` required).
+- [docs/MODEL_PROFILES.md](docs/MODEL_PROFILES.md) — the per-model profile system (`--model`): how one repo serves Gemma-4, OLMo-3.1, Qwen3.8, and Muse-Glimmer from a single main.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — module map, the two 4-bit precision paths, the C ABI.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — the correctness gates and benchmark hygiene.
 
@@ -201,4 +203,5 @@ clean exports) · **greedy-id parity** (`tools/gold_parity_ids.py`) · **the bar
 MIT — see [LICENSE](LICENSE). Third-party components and design credits (DFlash /
 z-lab·Anbeeld, llama.cpp, EAGLE-3, Mojo/MAX) are listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Nomos does not distribute model
-weights; Gemma-4 weights are obtained from Google under the Gemma Terms of Use.
+weights; each model's weights are obtained from its provider under that model's own
+license (e.g. Gemma-4 under the Gemma Terms of Use; OLMo under Apache-2.0).

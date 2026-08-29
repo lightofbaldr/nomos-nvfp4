@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { MAX_EVENTS = 1024, CATS = 12 };
+enum { MAX_EVENTS = 1024, CATS = 14 };
 
 static cudaEvent_t events[MAX_EVENTS];
 static int event_cats[MAX_EVENTS];
@@ -77,7 +77,8 @@ int nomos_budget_report(void) {
     static const char *names[CATS] = {
         "qkv", "kv_append", "kv_deq_attn", "o_proj", "layer_small_1",
         "gate", "up", "activation", "down", "layer_small_2",
-        "final_norm_transfer", "lmhead_argmax"
+        "final_norm_transfer", "lmhead_argmax", "attention_gate",
+        "attention_sigmoid"
     };
     active = 0;
     printf("[cuda-budget] tokens=%llu\n", (unsigned long long)traced_tokens);

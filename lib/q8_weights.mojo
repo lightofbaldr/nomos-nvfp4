@@ -13,8 +13,8 @@ GPU blob layout (host strips the 16-byte .q8 header — same header as .q4): con
 Element i: block = i//32. The int8 value lives at byte offset nb*2 + i (1 byte/elem, NOT
 packed — unlike Q4's nibbles). w = int8[i] * scale[block].
 """
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
 from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
 from std.memory import UnsafePointer, bitcast
 from lib.cuda import cuda_malloc, cuda_upload_u8

@@ -1,8 +1,8 @@
-# tools/gold_env.sh — DISCRETE BLACKWELL (Gold PRO 4000 / PRO 6000 / 5090 laptop) kernel env.
+# tools/gold_env.sh — DISCRETE BLACKWELL (discrete PRO 4000 / PRO 6000 / 5090 laptop) kernel env.
 # SOURCE this, do not execute it:    source tools/gold_env.sh
 #
-# VERIFIED 2026-08-04 @ HEAD 4eac19d on Gold: 12/12 LOSSLESS, 45.22 tok/s, E 3.01, verify ~60 ms.
-# See the README for the quickstart.
+# VERIFIED 2026-08-04 @ HEAD 4eac19d on the RTX PRO 4000: 12/12 LOSSLESS, 45.22 tok/s, E 3.01, verify ~60 ms.
+# See docs/the runbook §0 for the full quickstart and the failure fingerprints.
 #
 # WHY THIS FILE EXISTS: `./nomos env` is WRONG for discrete cards. Its arch-common BASE_ENV sets
 # NOMOS_VERIFY_BLOCK_ATTN=1, which is NOT byte-exact on NVFP4 (0/12 lossless), and it never sets
@@ -30,7 +30,7 @@ export NOMOS_KV_QUANT=1 NOMOS_KV_INT4=1 NOMOS_KV_I4_BLOCK=32
 export NOMOS_KV_SWA=0 NOMOS_KV_REUSE=0
 export NOMOS_VERIFY_MMQ_SMALL=1        # the ONLY NOMOS_VERIFY_* flag that belongs on discrete
 export NOMOS_MAX_SEQ=4096 NOMOS_BATCHED_PREFILL=1 CUBLAS_WORKSPACE_CONFIG=":4096:8"
-export SPEC_VB=7                       # Gold's optimum. NOT 9 (that is GB10's) — VB=9 costs -33% here.
+export SPEC_VB=7                       # the discrete box's optimum. NOT 9 (that is GB10's) — VB=9 costs -33% here.
 
 # Repo root. BASH_SOURCE is NOT reliable here -- under a non-bash /bin/sh (e.g. a plain
 # `ssh host 'source tools/gold_env.sh'`) it is unset, dirname "" -> "." and we would resolve one
@@ -70,7 +70,7 @@ case "$DFLASH_DIR" in */) ;; *) echo "FAIL: DFLASH_DIR must end in '/'." >&2; _g
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
   echo "NOTE: CUDA_VISIBLE_DEVICES is unset. Pick a GPU with >=19 GB free FIRST:" >&2
   echo "      nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader" >&2
-  echo "      Gold's topology is FLUID and Nano is a co-resident owner -- never kill an" >&2
+  echo "      the discrete box's topology is FLUID and Nano is a co-resident owner -- never kill an" >&2
   echo "      unidentified process; ask Adam." >&2
 fi
 

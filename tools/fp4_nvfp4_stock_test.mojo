@@ -6,8 +6,8 @@
 # bit-exact on the SINGLE nightly we standardize everything on. Build:
 #   pixi run mojo run --target-accelerator sm_121a tools/fp4_nvfp4_stock_test.mojo
 
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx
 from std.sys._assembly import inlined_assembly
 from std.sys import _RegisterPackType
 from std.memory import UnsafePointer

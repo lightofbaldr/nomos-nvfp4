@@ -9,7 +9,7 @@ Routes ps-fused vs fallback via NOMOS_FP4_QAFUSE, exactly like the live path.
 
 Run: pixi run mojo run -I . tools/fp4_shape_probe.mojo
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.random import random_ui64
 from lib.fp4_act import gpu_quant_act_nvfp4_dec, gpu_matmul_nvfp4_w4a4_prequant_dev

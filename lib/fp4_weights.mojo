@@ -16,8 +16,8 @@ e4m3 decode here is the arithmetic twin of the exact LUT in quantize_nvfp4.py / 
 hardware ue4m3 the NVFP4 MMA uses. E2M1 magnitudes {0,.5,1,1.5,2,3,4,6}.
 Requires Mojo ≥1.0.0b3 + --target-accelerator sm_121a.
 """
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
 from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
 from std.memory import UnsafePointer
 from std.collections import List
@@ -124,7 +124,9 @@ def load_to_gpu_nvfp4(
     var bytes = read_nvfp4_bytes(path, hdr, gscale, input_gscale)
     if len(bytes) == 0 or len(hdr) < 2:
         print("[WARN] Empty or missing nvfp4:", path)
-        gscale.append(Float32(1.0))   # keep gscale aligned with the weight slot
+        # A missing pointer must never look like a live NVFP4 weight to dispatch.
+        # Keep the lists aligned, but pair the null pointer with an inactive scale.
+        gscale.append(Float32(0.0))
         input_gscale.append(Float32(0.0))
         return UInt64(0)
     var ptr = cuda_malloc(len(bytes))

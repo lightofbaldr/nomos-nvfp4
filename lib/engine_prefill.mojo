@@ -5,10 +5,22 @@ rule). Free def taking `mut self: GemmaEngine`; verbatim move, behavior-identica
 from lib.gemma4_engine import (
     GemmaEngine, _env_float,
     D, FF, FULL_HD, HD, MAX_PROBE_TOKENS, NH, NKV, SLIDING_WINDOW, TOTAL_LAYERS, VOCAB,
+    FULL_LAYERS_V_EQ_K,
 )
-from lib.gemma4_ops import rmsnorm
+from lib.gemma4_ops import rmsnorm, rmsnorm_no_weight
+from lib.model_config import (
+    EMBED_RMSNORM, EMBED_SQRT_SCALE, RMS_EPS_INPUT, RMS_EPS_FINAL,
+    HAS_LINEAR_ATTENTION, ATTENTION_SCORE_SCALE,
+    GDN_CONV_DIM, GDN_VALUE_DIM, GDN_NUM_V_HEADS,
+)
 from lib.cuda import cuda_malloc, cuda_free, cuda_download, cuda_memcpy, cuda_upload
-from lib.gemma4_layer import prepare_qkv_batched, apply_output_and_mlp_batched, W4A4Scratch
+from lib.gemma4_layer import (
+    prepare_qkv_batched, apply_output_and_mlp_batched,
+    apply_qwen_mlp_batched, W4A4Scratch,
+)
+from lib.gdn_layer import gdn_forward_batched
+from lib.ops_gpu_mojo_reductions import gpu_rmsnorm_batched_mojo
+from lib.ops_gpu_mojo import gpu_residual_add_mojo, gpu_scalar_mul_mojo
 from lib.kv_cache_quant import gpu_append_quant_kv_i8, gpu_dequant_kv_i8_layer
 from lib.kv_cache_quant import gpu_append_quant_kv_i4, gpu_append_quant_kv_i4_with_q8, gpu_dequant_kv_i4_layer, gpu_dequant_kv_i4_to_q8_layer, debug_kv_i4_source_to_f32_dev
 from lib.attention_gpu import append_kv_gpu_dev, attention_gpu_fp32_dev
@@ -32,7 +44,7 @@ from std.math import sqrt
 from std.time import perf_counter_ns
 from std.memory import UnsafePointer
 from std.collections import List
-from lib.dflash_drafter import DFlashDrafter, DFLASH_CTX_BATCH, dflash_append_context_rows
+from lib.dflash_drafter import DFlashDrafter, DFLASH_CTX_BATCH, DFLASH_TAPS, dflash_append_context_rows
 
 
 def prefill_batch_impl(
@@ -138,6 +150,18 @@ def prefill_batch_impl(
     var prefix_bf16 = use_prefix_block and self.precision_bits <= 16 and not use_int8_attn
     var decode_order_verify_attn = prefix_int8 and _env_float("NOMOS_VERIFY_DECODE_ORDER_ATTN", 0.0) > Float32(0.5)
     var decode_order_multirow_attn = decode_order_verify_attn and _env_float("NOMOS_VERIFY_DECODE_ORDER_MULTIROW_ATTN", 0.0) > Float32(0.5)
+    # Fast-exact Qwen verify: retain M-row weight reuse for the large
+    # projections, but advance the recurrent/conv pools through the production
+    # S=1 state boundary once per row.  Debug AB calls also use this flag so the
+    # stage gate can adjudicate the candidate before the verifier enables it.
+    var gdn_fast_exact = (
+        HAS_LINEAR_ATTENTION
+        and _env_float("NOMOS_VERIFY_GDN_FAST_EXACT", 0.0) > Float32(0.5)
+        # Both the initial fused verify and a partial-commit replay are offset
+        # forwards.  Replay intentionally has no logits/debug destination, so
+        # output-pointer liveness is not a valid route discriminator.
+        and start_pos > 0
+    )
     var long_swa = self.kv_swa and S > SLIDING_WINDOW
     var need_block_scratch = (use_batched and not long_swa) or use_prefix_block
     var d_q_t = cuda_malloc(S * QD_MAX * 4) if need_block_scratch else UInt64(0)
@@ -193,16 +217,26 @@ def prefill_batch_impl(
     # sequential chunk captures accumulate correctly WITHOUT any start_pos indexing here.
     # Continue-mode/KV-reuse offset prefill stays excluded by dflash_context_append itself, which
     # the caller only sets on fresh full-prompt requests.
+    # Tap capture must match the drafter THIS BUILD was compiled for. A mismatch is a
+    # configuration error, not a reason to quietly run without taps: with capture off the
+    # drafter sees no target context, every block is rejected, and acceptance pins to E=1 —
+    # which reads as "this drafter is bad", NOT "the taps never fired". That exact
+    # misdiagnosis cost a full day on 2026-08-03, when dflash_capture was gated on
+    # start_pos==0 and the drafter silently saw 256 of 5,871 tokens.
     var dflash_capture = (
         dflash_context_append
         and self.dflash_ptr != 0
-        and self.drafter_tap_count == 6
+        and self.drafter_tap_count == DFLASH_TAPS
     )
+    if dflash_context_append and self.dflash_ptr != 0 and not dflash_capture:
+        print("[engine] DFlash tap capture DISABLED: drafter reports",
+              self.drafter_tap_count, "taps, this build expects", DFLASH_TAPS,
+              "-- acceptance will pin to E=1. Rebuild with the matching model profile.")
     var d_dflash_prefill_taps = UInt64(0)
     if dflash_capture:
         d_dflash_prefill_taps = cuda_malloc(S * self.drafter_tap_count * D * 4)
 
-    # ── Embeddings → host [S,d], scale by sqrt(d), upload once ──────
+    # ── Embeddings → host [S,d], profile-selected scaling ──────────
     var t_embed0 = Int(perf_counter_ns()) if verify_prof else 0
     var host_x = List[Float32](capacity=S * D)
     for _ in range(S * D):
@@ -212,9 +246,14 @@ def prefill_batch_impl(
         _ = external_call["nomos_pread", c_size_t](
             self.embed_fd, UnsafePointer(to=host_x[i * D]),
             c_size_t(D * 4), c_size_t(tok * D * 4))
-    var embed_scale = sqrt(Float32(D))
-    for j in range(S * D):
-        host_x[j] = host_x[j] * embed_scale
+    @parameter
+    if EMBED_RMSNORM:
+        for i in range(S):
+            rmsnorm_no_weight(host_x, i * D, D, RMS_EPS_INPUT)
+    elif EMBED_SQRT_SCALE:
+        var embed_scale = sqrt(Float32(D))
+        for j in range(S * D):
+            host_x[j] *= embed_scale
     cuda_upload(d_x_b, host_x)
     if verify_prof:
         cuda_sync()
@@ -246,7 +285,8 @@ def prefill_batch_impl(
         var l_kvd = self.layer_kvd[layer]
         var l_kvg = self.layer_kvg[layer]
         var ccap = self.layer_cache_cap[layer]   # #430: ring capacity (==max_seq unless SWA sliding layer)
-        var d_vw_or_zero: UInt64 = UInt64(0) if is_full else self.d_vw[layer]
+        var v_eq_k = is_full and FULL_LAYERS_V_EQ_K
+        var d_vw_or_zero: UInt64 = UInt64(0) if v_eq_k else self.d_vw[layer]
         var ring_prefill = long_swa and not is_full
         var d_k_compute_cache = UInt64(0)
         var d_v_compute_cache = UInt64(0)
@@ -259,28 +299,194 @@ def prefill_batch_impl(
             d_vs_compute = d_swa_vs_tmp if ring_prefill else self.d_v_scales[layer]
         var compute_cap = S if ring_prefill else ccap
 
+        if HAS_LINEAR_ATTENTION and not is_full:
+            var gdn_slot = self.gdn_state.gdn_slot_for_layer(layer)
+            if gdn_slot < 0:
+                raise Error("GDN layer missing ordered state slot")
+            # Correctness-first per-layer work surfaces. Once parity is green,
+            # hoist these to a reusable prefill workspace; allocation policy is
+            # not part of the arithmetic contract.
+            var d_gdn_qkv_raw = cuda_malloc(S * GDN_CONV_DIM * 4)
+            var d_gdn_qkv_conv = cuda_malloc(S * GDN_CONV_DIM * 4)
+            var d_gdn_z = cuda_malloc(S * GDN_VALUE_DIM * 4)
+            var d_gdn_a = cuda_malloc(S * GDN_NUM_V_HEADS * 4)
+            var d_gdn_b = cuda_malloc(S * GDN_NUM_V_HEADS * 4)
+            var d_gdn_core = cuda_malloc(S * GDN_VALUE_DIM * 4)
+            var d_gdn_out = cuda_malloc(S * D * 4)
+            gpu_rmsnorm_batched_mojo(
+                self.ctx, d_x_b, d_normed_b, self.d_in_norms[layer],
+                D, S, RMS_EPS_INPUT,
+            )
+            if (layer == debug_omlp_layer and debug_omlp_stage == 18
+                    and debug_omlp_out != 0):
+                self.ctx.synchronize()
+                cuda_memcpy(
+                    UInt64(debug_omlp_out),
+                    d_normed_b + UInt64(debug_omlp_row * D * 4), D * 4, 2,
+                )
+            gdn_forward_batched(
+                self.ctx, self.handle, d_gdn_out, d_normed_b,
+                d_gdn_qkv_raw, d_gdn_qkv_conv, d_gdn_z,
+                d_gdn_a, d_gdn_b, d_gdn_core, d_bf16_b,
+                self.gdn_weights.in_proj_qkv[gdn_slot],
+                self.gdn_weights.in_proj_z[gdn_slot],
+                self.gdn_weights.in_proj_a[gdn_slot],
+                self.gdn_weights.in_proj_b[gdn_slot],
+                self.gdn_weights.out_proj[gdn_slot],
+                self.gdn_weights.conv1d[gdn_slot],
+                self.gdn_weights.a_log[gdn_slot],
+                self.gdn_weights.dt_bias[gdn_slot],
+                self.gdn_weights.norm[gdn_slot],
+                self.gdn_state.conv_ptr(gdn_slot),
+                self.gdn_state.rec_ptr(gdn_slot), S,
+                self.gdn_nvfp4,
+                self.gdn_weights.qkv_gs[gdn_slot],
+                self.gdn_weights.z_gs[gdn_slot],
+                self.gdn_weights.out_gs[gdn_slot],
+                self.gdn_weights.qkv_ags[gdn_slot],
+                self.gdn_weights.z_ags[gdn_slot],
+                self.gdn_weights.out_ags[gdn_slot],
+                self.d_weight_bf16_scratch,
+                W4A4Scratch(
+                    self.d_w4a4_packed, self.d_w4a4_bs,
+                    self.d_w4a4_global, self.d_w4a4_cpad,
+                    self.w4a4_chunk_mpad, self.w4a4,
+                    self.d_w4a4_bs_sf, self.d_w4a4_wbs_sf,
+                ),
+                debug_omlp_row if layer == debug_omlp_layer else -1,
+                debug_omlp_stage if layer == debug_omlp_layer else -1,
+                debug_omlp_out if layer == debug_omlp_layer else Int64(0),
+                gdn_fast_exact,
+            )
+            # GDN stage surfaces reuse the existing O/MLP debug ABI.
+            if layer == debug_omlp_layer and debug_omlp_out != 0:
+                self.ctx.synchronize()
+                if debug_omlp_stage == 13:
+                    cuda_memcpy(
+                        UInt64(debug_omlp_out),
+                        d_gdn_core + UInt64(debug_omlp_row * GDN_VALUE_DIM * 4),
+                        GDN_VALUE_DIM * 4, 2,
+                    )
+                elif debug_omlp_stage == 14:
+                    cuda_memcpy(
+                        UInt64(debug_omlp_out),
+                        d_gdn_z + UInt64(debug_omlp_row * GDN_VALUE_DIM * 4),
+                        GDN_VALUE_DIM * 4, 2,
+                    )
+                elif debug_omlp_stage == 15:
+                    cuda_memcpy(
+                        UInt64(debug_omlp_out),
+                        d_gdn_out + UInt64(debug_omlp_row * D * 4),
+                        D * 4, 2,
+                    )
+            gpu_residual_add_mojo(self.ctx, d_x_b, d_gdn_out, S * D)
+            if (layer == debug_omlp_layer and debug_omlp_stage == 16
+                    and debug_omlp_out != 0):
+                self.ctx.synchronize()
+                cuda_memcpy(
+                    UInt64(debug_omlp_out),
+                    d_x_b + UInt64(debug_omlp_row * D * 4), D * 4, 2,
+                )
+            apply_qwen_mlp_batched(
+                self.ctx, d_x_b, d_pn_b, d_gate_b, d_up_b,
+                d_mlpv_b, d_down_b, self.handle,
+                self.d_post_attn_norms[layer], self.d_gw[layer],
+                self.d_uw[layer], self.d_dw[layer], d_bf16_b,
+                S, D, FF, layer, self.d_weight_bf16_scratch,
+                self.d_gw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
+                self.d_uw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
+                self.d_dw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
+                self.d_gw_ags[layer] if self.weight_nvfp4 else Float32(0.0),
+                self.d_uw_ags[layer] if self.weight_nvfp4 else Float32(0.0),
+                self.d_dw_ags[layer] if self.weight_nvfp4 else Float32(0.0),
+                W4A4Scratch(
+                    self.d_w4a4_packed, self.d_w4a4_bs,
+                    self.d_w4a4_global, self.d_w4a4_cpad,
+                    self.w4a4_chunk_mpad, self.w4a4,
+                    self.d_w4a4_bs_sf, self.d_w4a4_wbs_sf,
+                ),
+            )
+            if (layer == debug_omlp_layer and debug_omlp_stage == 17
+                    and debug_omlp_out != 0):
+                self.ctx.synchronize()
+                cuda_memcpy(
+                    UInt64(debug_omlp_out),
+                    d_x_b + UInt64(debug_omlp_row * D * 4), D * 4, 2,
+                )
+
+            # Keep the generic all-layer/debug tap contract valid for GDN
+            # layers too.  This branch used to `continue` before the common
+            # tap block below, leaving deterministic zeros that looked like a
+            # layer-output failure even when the state-producing scan matched.
+            if self.drafter_tap_count > 0:
+                var tap_slot = self.drafter_tap_slot(layer)
+                if tap_slot >= 0:
+                    var rows_to_copy = eagle_tap_rows
+                    if rows_to_copy < 0: rows_to_copy = 0
+                    if rows_to_copy > S: rows_to_copy = S
+                    var copy_live_tap = (
+                        self.d_eagle3_tap_out != 0
+                        and eagle_tap_row >= 0 and eagle_tap_row < S
+                    )
+                    var copy_row_taps = (
+                        self.d_eagle3_tap_rows_out != 0 and rows_to_copy > 0
+                    )
+                    if copy_live_tap or copy_row_taps or dflash_capture:
+                        self.ctx.synchronize()
+                        if copy_live_tap:
+                            cuda_memcpy(
+                                self.d_eagle3_tap_out + UInt64(tap_slot * D * 4),
+                                d_x_b + UInt64(eagle_tap_row * D * 4),
+                                D * 4, 3,
+                            )
+                        if copy_row_taps:
+                            for r in range(rows_to_copy):
+                                cuda_memcpy(
+                                    self.d_eagle3_tap_rows_out
+                                    + UInt64((r * self.drafter_tap_count + tap_slot) * D * 4),
+                                    d_x_b + UInt64(r * D * 4), D * 4, 3,
+                                )
+                        if dflash_capture:
+                            for r in range(S):
+                                cuda_memcpy(
+                                    d_dflash_prefill_taps
+                                    + UInt64((r * self.drafter_tap_count + tap_slot) * D * 4),
+                                    d_x_b + UInt64(r * D * 4), D * 4, 3,
+                                )
+                        cuda_sync()
+            cuda_free(d_gdn_qkv_raw); cuda_free(d_gdn_qkv_conv)
+            cuda_free(d_gdn_z); cuda_free(d_gdn_a); cuda_free(d_gdn_b)
+            cuda_free(d_gdn_core); cuda_free(d_gdn_out)
+            continue
+
         if prof: cuda_sync()
         _t0 = Int(perf_counter_ns())
-        prepare_qkv_batched(
-            self.ctx, d_x_b, d_normed_b, d_q_b, d_k_b, d_v_b, self.handle,
+        var attn_gate_ready = prepare_qkv_batched(
+            self.ctx, d_x_b, d_normed_b, d_q_b, d_k_b, d_v_b,
+            d_up_b, d_gate_b, self.handle,
             self.d_in_norms[layer], self.d_q_norms[layer], self.d_k_norms[layer],
             self.d_qw[layer], self.d_kw[layer], d_vw_or_zero, d_bf16_b,
-            is_full, D, l_nh, l_nkv, l_hd, l_qd, l_kvd, S,
+            is_full, D, l_nh, l_nkv, l_hd, l_qd, l_kvd, S, layer,
             start_pos,
             self.d_weight_bf16_scratch,
             self.d_qw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
             self.d_kw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
-            self.d_vw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
+            Float32(0.0) if v_eq_k else (self.d_vw_gs[layer] if self.weight_nvfp4 else Float32(0.0)),
             self.d_qw_ags[layer] if self.weight_nvfp4 else Float32(0.0),
             self.d_kw_ags[layer] if self.weight_nvfp4 else Float32(0.0),
-            self.d_vw_ags[layer] if self.weight_nvfp4 else Float32(0.0),
+            Float32(0.0) if v_eq_k else (self.d_vw_ags[layer] if self.weight_nvfp4 else Float32(0.0)),
             W4A4Scratch(self.d_w4a4_packed, self.d_w4a4_bs, self.d_w4a4_global, self.d_w4a4_cpad, self.w4a4_chunk_mpad, self.w4a4, self.d_w4a4_bs_sf, self.d_w4a4_wbs_sf),
+            debug_omlp_row if layer == debug_omlp_layer else -1,
+            debug_omlp_stage if layer == debug_omlp_layer else -1,
+            debug_omlp_out if layer == debug_omlp_layer else Int64(0),
         )
-        if layer == debug_omlp_layer and debug_omlp_stage == 8:
+        if layer == debug_omlp_layer and (
+            debug_omlp_stage == 8 or debug_omlp_stage == 26
+        ):
             if debug_omlp_row < 0 or debug_omlp_row >= S:
                 raise Error("debug_omlp_row out of range")
             self.ctx.synchronize()
-            if debug_omlp_out != 0:
+            if debug_omlp_stage == 8 and debug_omlp_out != 0:
                 cuda_memcpy(
                     UInt64(debug_omlp_out),
                     d_q_b + UInt64(debug_omlp_row * l_qd * 4),
@@ -391,6 +597,14 @@ def prefill_batch_impl(
                 cuda_free(d_swa_k_tmp); cuda_free(d_swa_v_tmp)
                 cuda_free(d_swa_ks_tmp); cuda_free(d_swa_vs_tmp)
             return
+        # Scale Q only after stages 26/8 have captured the HF-visible post-norm
+        # and post-RoPE tensors. This is algebraically the score scaling applied
+        # by HF eager_attention_forward and avoids touching K/V cache contents.
+        @parameter
+        if ATTENTION_SCORE_SCALE != 1.0:
+            gpu_scalar_mul_mojo(
+                self.ctx, d_q_b, ATTENTION_SCORE_SCALE, S * l_qd
+            )
         if prof:
             cuda_sync()
             t_qkv += Int(perf_counter_ns()) - _t0
@@ -1051,18 +1265,21 @@ def prefill_batch_impl(
             t_attn += Int(perf_counter_ns()) - _t0
             _t0 = Int(perf_counter_ns())
         apply_output_and_mlp_batched(
-            self.ctx, d_x_b, d_attn_b, d_o_b, d_pn_b,
+            self.ctx, d_x_b, d_attn_b, d_normed_b,
+            d_up_b if attn_gate_ready else d_q_b, d_o_b, d_pn_b,
             d_gate_b, d_up_b, d_mlpv_b, d_down_b, self.handle,
-            self.d_ow[layer],
+            self.d_attn_gw[layer], self.d_ow[layer],
             self.d_post_attn_norms[layer], self.d_pre_ff_norms[layer], self.d_post_ff_norms[layer],
             self.d_gw[layer], self.d_uw[layer], self.d_dw[layer], d_bf16_b,
-            self.layer_scalars[layer], D, FF, l_qd, S,
+            self.layer_scalars[layer], D, FF, l_qd, S, layer,
             self.d_weight_bf16_scratch,
             self.d_ow_gs[layer] if self.weight_nvfp4 else Float32(0.0),
+            self.d_attn_gw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
             self.d_gw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
             self.d_uw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
             self.d_dw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
             self.d_ow_ags[layer] if self.weight_nvfp4 else Float32(0.0),
+            self.d_attn_gw_ags[layer] if self.weight_nvfp4 else Float32(0.0),
             self.d_gw_ags[layer] if self.weight_nvfp4 else Float32(0.0),
             self.d_uw_ags[layer] if self.weight_nvfp4 else Float32(0.0),
             self.d_dw_ags[layer] if self.weight_nvfp4 else Float32(0.0),
@@ -1071,6 +1288,7 @@ def prefill_batch_impl(
             debug_omlp_stage if layer == debug_omlp_layer else -1,
             debug_omlp_out if layer == debug_omlp_layer else Int64(0),
             prof_stages=(verify_prof and (layer == 20 or layer == 40)),
+            attn_gate_ready=attn_gate_ready,
         )
         if layer == debug_omlp_layer:
             cuda_free(d_x_b); cuda_free(d_normed_b); cuda_free(d_q_b)
@@ -1136,7 +1354,7 @@ def prefill_batch_impl(
                     cuda_sync()
 
     if dflash_capture:
-        var dp = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+        var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
             unsafe_from_address=Int(self.dflash_ptr)
         )
         if dp[0].cache_len() + S > dp[0].max_ctx:
@@ -1155,7 +1373,7 @@ def prefill_batch_impl(
             off += chunk
         self.ctx.synchronize()
 
-    # EAGLE-3 D3 (Gold NVFP4/W4A4) verify readout: when verify_g_out != 0 on the w4a4
+    # EAGLE-3 D3 (discrete NVFP4/W4A4) verify readout: when verify_g_out != 0 on the w4a4
     # path, emit per-position logits for ALL S rows via the DECODE-IDENTICAL lm-head:
     # per row, D2H the post-layer hidden -> HOST rmsnorm(final_norm) -> H2D d_lmhead_in
     # -> the SAME direct NVFP4-weight/fp32-activation GEMV engine_decode uses
@@ -1169,20 +1387,22 @@ def prefill_batch_impl(
         var normed = List[Float32](capacity=D)
         for _ in range(D): normed.append(0.0)
         # BATCHED READOUT. Each single-row GEMV re-streams the whole 749 MB embedding matrix to
-        # produce one row of logits, so S rows cost S x that traffic. Measured on Gold:
+        # produce one row of logits, so S rows cost S x that traffic. Measured on the RTX PRO 4000:
         # read_lmhead 23.22 ms/call = 31.6% of verify. The multirow kernel reads each weight
-        # once and reuses it across all S rows, and is bit-exact to the single-row v3 by
+        # once per <=SMAX row chunk and reuses it across that chunk, and is bit-exact to v3 by
         # construction (row-independent weight decode hoisted; identical per-(s,n) expression,
         # accumulation order and warp reduction). The in-tree comment that priced batching at
         # "~3ms/cycle" costed launch overhead and missed the S-fold weight re-read.
-        # S > SMAX (rare; VB>8) keeps the serial path -- same numerics, just slower.
-        if S <= NVFP4_GEMV_SMAX and _env_float("NOMOS_VERIFY_BATCH_READOUT", 1.0) > 0.5:
+        # S > SMAX is split into ceil(S/SMAX) row slices. Each slice re-streams the
+        # weights once, instead of the serial fallback re-streaming them once per row.
+        # NOMOS_VERIFY_BATCH_READOUT=0 retains that fallback as the A/B control.
+        if _env_float("NOMOS_VERIFY_BATCH_READOUT", 1.0) > 0.5:
             var _rr0 = Int(perf_counter_ns()) if prof else 0
             var normed_rows = List[Float32](capacity=S * D)
             for _ in range(S * D): normed_rows.append(0.0)
             for s in range(S):
                 cuda_download(xs, d_x_b + UInt64(s * D * 4), D)
-                rmsnorm(normed, xs, self.final_norm, D)
+                rmsnorm(normed, xs, self.final_norm, D, RMS_EPS_FINAL)
                 for j in range(D):
                     normed_rows[s * D + j] = normed[j]
             cuda_upload(d_normed_b, normed_rows)
@@ -1190,12 +1410,29 @@ def prefill_batch_impl(
             if prof:
                 t_read_prep += Int(perf_counter_ns()) - _rr0
                 _rr0 = Int(perf_counter_ns())
-            gpu_matmul_nvfp4_fused_v3_multirow_dev(
-                self.ctx, self.d_lmhead_logits, d_normed_b,
-                self.d_embed_nvfp4, self.embed_global, D, VOCAB, S)
-            _w4a4_sync_checkpoint(
-                self.ctx, "verify lmhead multirow NVFP4 GEMV", S, VOCAB, D
-            )
+            var row0 = 0
+            while row0 < S:
+                var chunk_s = S - row0
+                if chunk_s > NVFP4_GEMV_SMAX:
+                    chunk_s = NVFP4_GEMV_SMAX
+                gpu_matmul_nvfp4_fused_v3_multirow_dev(
+                    self.ctx,
+                    self.d_lmhead_logits + UInt64(row0 * VOCAB * 4),
+                    d_normed_b + UInt64(row0 * D * 4),
+                    self.d_embed_nvfp4,
+                    self.embed_global,
+                    D,
+                    VOCAB,
+                    chunk_s,
+                )
+                _w4a4_sync_checkpoint(
+                    self.ctx,
+                    "verify lmhead multirow NVFP4 GEMV chunk",
+                    chunk_s,
+                    VOCAB,
+                    D,
+                )
+                row0 += chunk_s
             self.ctx.synchronize()
             if prof:
                 t_read_lmhead += Int(perf_counter_ns()) - _rr0
@@ -1212,7 +1449,7 @@ def prefill_batch_impl(
                 # act_precision()==8 branch already has, so the NVFP4 readout is priced too.
                 var _rr0 = Int(perf_counter_ns()) if prof else 0
                 cuda_download(xs, d_x_b + UInt64(s * D * 4), D)
-                rmsnorm(normed, xs, self.final_norm, D)
+                rmsnorm(normed, xs, self.final_norm, D, RMS_EPS_FINAL)
                 cuda_upload(self.d_lmhead_in, normed)
                 cuda_sync()   # raw H2D -> ctx GEMV boundary (same seam as decode)
                 if prof:
@@ -1261,7 +1498,7 @@ def prefill_batch_impl(
             for s in range(S):
                 var _rr0 = Int(perf_counter_ns()) if prof else 0
                 cuda_download(xs, d_x_b + UInt64(s * D * 4), D)
-                rmsnorm(normed, xs, self.final_norm, D)
+                rmsnorm(normed, xs, self.final_norm, D, RMS_EPS_FINAL)
                 cuda_upload(self.d_lmhead_in, normed)
                 cuda_sync()   # raw H2D -> ctx GEMV boundary
                 if prof:
@@ -1294,7 +1531,7 @@ def prefill_batch_impl(
             for s in range(S):
                 for j in range(D):
                     xs[j] = all_x[s * D + j]
-                rmsnorm(normed, xs, self.final_norm, D)
+                rmsnorm(normed, xs, self.final_norm, D, RMS_EPS_FINAL)
                 for j in range(D):
                     normed_rows[s * D + j] = normed[j]
             cuda_upload(d_normed_b, normed_rows)

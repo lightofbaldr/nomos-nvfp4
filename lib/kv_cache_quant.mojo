@@ -24,8 +24,9 @@ cuBLAS attention is unchanged. When cache_cap == max_seq and win_start == 0 (the
 non-SWA path, and all full/global layers) the modulo and remap are no-ops and the
 output is byte-identical to the pre-#430 absolute-position codec.
 """
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim, barrier
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
+from max.gpu import barrier
 from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
 from std.memory import UnsafePointer
 

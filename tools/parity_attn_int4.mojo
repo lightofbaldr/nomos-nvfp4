@@ -1,8 +1,8 @@
 """parity_attn_int4.mojo — Unit B+C parity gate.
 Tests INT4 sign-extend math + SIMD dequant formula.
 """
-from std.gpu.host import DeviceContext
-from std.gpu import global_idx
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import global_idx
 
 comptime D_HEAD = 256; comptime NH = 32; comptime NKV = 16
 comptime WINDOW = 128; comptime HC = D_HEAD // 2

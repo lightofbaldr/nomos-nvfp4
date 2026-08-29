@@ -37,8 +37,12 @@ def final_logit_softcap(mut logits: List[Float32], vocab: Int, cap: Float32 = 30
 
     Expanded as `cap * (e^{2v} - 1) / (e^{2v} + 1)` with v clamped to
     [-10, 10] to prevent overflow — the equivalent of Python's numerically
-    stable tanh that we already use in gemma4_ops.gelu.
+    stable tanh that we already use in gemma4_ops.gelu.  A non-positive cap
+    disables softcapping (Qwen profile contract); do not divide by zero and
+    turn ordinary logits into zeros/NaNs.
     """
+    if cap <= Float32(0.0):
+        return
     for i in range(vocab):
         var v = logits[i] / cap
         if v > 10.0: v = 10.0

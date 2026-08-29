@@ -26,8 +26,8 @@ fp32 is law-acceptable here: this is a transient, recomputed-every-round M=1 att
 the drafter's own cache, not a persistent weight or the 31B's INT4 KV.
 """
 
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
 from std.memory import UnsafePointer
 from std.math import sqrt
 

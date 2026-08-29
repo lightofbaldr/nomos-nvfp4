@@ -9,7 +9,7 @@ Run with the Q4 GB10 env + DFLASH_DIR (trailing slash).
 import os, sys, json
 import numpy as np
 
-REPO = os.path.expanduser("~/nomos-nvfp4")
+REPO = os.path.expanduser("~/nomos-kernel-product")
 sys.path.insert(0, REPO)
 from pyhost.host import KernelLM
 

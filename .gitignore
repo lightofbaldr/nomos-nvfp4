@@ -16,3 +16,8 @@ build/
 *.nvfp4
 *.gguf
 results/
+
+# Generated per-build from lib/model_profiles/<model>.mojo (refresh_build.sh --model).
+# Tracked profiles are the source of truth; this copy is build output.
+lib/model_config.mojo
+libnomos_kernel-*.so

@@ -17,7 +17,7 @@ to our layout for a uniform loader.
 import os, json, numpy as np
 
 GROUP = 32
-SRC = os.path.expanduser("~/Services/inference/models/assistant/gemma4-31B-it-assistant-Q8_0.gguf")
+SRC = os.path.expanduser("~/models/assistant/gemma4-31B-it-assistant-Q8_0.gguf")
 OUT = os.path.expanduser("~/nomos_data/assistant")
 
 def q8(w):

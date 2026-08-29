@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""D3 — EAGLE-3 spec-decode loop on the Gold NVFP4 path (propose k=3 -> batched
+"""D3 — EAGLE-3 spec-decode loop on the discrete NVFP4 path (propose k=3 -> batched
 verify M=k+1 -> greedy longest-prefix accept -> commit num_acc+1).
 
 Port of the GB10 lineage loop semantics (b1ec92d / 25641de / 573faf0 / the

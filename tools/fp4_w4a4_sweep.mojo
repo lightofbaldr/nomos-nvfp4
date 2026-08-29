@@ -5,7 +5,7 @@ A clean threshold (e.g. N>=131072 where weight byte-offset crosses ~2^29) => off
 bug; "only both large" with no threshold => codegen/occupancy. Run:
   pixi run mojo run -I . --target-accelerator sm_121a tools/fp4_w4a4_sweep.mojo
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from lib.fp4_act import gpu_matmul_nvfp4_w4a4_dev, _f32_to_e4m3_byte, _e2m1_nibble
 from lib.fp4_weights import e4m3_decode

@@ -12,8 +12,8 @@ Run:
   gpurun ./build/mmq_relaxed_perf_probe
 """
 
-from std.gpu.host import DeviceContext
-from std.gpu import block_idx, thread_idx
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import block_idx, thread_idx
 from std.memory import UnsafePointer
 from std.sys import _RegisterPackType
 from std.sys._assembly import inlined_assembly

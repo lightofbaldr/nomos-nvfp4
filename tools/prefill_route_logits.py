@@ -30,7 +30,7 @@ import ctypes as c, json, os, pathlib, subprocess, sys
 import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUT = pathlib.Path(os.environ.get("ROUTE_OUT", "/root"))
+OUT = pathlib.Path(os.environ.get("ROUTE_OUT", "~/out"))
 
 if "--compare" in sys.argv:
     sq = np.load(OUT / "logits_sq.npy")

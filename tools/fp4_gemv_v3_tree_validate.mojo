@@ -16,7 +16,7 @@ agreement (tree argmax vs ref argmax; flags only if the ref-runner-up is NOT a n
       -Xlinker -L/usr/local/cuda/targets/sbsa-linux/lib -Xlinker -lcudart -Xlinker -lcublas -Xlinker -lm
   gpurun ./build/v3tree_val
 """
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.memory import UnsafePointer
 from std.collections import List
 

@@ -20,7 +20,7 @@ Usage (from the repo root, after building libnomos_kernel.so ON THIS BOX):
 Env: WEIGHTS (trailing slash REQUIRED), SO_PATH (default ./libnomos_kernel.so),
 PERF_NTOK (default 96), PERF_REPEAT (default 2; first pass warms, last is scored).
 NVFP4 selection happens via the NOMOS_* env you export before running — see
-docs/GOLD_NVFP4_PERF.md for the exact block.
+docs/the perf notes for the exact block.
 """
 import ctypes, json, os, time
 import numpy as np

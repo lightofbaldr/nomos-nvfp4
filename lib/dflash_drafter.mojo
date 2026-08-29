@@ -1,22 +1,41 @@
-"""DFlash block drafter for Gemma-4-31B.
+"""DFlash block drafter for Muse-Glimmer-30B.
 
 The implemented path follows z-lab's Qwen3-style DFlash forward over synthetic
-or host-provided tensors: hidden_norm(fc(raw 6-tap stream)), five block layers,
+or host-provided tensors: hidden_norm(fc(raw 5-tap stream)), five block layers,
 bidirectional attention over [context + block], and final norm. Live target
 embed/lm-head drafting is wired after this staged math path gates.
 """
 
+# Hidden and vocabulary are target-facing interfaces; the assistant's other shape
+# and scalar values are independent profile constants.
+from lib.model_config import (
+    D, VOCAB, DRAFTER_MLP, DRAFTER_TAPS, DRAFTER_Q_HEADS,
+    DRAFTER_KV_HEADS, DRAFTER_BLOCK, DRAFTER_WEIGHTS_BF16,
+    DRAFTER_CANDIDATES, DRAFTER_READOUT_SKIP_ROWS,
+    DRAFTER_ROPE_YARN, DRAFTER_YARN_FACTOR,
+    DRAFTER_MARKOV_RANK,
+    DRAFTER_MASK_ELISION_SINGLE_BLOCK,
+    DRAFTER_MASK_TOKEN_ID, DRAFTER_ROPE_THETA, DRAFTER_RMS_EPS,
+    DRAFTER_SOFTCAP, DRAFTER_SLIDING_WINDOW,
+    DRAFTER_READOUT_V4, DRAFTER_SLIDING_LAYERS,
+)
+
 from std.collections import List
-from std.gpu import barrier, block_dim, block_idx, thread_idx
-from std.gpu.memory import AddressSpace
+from std.gpu.primitives import block_dim, block_idx, thread_idx
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
 from std.memory import UnsafePointer
-from std.math import exp, sqrt
+from std.math import cos, exp, log, sin, sqrt
 from layout import row_major
 from layout import stack_allocation
 
 from lib.cuda import cuda_malloc, cuda_free, cuda_memcpy, cuda_sync
-from lib.io import load_f32_file_to_gpu
-from lib.ops_gpu_mojo import gpu_residual_add_mojo, gpu_rope_batched_mojo
+from lib.io import load_f32_file_to_gpu, load_bf16_file_to_gpu
+from lib.cast_gpu_mojo import gpu_bf16_to_fp32_mojo
+from lib.cublas import gpu_matmul_bf16_dev_batched
+from lib.ops_gpu_mojo import (
+    gpu_embed_load_bf16_mojo, gpu_residual_add_mojo, gpu_rope_batched_mojo,
+)
 from lib.ops_gpu_mojo_reductions import gpu_qk_norm_mojo, gpu_rmsnorm_batched_mojo
 from lib.q4_gemv_dp4a import (
     gpu_matmul_q4_dp4a_dev,
@@ -28,29 +47,30 @@ from lib.q8_weights import load_to_gpu_q8, gpu_matmul_q8_rows_dev
 from lib.softmax_gpu_mojo import gpu_softmax_over_heads_mojo
 from lib.fp4_act import gpu_matmul_nvfp4_w4a4_dev
 from std.ffi import external_call
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 
 
-comptime DFLASH_HIDDEN = 5376
-comptime DFLASH_TAPS = 6
+comptime DFLASH_HIDDEN = D
+comptime DFLASH_TAPS = DRAFTER_TAPS
 comptime DFLASH_FC_IN = DFLASH_TAPS * DFLASH_HIDDEN
-comptime DFLASH_BLOCK = 16
-comptime DFLASH_CANDIDATES = 15
+comptime DFLASH_BLOCK = DRAFTER_BLOCK
+comptime DFLASH_CANDIDATES = DRAFTER_CANDIDATES
 comptime DFLASH_LAYERS = 5
-comptime DFLASH_Q_HEADS = 64
-comptime DFLASH_KV_HEADS = 8
+comptime DFLASH_Q_HEADS = DRAFTER_Q_HEADS
+comptime DFLASH_KV_HEADS = DRAFTER_KV_HEADS
 comptime DFLASH_HEAD_DIM = 128
 comptime DFLASH_Q_DIM = DFLASH_Q_HEADS * DFLASH_HEAD_DIM
 comptime DFLASH_KV_DIM = DFLASH_KV_HEADS * DFLASH_HEAD_DIM
 comptime DFLASH_QKV_DIM = DFLASH_Q_DIM + 2 * DFLASH_KV_DIM
-comptime DFLASH_MLP = 10752
-comptime DFLASH_VOCAB = 262144
+comptime DFLASH_MLP = DRAFTER_MLP
+comptime DFLASH_VOCAB = VOCAB
 comptime DFLASH_MAX_VERIFY_ROWS = 17
 comptime DFLASH_MAX_CTX = 8192
 comptime DFLASH_CTX_BATCH = DFLASH_MAX_VERIFY_ROWS
 comptime DFLASH_MAX_SEQ = DFLASH_MAX_CTX + DFLASH_BLOCK
 comptime DFLASH_Q4_SCRATCH_BYTES = 16 * ((DFLASH_FC_IN + 31) // 32) * 36
 comptime DFLASH_ARGMAX_TPB = 1024
+comptime DFLASH_MARKOV_RANK = DRAFTER_MARKOV_RANK
 
 
 def _dflash_env_flag(name: String) -> Bool:
@@ -109,8 +129,104 @@ def _threads_for_cols(cols: Int) -> Int:
     return t
 
 
+def dflash_yarn_rope_batched_kernel(
+    x: UnsafePointer[Float32, MutAnyOrigin],
+    base_pos_arg: Int32, s_arg: Int32, heads_arg: Int32,
+):
+    """Qwen3 DSpark YARN: factor=32, theta=1e7, orig=8192, beta=32/1.
+
+    HF's truncated correction range is [14,29] over the 64 frequency bins and
+    its inferred attention_factor is 1 + 0.1*ln(32). Both cosine and sine are
+    scaled, exactly as Qwen3RotaryEmbedding returns them.
+    """
+    var s = Int(s_arg)
+    var heads = Int(heads_arg)
+    var token = block_idx.z
+    var head = block_idx.x
+    var idx = thread_idx.x
+    if token >= s or head >= heads or idx >= DFLASH_HEAD_DIM // 2:
+        return
+    var ramp = (Float32(idx) - 14.0) / 15.0
+    if ramp < 0.0: ramp = 0.0
+    if ramp > 1.0: ramp = 1.0
+    var exponent = (2.0 * Float32(idx)) / Float32(DFLASH_HEAD_DIM)
+    var inv_extrap = exp(-exponent * log(Float32(DRAFTER_ROPE_THETA)))
+    var inv_interp = inv_extrap / Float32(DRAFTER_YARN_FACTOR)
+    var inv_freq = inv_interp * ramp + inv_extrap * (1.0 - ramp)
+    var angle = Float32(Int(base_pos_arg) + token) * inv_freq
+    var attn_factor = Float32(1.0) + Float32(0.1) * log(Float32(DRAFTER_YARN_FACTOR))
+    var c = cos(angle) * attn_factor
+    var sn = sin(angle) * attn_factor
+    var off = (token * heads + head) * DFLASH_HEAD_DIM
+    var a = x[off + idx]
+    var b = x[off + idx + DFLASH_HEAD_DIM // 2]
+    x[off + idx] = a * c - b * sn
+    x[off + idx + DFLASH_HEAD_DIM // 2] = a * sn + b * c
+
+
+def _dflash_rope_batched(
+    ctx: DeviceContext, d_x: UInt64, base_pos: Int, s: Int, heads: Int
+) raises:
+    @parameter
+    if DRAFTER_ROPE_YARN:
+        var k = ctx.compile_function[dflash_yarn_rope_batched_kernel]()
+        ctx.enqueue_function(
+            k, _as_f32_ptr(d_x), Int32(base_pos), Int32(s), Int32(heads),
+            grid_dim=(heads, 1, s), block_dim=DFLASH_HEAD_DIM // 2,
+        )
+    else:
+        gpu_rope_batched_mojo(
+            ctx, d_x, base_pos, s, heads, DFLASH_HEAD_DIM,
+            Float32(DRAFTER_ROPE_THETA), DFLASH_HEAD_DIM,
+        )
+
+
+def _dflash_bf16_norm(ctx: DeviceContext, path: String, n: Int) raises -> UInt64:
+    var packed = load_bf16_file_to_gpu(path)
+    if packed == 0:
+        print("[WARN] Empty or missing DFlash bf16 norm:", path)
+        return UInt64(0)
+    var out = cuda_malloc(n * 4)
+    gpu_bf16_to_fp32_mojo(ctx, packed, out, n)
+    cuda_free(packed)
+    return out
+
+
+def _dflash_bf16_concat2(a_path: String, a_n: Int, b_path: String, b_n: Int) -> UInt64:
+    var a = load_bf16_file_to_gpu(a_path)
+    var b = load_bf16_file_to_gpu(b_path)
+    if a == 0 or b == 0:
+        if a != 0: cuda_free(a)
+        if b != 0: cuda_free(b)
+        return UInt64(0)
+    var out = cuda_malloc((a_n + b_n) * 2)
+    cuda_memcpy(out, a, a_n * 2, 3)
+    cuda_memcpy(out + UInt64(a_n * 2), b, b_n * 2, 3)
+    cuda_free(a)
+    cuda_free(b)
+    return out
+
+
+def _dflash_bf16_concat3(
+    a_path: String, a_n: Int, b_path: String, b_n: Int, c_path: String, c_n: Int
+) -> UInt64:
+    var ab = _dflash_bf16_concat2(a_path, a_n, b_path, b_n)
+    var c = load_bf16_file_to_gpu(c_path)
+    if ab == 0 or c == 0:
+        if ab != 0: cuda_free(ab)
+        if c != 0: cuda_free(c)
+        return UInt64(0)
+    var out = cuda_malloc((a_n + b_n + c_n) * 2)
+    cuda_memcpy(out, ab, (a_n + b_n) * 2, 3)
+    cuda_memcpy(out + UInt64((a_n + b_n) * 2), c, c_n * 2, 3)
+    cuda_free(ab)
+    cuda_free(c)
+    return out
+
+
 def _dflash_q4_batched(
     ctx: DeviceContext,
+    handle: UInt64,
     d_out: UInt64,
     d_in: UInt64,
     d_w: UInt64,
@@ -120,6 +236,12 @@ def _dflash_q4_batched(
     S: Int,
     force_q4: Bool = False,
 ) raises:
+    @parameter
+    if DRAFTER_WEIGHTS_BF16:
+        gpu_matmul_bf16_dev_batched(
+            ctx, handle, d_out, d_in, d_w, d_scratch, S, K, N
+        )
+        return
     if not force_q4 and _dflash_env_flag("NOMOS_DFLASH_DRAFTER_Q8"):
         gpu_matmul_q8_rows_dev(ctx, d_out, d_in, d_w, K, N, S)
         return
@@ -144,7 +266,7 @@ def _dflash_q4_batched(
     # bound on an implementation, not a description of one. (The 166-vs-208 GB/s figures used to
     # rank the routes were also measured at the VERIFY shapes, S=5..8, then misapplied here.)
     #
-    # Leave this OFF. (a kernel property, not a shape one).
+    # Leave this OFF. See docs/the measurement notes, "AI is a property of the KERNEL, not the shape".
     if S >= 9 and S <= 16 and not _dflash_env_flag("NOMOS_DFLASH_DRAFTER_V4"):
         if K <= 8192 and N > 8192:
             gpu_matmul_q4_mmq_relaxed_verify_dev[8](
@@ -163,6 +285,7 @@ def _dflash_q4_batched(
 
 
 struct DFlashDrafter(Movable):
+    var handle: UInt64
     var dB: Int
     var n_taps: Int
     var block_size: Int
@@ -179,6 +302,7 @@ struct DFlashDrafter(Movable):
     var max_ctx: Int
     var seq_len: Int
     var use_q8: Bool
+    var trace_enabled: Bool
 
     # Converted weights. Q/K/V and gate/up are loaded concatenated along output N.
     var w_fc: UInt64
@@ -192,13 +316,15 @@ struct DFlashDrafter(Movable):
     var w_post_attn_norm: List[UInt64]
     var w_q_norm: List[UInt64]
     var w_k_norm: List[UInt64]
+    var w_markov_1: UInt64
+    var w_markov_2: UInt64
 
     # Target-tap buffers wired through GemmaEngine.configure_drafter_taps.
     var d_taps_buf: UInt64
     var d_verify_taps_buf: UInt64
     var last_verify_rows: Int
 
-    # Gold-diff and forward scratch. Block-forward use waits for goldens.
+    # gold-diff and forward scratch. Block-forward use waits for goldens.
     var d_context: UInt64
     var d_target_hidden: UInt64
     var d_fc_out: UInt64
@@ -224,7 +350,7 @@ struct DFlashDrafter(Movable):
     var d_layer_out: UInt64
     var d_final_norm: UInt64
     var d_logits: UInt64
-    # Optional draft-vocab restriction. 0 = disabled (full 262144 argmax, bit-identical
+    # Optional draft-vocab restriction. 0 = disabled (full target-vocabulary argmax,
     # to pre-change behaviour). Non-zero = f32[VOCAB] keep-mask; the drafter may only
     # PROPOSE tokens with mask!=0. Lossless by construction on the verify side: the
     # target still scores the full vocabulary, so a restricted proposal set can only
@@ -233,33 +359,47 @@ struct DFlashDrafter(Movable):
     var d_decode_ids: UInt64
     var d_q4_scratch: UInt64
     var d_scores: UInt64
+    var d_markov_latent: UInt64
+    var d_markov_bias: UInt64
 
-    def __init__(out self, dir: String):
+    def __init__(out self, dir: String, ctx: DeviceContext, handle: UInt64) raises:
+        self.handle = handle
         self.dB = DFLASH_HIDDEN
         self.n_taps = DFLASH_TAPS
         self.block_size = DFLASH_BLOCK
-        self.mask_token_id = 4
+        self.mask_token_id = DRAFTER_MASK_TOKEN_ID
         self.num_layers = DFLASH_LAYERS
         self.num_q_heads = DFLASH_Q_HEADS
         self.num_kv_heads = DFLASH_KV_HEADS
         self.head_dim = DFLASH_HEAD_DIM
         self.mlp_dim = DFLASH_MLP
-        self.sliding_window = 2048
-        self.rope_theta = Float32(1000000.0)
-        self.rms_eps = Float32(0.000001)
-        self.softcap = Float32(30.0)
+        self.sliding_window = DRAFTER_SLIDING_WINDOW
+        self.rope_theta = Float32(DRAFTER_ROPE_THETA)
+        self.rms_eps = Float32(DRAFTER_RMS_EPS)
+        self.softcap = Float32(DRAFTER_SOFTCAP)
         self.max_ctx = DFLASH_MAX_CTX
         self.seq_len = 0
 
         self.use_q8 = _dflash_env_flag("NOMOS_DFLASH_DRAFTER_Q8")
-        if self.use_q8:
-            print("[dflash] drafter weights: Q8")
-            self.w_fc = load_to_gpu_q8(dir + "fc_weight.q8")
+        self.trace_enabled = _dflash_env_flag("NOMOS_DFLASH_TRACE")
+        @parameter
+        if DRAFTER_WEIGHTS_BF16:
+            print("[dflash] drafter weights: BF16")
+            self.use_q8 = False
+            self.w_fc = load_bf16_file_to_gpu(dir + "fc.weight.bf16")
+            self.w_hidden_norm = _dflash_bf16_norm(
+                ctx, dir + "hidden_norm.weight.bf16", DFLASH_HIDDEN
+            )
+            self.w_norm = _dflash_bf16_norm(ctx, dir + "norm.weight.bf16", DFLASH_HIDDEN)
         else:
-            print("[dflash] drafter weights: Q4")
-            self.w_fc = load_to_gpu_q4(dir + "fc_weight.q4")
-        self.w_hidden_norm = _dflash_f32(dir + "hidden_norm_weight")
-        self.w_norm = _dflash_f32(dir + "norm_weight")
+            if self.use_q8:
+                print("[dflash] drafter weights: Q8")
+                self.w_fc = load_to_gpu_q8(dir + "fc_weight.q8")
+            else:
+                print("[dflash] drafter weights: Q4")
+                self.w_fc = load_to_gpu_q4(dir + "fc_weight.q4")
+            self.w_hidden_norm = _dflash_f32(dir + "hidden_norm_weight")
+            self.w_norm = _dflash_f32(dir + "norm_weight")
 
         self.w_qkv = List[UInt64]()
         self.w_o = List[UInt64]()
@@ -269,30 +409,71 @@ struct DFlashDrafter(Movable):
         self.w_post_attn_norm = List[UInt64]()
         self.w_q_norm = List[UInt64]()
         self.w_k_norm = List[UInt64]()
+        self.w_markov_1 = UInt64(0)
+        self.w_markov_2 = UInt64(0)
+        @parameter
+        if DFLASH_MARKOV_RANK > 0:
+            self.w_markov_1 = load_bf16_file_to_gpu(
+                dir + "markov_head.markov_w1.weight.bf16"
+            )
+            self.w_markov_2 = load_bf16_file_to_gpu(
+                dir + "markov_head.markov_w2.weight.bf16"
+            )
+            if self.w_markov_1 == 0 or self.w_markov_2 == 0:
+                raise Error("DSpark Markov weights missing")
 
         for layer in range(DFLASH_LAYERS):
             var p = dir + "layers_" + String(layer) + "_"
-            if self.use_q8:
-                self.w_qkv.append(load_to_gpu_q8(p + "self_attn_qkv_weight.q8"))
-                self.w_o.append(load_to_gpu_q8(p + "self_attn_o_proj_weight.q8"))
-                self.w_gup.append(load_to_gpu_q8(p + "mlp_gate_up_weight.q8"))
-                self.w_down.append(load_to_gpu_q8(p + "mlp_down_proj_weight.q8"))
+            @parameter
+            if DRAFTER_WEIGHTS_BF16:
+                var bp = dir + String(layer) + "."
+                self.w_qkv.append(_dflash_bf16_concat3(
+                    bp + "self_attn.q_proj.weight.bf16", DFLASH_Q_DIM * DFLASH_HIDDEN,
+                    bp + "self_attn.k_proj.weight.bf16", DFLASH_KV_DIM * DFLASH_HIDDEN,
+                    bp + "self_attn.v_proj.weight.bf16", DFLASH_KV_DIM * DFLASH_HIDDEN,
+                ))
+                self.w_o.append(load_bf16_file_to_gpu(bp + "self_attn.o_proj.weight.bf16"))
+                self.w_gup.append(_dflash_bf16_concat2(
+                    bp + "mlp.gate_proj.weight.bf16", DFLASH_MLP * DFLASH_HIDDEN,
+                    bp + "mlp.up_proj.weight.bf16", DFLASH_MLP * DFLASH_HIDDEN,
+                ))
+                self.w_down.append(load_bf16_file_to_gpu(bp + "mlp.down_proj.weight.bf16"))
+                self.w_in_norm.append(_dflash_bf16_norm(
+                    ctx, bp + "input_layernorm.weight.bf16", DFLASH_HIDDEN
+                ))
+                self.w_post_attn_norm.append(_dflash_bf16_norm(
+                    ctx, bp + "post_attention_layernorm.weight.bf16", DFLASH_HIDDEN
+                ))
+                self.w_q_norm.append(_dflash_bf16_norm(
+                    ctx, bp + "self_attn.q_norm.weight.bf16", DFLASH_HEAD_DIM
+                ))
+                self.w_k_norm.append(_dflash_bf16_norm(
+                    ctx, bp + "self_attn.k_norm.weight.bf16", DFLASH_HEAD_DIM
+                ))
             else:
-                self.w_qkv.append(load_to_gpu_q4_concat3(
-                    p + "self_attn_q_proj_weight.q4",
-                    p + "self_attn_k_proj_weight.q4",
-                    p + "self_attn_v_proj_weight.q4",
-                ))
-                self.w_o.append(load_to_gpu_q4(p + "self_attn_o_proj_weight.q4"))
-                self.w_gup.append(load_to_gpu_q4_concat2(
-                    p + "mlp_gate_proj_weight.q4",
-                    p + "mlp_up_proj_weight.q4",
-                ))
-                self.w_down.append(load_to_gpu_q4(p + "mlp_down_proj_weight.q4"))
-            self.w_in_norm.append(_dflash_f32(p + "input_layernorm_weight"))
-            self.w_post_attn_norm.append(_dflash_f32(p + "post_attention_layernorm_weight"))
-            self.w_q_norm.append(_dflash_f32(p + "self_attn_q_norm_weight"))
-            self.w_k_norm.append(_dflash_f32(p + "self_attn_k_norm_weight"))
+                if self.use_q8:
+                    self.w_qkv.append(load_to_gpu_q8(p + "self_attn_qkv_weight.q8"))
+                    self.w_o.append(load_to_gpu_q8(p + "self_attn_o_proj_weight.q8"))
+                    self.w_gup.append(load_to_gpu_q8(p + "mlp_gate_up_weight.q8"))
+                    self.w_down.append(load_to_gpu_q8(p + "mlp_down_proj_weight.q8"))
+                else:
+                    self.w_qkv.append(load_to_gpu_q4_concat3(
+                        p + "self_attn_q_proj_weight.q4",
+                        p + "self_attn_k_proj_weight.q4",
+                        p + "self_attn_v_proj_weight.q4",
+                    ))
+                    self.w_o.append(load_to_gpu_q4(p + "self_attn_o_proj_weight.q4"))
+                    self.w_gup.append(load_to_gpu_q4_concat2(
+                        p + "mlp_gate_proj_weight.q4",
+                        p + "mlp_up_proj_weight.q4",
+                    ))
+                    self.w_down.append(load_to_gpu_q4(p + "mlp_down_proj_weight.q4"))
+            @parameter
+            if not DRAFTER_WEIGHTS_BF16:
+                self.w_in_norm.append(_dflash_f32(p + "input_layernorm_weight"))
+                self.w_post_attn_norm.append(_dflash_f32(p + "post_attention_layernorm_weight"))
+                self.w_q_norm.append(_dflash_f32(p + "self_attn_q_norm_weight"))
+                self.w_k_norm.append(_dflash_f32(p + "self_attn_k_norm_weight"))
 
         self.d_taps_buf = cuda_malloc(DFLASH_FC_IN * 4)
         self.d_verify_taps_buf = cuda_malloc(DFLASH_MAX_VERIFY_ROWS * DFLASH_FC_IN * 4)
@@ -326,7 +507,7 @@ struct DFlashDrafter(Movable):
         self.d_layer_out = cuda_malloc(DFLASH_LAYERS * DFLASH_BLOCK * DFLASH_HIDDEN * 4)
         self.d_final_norm = cuda_malloc(DFLASH_BLOCK * DFLASH_HIDDEN * 4)
         self.d_logits = cuda_malloc(DFLASH_CANDIDATES * DFLASH_VOCAB * 4)
-        # NOMOS_DRAFT_VOCAB_MASK=<path to f32[262144] of 1.0/0.0>. f32 (not u8) so it reuses
+        # NOMOS_DRAFT_VOCAB_MASK=<path to f32[VOCAB] of 1.0/0.0>. f32 (not u8) so it reuses
         # the existing, tested load_f32_file_to_gpu path rather than adding a byte loader.
         #
         # *** MEASURED NULL ON GB10 (2026-08-05). KEPT so nobody re-runs it hoping. ***
@@ -360,13 +541,30 @@ struct DFlashDrafter(Movable):
             self.d_vocab_mask = load_f32_file_to_gpu(_mask_path)
             if self.d_vocab_mask == 0:
                 print("[dflash] WARNING: NOMOS_DRAFT_VOCAB_MASK set but not loadable:",
-                      _mask_path, "-- running UNMASKED (full 262144 vocab)")
+                      _mask_path, "-- running UNMASKED (full target vocabulary)")
             else:
                 print("[dflash] draft-vocab mask ACTIVE:", _mask_path,
                       "-- drafter may only propose masked tokens; verify is unaffected")
         self.d_decode_ids = cuda_malloc(DFLASH_CANDIDATES * 4)
-        self.d_q4_scratch = cuda_malloc(DFLASH_Q4_SCRATCH_BYTES)
+        @parameter
+        if DRAFTER_WEIGHTS_BF16:
+            # Largest activation cast is target_hidden[CTX_BATCH, taps*D].
+            self.d_q4_scratch = cuda_malloc(DFLASH_CTX_BATCH * DFLASH_FC_IN * 2)
+        else:
+            self.d_q4_scratch = cuda_malloc(DFLASH_Q4_SCRATCH_BYTES)
         self.d_scores = cuda_malloc(DFLASH_BLOCK * DFLASH_Q_HEADS * DFLASH_MAX_SEQ * 4)
+        self.d_markov_latent = UInt64(0)
+        self.d_markov_bias = UInt64(0)
+        @parameter
+        if DFLASH_MARKOV_RANK > 0:
+            self.d_markov_latent = cuda_malloc(DFLASH_BLOCK * DFLASH_MARKOV_RANK * 4)
+            self.d_markov_bias = cuda_malloc(DFLASH_BLOCK * DFLASH_VOCAB * 4)
+        @parameter
+        if DRAFTER_MASK_ELISION_SINGLE_BLOCK:
+            print(
+                "[dflash] mask elision: SpecForge single-block domain;",
+                "runtime asserts ctx_cache_len == abs_start_pos and no window truncation",
+            )
         cuda_sync()
 
     def set_cache_len(mut self, n: Int):
@@ -579,6 +777,87 @@ def dflash_argmax_rows_kernel(
         out_ids[row] = idx_s[0]
 
 
+def dflash_markov_gather_kernel(
+    latent: UnsafePointer[Float32, MutAnyOrigin],
+    w1: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    prior_ids: UnsafePointer[Int32, MutAnyOrigin],
+    row_arg: Int32,
+    anchor_arg: Int32,
+):
+    var row = Int(row_arg)
+    var col = block_idx.x * block_dim.x + thread_idx.x
+    if col >= DFLASH_MARKOV_RANK:
+        return
+    var token = Int(anchor_arg) if row == 0 else Int(prior_ids[row - 1])
+    latent[row * DFLASH_MARKOV_RANK + col] = Float32(
+        w1[token * DFLASH_MARKOV_RANK + col]
+    )
+
+
+def dflash_add_markov_bias_kernel(
+    logits: UnsafePointer[Float32, MutAnyOrigin],
+    bias: UnsafePointer[Float32, MutAnyOrigin],
+    row_arg: Int32,
+):
+    var row = Int(row_arg)
+    var col = block_idx.x * block_dim.x + thread_idx.x
+    if col < DFLASH_VOCAB:
+        logits[row * DFLASH_VOCAB + col] += bias[row * DFLASH_VOCAB + col]
+
+
+def _dflash_finish_readout(
+    ctx: DeviceContext, mut m: DFlashDrafter, anchor_token: Int
+) raises:
+    var argmax = ctx.compile_function[dflash_argmax_rows_kernel]()
+    @parameter
+    if DFLASH_MARKOV_RANK > 0:
+        var gather = ctx.compile_function[dflash_markov_gather_kernel]()
+        var add_bias = ctx.compile_function[dflash_add_markov_bias_kernel]()
+        for row in range(DFLASH_CANDIDATES):
+            ctx.enqueue_function(
+                gather,
+                _as_f32_ptr(m.d_markov_latent),
+                UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+                    unsafe_from_address=Int(m.w_markov_1)
+                ),
+                UnsafePointer[Int32, MutAnyOrigin](
+                    unsafe_from_address=Int(m.d_decode_ids)
+                ),
+                Int32(row), Int32(anchor_token),
+                grid_dim=(DFLASH_MARKOV_RANK + 255) // 256, block_dim=256,
+            )
+            gpu_matmul_bf16_dev_batched(
+                ctx, m.handle,
+                m.d_markov_bias + UInt64(row * DFLASH_VOCAB * 4),
+                m.d_markov_latent + UInt64(row * DFLASH_MARKOV_RANK * 4),
+                m.w_markov_2, m.d_q4_scratch,
+                1, DFLASH_MARKOV_RANK, DFLASH_VOCAB,
+            )
+            ctx.enqueue_function(
+                add_bias, _as_f32_ptr(m.d_logits), _as_f32_ptr(m.d_markov_bias),
+                Int32(row), grid_dim=(DFLASH_VOCAB + 255) // 256, block_dim=256,
+            )
+            ctx.enqueue_function(
+                argmax,
+                UnsafePointer[Int32, MutAnyOrigin](
+                    unsafe_from_address=Int(m.d_decode_ids + UInt64(row * 4))
+                ),
+                _as_f32_ptr(m.d_logits + UInt64(row * DFLASH_VOCAB * 4)),
+                Int32(1), Int32(DFLASH_VOCAB), _as_f32_ptr(m.d_vocab_mask),
+                Int32(1) if m.d_vocab_mask != 0 else Int32(0),
+                grid_dim=1, block_dim=DFLASH_ARGMAX_TPB,
+            )
+    else:
+        ctx.enqueue_function(
+            argmax,
+            UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=Int(m.d_decode_ids)),
+            _as_f32_ptr(m.d_logits), Int32(DFLASH_CANDIDATES), Int32(DFLASH_VOCAB),
+            _as_f32_ptr(m.d_vocab_mask),
+            Int32(1) if m.d_vocab_mask != 0 else Int32(0),
+            grid_dim=DFLASH_CANDIDATES, block_dim=DFLASH_ARGMAX_TPB,
+        )
+
+
 def _dflash_copy(ctx: DeviceContext, dst: UInt64, src: UInt64, n: Int) raises:
     var threads = 256
     var k = ctx.compile_function[dflash_copy_kernel]()
@@ -589,56 +868,69 @@ def _dflash_copy(ctx: DeviceContext, dst: UInt64, src: UInt64, n: Int) raises:
     )
 
 
-def _dflash_readout_argmax(ctx: DeviceContext, mut m: DFlashDrafter, d_lmhead_q4: UInt64) raises:
-    _dflash_q4_batched(
-        ctx,
-        m.d_logits,
-        m.d_final_norm + UInt64(DFLASH_HIDDEN * 4),
-        d_lmhead_q4,
-        m.d_q4_scratch,
-        DFLASH_HIDDEN,
-        DFLASH_VOCAB,
-        DFLASH_CANDIDATES,
-        True,
-    )
-    var k = ctx.compile_function[dflash_argmax_rows_kernel]()
-    ctx.enqueue_function(
-        k,
-        UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=Int(m.d_decode_ids)),
-        _as_f32_ptr(m.d_logits),
-        Int32(DFLASH_CANDIDATES),
-        Int32(DFLASH_VOCAB),
-        _as_f32_ptr(m.d_vocab_mask),
-        Int32(1) if m.d_vocab_mask != 0 else Int32(0),
-        grid_dim=DFLASH_CANDIDATES,
-        block_dim=DFLASH_ARGMAX_TPB,
-    )
+def _dflash_readout_argmax(
+    ctx: DeviceContext, mut m: DFlashDrafter, d_lmhead_q4: UInt64, anchor_token: Int
+) raises:
+    @parameter
+    if DRAFTER_READOUT_V4:
+        # Muse correctness route: relaxed MMQ collapses onto the special-token
+        # tail (cosine 0.017); v4 reaches 0.969 against the HF reference.
+        gpu_matmul_q4_s8_v4_gemv_dev[4](
+            ctx,
+            m.d_logits,
+            m.d_final_norm + UInt64(DRAFTER_READOUT_SKIP_ROWS * DFLASH_HIDDEN * 4),
+            d_lmhead_q4,
+            m.d_q4_scratch,
+            DFLASH_HIDDEN,
+            DFLASH_VOCAB,
+            DFLASH_CANDIDATES,
+        )
+    else:
+        _dflash_q4_batched(
+            ctx, m.handle,
+            m.d_logits,
+            m.d_final_norm + UInt64(DRAFTER_READOUT_SKIP_ROWS * DFLASH_HIDDEN * 4),
+            d_lmhead_q4,
+            m.d_q4_scratch,
+            DFLASH_HIDDEN,
+            DFLASH_VOCAB,
+            DFLASH_CANDIDATES,
+            True,
+        )
+    _dflash_finish_readout(ctx, m, anchor_token)
 
 
 def dflash_project_context(ctx: DeviceContext, mut m: DFlashDrafter, d_taps: UInt64) raises:
-    """Project one six-tap context row through hidden_norm(fc(raw_concat))."""
-    if m.use_q8:
-        gpu_matmul_q8_rows_dev(
-            ctx, m.d_fc_out, d_taps, m.w_fc, DFLASH_FC_IN, DFLASH_HIDDEN, 1
+    """Project one n-tap context row through hidden_norm(fc(raw_concat))."""
+    @parameter
+    if DRAFTER_WEIGHTS_BF16:
+        _dflash_q4_batched(
+            ctx, m.handle, m.d_fc_out, d_taps, m.w_fc, m.d_q4_scratch,
+            DFLASH_FC_IN, DFLASH_HIDDEN, 1,
         )
     else:
-        gpu_matmul_q4_dp4a_dev[4](
-            ctx,
-            m.d_fc_out,
-            d_taps,
-            m.w_fc,
-            m.d_q4_scratch,
-            DFLASH_FC_IN,
-            DFLASH_HIDDEN,
-        )
-    gpu_rmsnorm_batched_mojo(ctx, m.d_fc_out, m.d_context, m.w_hidden_norm, DFLASH_HIDDEN, 1)
+        if m.use_q8:
+            gpu_matmul_q8_rows_dev(
+                ctx, m.d_fc_out, d_taps, m.w_fc, DFLASH_FC_IN, DFLASH_HIDDEN, 1
+            )
+        else:
+            gpu_matmul_q4_dp4a_dev[4](
+                ctx,
+                m.d_fc_out,
+                d_taps,
+                m.w_fc,
+                m.d_q4_scratch,
+                DFLASH_FC_IN,
+                DFLASH_HIDDEN,
+            )
+    gpu_rmsnorm_batched_mojo(ctx, m.d_fc_out, m.d_context, m.w_hidden_norm, DFLASH_HIDDEN, 1, m.rms_eps)
 
 
 def dflash_project_context_stream(ctx: DeviceContext, mut m: DFlashDrafter, ctx_len: Int) raises:
     if ctx_len <= 0 or ctx_len > DFLASH_CTX_BATCH:
         return
     _dflash_q4_batched(
-        ctx,
+        ctx, m.handle,
         m.d_fc_out,
         m.d_target_hidden,
         m.w_fc,
@@ -647,7 +939,7 @@ def dflash_project_context_stream(ctx: DeviceContext, mut m: DFlashDrafter, ctx_
         DFLASH_HIDDEN,
         ctx_len,
     )
-    gpu_rmsnorm_batched_mojo(ctx, m.d_fc_out, m.d_ctx_fused, m.w_hidden_norm, DFLASH_HIDDEN, ctx_len)
+    gpu_rmsnorm_batched_mojo(ctx, m.d_fc_out, m.d_ctx_fused, m.w_hidden_norm, DFLASH_HIDDEN, ctx_len, m.rms_eps)
 
 
 def dflash_append_context_rows(
@@ -658,7 +950,7 @@ def dflash_append_context_rows(
     if m.seq_len + n_rows > m.max_ctx:
         return
     _dflash_q4_batched(
-        ctx,
+        ctx, m.handle,
         m.d_fc_out,
         d_taps_rows,
         m.w_fc,
@@ -668,12 +960,12 @@ def dflash_append_context_rows(
         n_rows,
     )
     gpu_rmsnorm_batched_mojo(
-        ctx, m.d_fc_out, m.d_ctx_fused, m.w_hidden_norm, DFLASH_HIDDEN, n_rows
+        ctx, m.d_fc_out, m.d_ctx_fused, m.w_hidden_norm, DFLASH_HIDDEN, n_rows, m.rms_eps
     )
     var base_pos = m.seq_len
     for layer in range(DFLASH_LAYERS):
         _dflash_q4_batched(
-            ctx,
+            ctx, m.handle,
             m.d_ctx_qkv,
             m.d_ctx_fused,
             m.w_qkv[layer],
@@ -684,12 +976,9 @@ def dflash_append_context_rows(
         )
         _dflash_split_ctx_qkv(ctx, m, n_rows)
         gpu_qk_norm_mojo(
-            ctx, m.d_k_ctx, m.w_k_norm[layer], n_rows * DFLASH_KV_HEADS, DFLASH_HEAD_DIM
+            ctx, m.d_k_ctx, m.w_k_norm[layer], n_rows * DFLASH_KV_HEADS, DFLASH_HEAD_DIM, m.rms_eps
         )
-        gpu_rope_batched_mojo(
-            ctx, m.d_k_ctx, base_pos, n_rows, DFLASH_KV_HEADS, DFLASH_HEAD_DIM,
-            m.rope_theta, DFLASH_HEAD_DIM,
-        )
+        _dflash_rope_batched(ctx, m.d_k_ctx, base_pos, n_rows, DFLASH_KV_HEADS)
         cuda_memcpy(
             m.d_ctx_k_cache[layer] + UInt64(base_pos * DFLASH_KV_DIM * 4),
             m.d_k_ctx,
@@ -806,11 +1095,11 @@ def dflash_forward_block_embeddings(ctx: DeviceContext, mut m: DFlashDrafter, ct
     for layer in range(DFLASH_LAYERS):
         _dflash_copy(ctx, m.d_residual, m.d_block_h, DFLASH_BLOCK * DFLASH_HIDDEN)
         gpu_rmsnorm_batched_mojo(
-            ctx, m.d_block_h, m.d_normed, m.w_in_norm[layer], DFLASH_HIDDEN, DFLASH_BLOCK
+            ctx, m.d_block_h, m.d_normed, m.w_in_norm[layer], DFLASH_HIDDEN, DFLASH_BLOCK, m.rms_eps
         )
 
         _dflash_q4_batched(
-            ctx,
+            ctx, m.handle,
             m.d_qkv,
             m.d_normed,
             m.w_qkv[layer],
@@ -821,7 +1110,7 @@ def dflash_forward_block_embeddings(ctx: DeviceContext, mut m: DFlashDrafter, ct
         )
         if ctx_len > 0:
             _dflash_q4_batched(
-                ctx,
+                ctx, m.handle,
                 m.d_ctx_qkv,
                 m.d_ctx_fused,
                 m.w_qkv[layer],
@@ -834,23 +1123,19 @@ def dflash_forward_block_embeddings(ctx: DeviceContext, mut m: DFlashDrafter, ct
         _dflash_split_ctx_qkv(ctx, m, ctx_len)
         _dflash_concat_kv(ctx, m, ctx_len)
 
-        gpu_qk_norm_mojo(ctx, m.d_q, m.w_q_norm[layer], DFLASH_BLOCK * DFLASH_Q_HEADS, DFLASH_HEAD_DIM)
-        gpu_qk_norm_mojo(ctx, m.d_k_all, m.w_k_norm[layer], (ctx_len + DFLASH_BLOCK) * DFLASH_KV_HEADS, DFLASH_HEAD_DIM)
-        gpu_rope_batched_mojo(
-            ctx, m.d_q, ctx_len, DFLASH_BLOCK, DFLASH_Q_HEADS, DFLASH_HEAD_DIM, m.rope_theta, DFLASH_HEAD_DIM
-        )
-        gpu_rope_batched_mojo(
-            ctx, m.d_k_all, 0, ctx_len + DFLASH_BLOCK, DFLASH_KV_HEADS, DFLASH_HEAD_DIM, m.rope_theta, DFLASH_HEAD_DIM
-        )
+        gpu_qk_norm_mojo(ctx, m.d_q, m.w_q_norm[layer], DFLASH_BLOCK * DFLASH_Q_HEADS, DFLASH_HEAD_DIM, m.rms_eps)
+        gpu_qk_norm_mojo(ctx, m.d_k_all, m.w_k_norm[layer], (ctx_len + DFLASH_BLOCK) * DFLASH_KV_HEADS, DFLASH_HEAD_DIM, m.rms_eps)
+        _dflash_rope_batched(ctx, m.d_q, ctx_len, DFLASH_BLOCK, DFLASH_Q_HEADS)
+        _dflash_rope_batched(ctx, m.d_k_all, 0, ctx_len + DFLASH_BLOCK, DFLASH_KV_HEADS)
 
         var key_start = 0
         var key_len = ctx_len + DFLASH_BLOCK
-        if layer < 4 and key_len > m.sliding_window:
+        if layer < DRAFTER_SLIDING_LAYERS and key_len > m.sliding_window:
             key_start = key_len - m.sliding_window
             key_len = m.sliding_window
         _dflash_attention(ctx, m, key_start, key_len)
         _dflash_q4_batched(
-            ctx,
+            ctx, m.handle,
             m.d_o,
             m.d_attn,
             m.w_o[layer],
@@ -864,10 +1149,10 @@ def dflash_forward_block_embeddings(ctx: DeviceContext, mut m: DFlashDrafter, ct
 
         _dflash_copy(ctx, m.d_residual, m.d_block_h, DFLASH_BLOCK * DFLASH_HIDDEN)
         gpu_rmsnorm_batched_mojo(
-            ctx, m.d_block_h, m.d_normed, m.w_post_attn_norm[layer], DFLASH_HIDDEN, DFLASH_BLOCK
+            ctx, m.d_block_h, m.d_normed, m.w_post_attn_norm[layer], DFLASH_HIDDEN, DFLASH_BLOCK, m.rms_eps
         )
         _dflash_q4_batched(
-            ctx,
+            ctx, m.handle,
             m.d_gate_up,
             m.d_normed,
             m.w_gup[layer],
@@ -878,7 +1163,7 @@ def dflash_forward_block_embeddings(ctx: DeviceContext, mut m: DFlashDrafter, ct
         )
         _dflash_swiglu(ctx, m)
         _dflash_q4_batched(
-            ctx,
+            ctx, m.handle,
             m.d_o,
             m.d_mlp,
             m.w_down[layer],
@@ -896,21 +1181,37 @@ def dflash_forward_block_embeddings(ctx: DeviceContext, mut m: DFlashDrafter, ct
             DFLASH_BLOCK * DFLASH_HIDDEN,
         )
 
-    gpu_rmsnorm_batched_mojo(ctx, m.d_block_h, m.d_final_norm, m.w_norm, DFLASH_HIDDEN, DFLASH_BLOCK)
+    gpu_rmsnorm_batched_mojo(ctx, m.d_block_h, m.d_final_norm, m.w_norm, DFLASH_HIDDEN, DFLASH_BLOCK, m.rms_eps)
 
 
 def dflash_forward_block_cached(ctx: DeviceContext, mut m: DFlashDrafter, abs_start_pos: Int) raises:
     var ctx_len = m.seq_len
     if ctx_len < 0 or ctx_len > m.max_ctx:
         return
+    @parameter
+    if DRAFTER_MASK_ELISION_SINGLE_BLOCK:
+        # Authoritative SpecForge mask = Base Prefix OR Same Block. It is an all-True
+        # matrix only for this exact serving domain: one synthetic block and K/V
+        # containing precisely the committed prefix followed by that block. A cache
+        # length different from the absolute block start means the domain contains a
+        # gap, future/foreign rows, or stale state; mask=None would then be illegal.
+        if DFLASH_CANDIDATES != DFLASH_BLOCK:
+            raise Error("DSpark mask-elision contract requires one proposal per block row")
+        if DRAFTER_SLIDING_LAYERS != 0:
+            raise Error("DSpark mask-elision contract forbids sliding/window truncation")
+        if ctx_len != abs_start_pos:
+            raise Error(
+                "DSpark mask-elision domain mismatch: ctx_cache_len=" + String(ctx_len) +
+                " abs_start_pos=" + String(abs_start_pos)
+            )
     for layer in range(DFLASH_LAYERS):
         _dflash_copy(ctx, m.d_residual, m.d_block_h, DFLASH_BLOCK * DFLASH_HIDDEN)
         gpu_rmsnorm_batched_mojo(
-            ctx, m.d_block_h, m.d_normed, m.w_in_norm[layer], DFLASH_HIDDEN, DFLASH_BLOCK
+            ctx, m.d_block_h, m.d_normed, m.w_in_norm[layer], DFLASH_HIDDEN, DFLASH_BLOCK, m.rms_eps
         )
 
         _dflash_q4_batched(
-            ctx,
+            ctx, m.handle,
             m.d_qkv,
             m.d_normed,
             m.w_qkv[layer],
@@ -921,16 +1222,10 @@ def dflash_forward_block_cached(ctx: DeviceContext, mut m: DFlashDrafter, abs_st
         )
         _dflash_split_block_qkv(ctx, m)
 
-        gpu_qk_norm_mojo(ctx, m.d_q, m.w_q_norm[layer], DFLASH_BLOCK * DFLASH_Q_HEADS, DFLASH_HEAD_DIM)
-        gpu_qk_norm_mojo(ctx, m.d_k, m.w_k_norm[layer], DFLASH_BLOCK * DFLASH_KV_HEADS, DFLASH_HEAD_DIM)
-        gpu_rope_batched_mojo(
-            ctx, m.d_q, abs_start_pos, DFLASH_BLOCK, DFLASH_Q_HEADS, DFLASH_HEAD_DIM,
-            m.rope_theta, DFLASH_HEAD_DIM,
-        )
-        gpu_rope_batched_mojo(
-            ctx, m.d_k, abs_start_pos, DFLASH_BLOCK, DFLASH_KV_HEADS, DFLASH_HEAD_DIM,
-            m.rope_theta, DFLASH_HEAD_DIM,
-        )
+        gpu_qk_norm_mojo(ctx, m.d_q, m.w_q_norm[layer], DFLASH_BLOCK * DFLASH_Q_HEADS, DFLASH_HEAD_DIM, m.rms_eps)
+        gpu_qk_norm_mojo(ctx, m.d_k, m.w_k_norm[layer], DFLASH_BLOCK * DFLASH_KV_HEADS, DFLASH_HEAD_DIM, m.rms_eps)
+        _dflash_rope_batched(ctx, m.d_q, abs_start_pos, DFLASH_BLOCK, DFLASH_Q_HEADS)
+        _dflash_rope_batched(ctx, m.d_k, abs_start_pos, DFLASH_BLOCK, DFLASH_KV_HEADS)
 
         if ctx_len > 0:
             cuda_memcpy(
@@ -960,12 +1255,12 @@ def dflash_forward_block_cached(ctx: DeviceContext, mut m: DFlashDrafter, abs_st
 
         var key_start = 0
         var key_len = ctx_len + DFLASH_BLOCK
-        if layer < 4 and key_len > m.sliding_window:
+        if layer < DRAFTER_SLIDING_LAYERS and key_len > m.sliding_window:
             key_start = key_len - m.sliding_window
             key_len = m.sliding_window
         _dflash_attention(ctx, m, key_start, key_len)
         _dflash_q4_batched(
-            ctx,
+            ctx, m.handle,
             m.d_o,
             m.d_attn,
             m.w_o[layer],
@@ -979,10 +1274,10 @@ def dflash_forward_block_cached(ctx: DeviceContext, mut m: DFlashDrafter, abs_st
 
         _dflash_copy(ctx, m.d_residual, m.d_block_h, DFLASH_BLOCK * DFLASH_HIDDEN)
         gpu_rmsnorm_batched_mojo(
-            ctx, m.d_block_h, m.d_normed, m.w_post_attn_norm[layer], DFLASH_HIDDEN, DFLASH_BLOCK
+            ctx, m.d_block_h, m.d_normed, m.w_post_attn_norm[layer], DFLASH_HIDDEN, DFLASH_BLOCK, m.rms_eps
         )
         _dflash_q4_batched(
-            ctx,
+            ctx, m.handle,
             m.d_gate_up,
             m.d_normed,
             m.w_gup[layer],
@@ -993,7 +1288,7 @@ def dflash_forward_block_cached(ctx: DeviceContext, mut m: DFlashDrafter, abs_st
         )
         _dflash_swiglu(ctx, m)
         _dflash_q4_batched(
-            ctx,
+            ctx, m.handle,
             m.d_o,
             m.d_mlp,
             m.w_down[layer],
@@ -1004,15 +1299,62 @@ def dflash_forward_block_cached(ctx: DeviceContext, mut m: DFlashDrafter, abs_st
         )
         _dflash_copy(ctx, m.d_block_h, m.d_residual, DFLASH_BLOCK * DFLASH_HIDDEN)
         gpu_residual_add_mojo(ctx, m.d_block_h, m.d_o, DFLASH_BLOCK * DFLASH_HIDDEN)
+        if m.trace_enabled:
+            _dflash_copy(
+                ctx,
+                m.d_layer_out + UInt64(layer * DFLASH_BLOCK * DFLASH_HIDDEN * 4),
+                m.d_block_h,
+                DFLASH_BLOCK * DFLASH_HIDDEN,
+            )
 
-    gpu_rmsnorm_batched_mojo(ctx, m.d_block_h, m.d_final_norm, m.w_norm, DFLASH_HIDDEN, DFLASH_BLOCK)
+    gpu_rmsnorm_batched_mojo(ctx, m.d_block_h, m.d_final_norm, m.w_norm, DFLASH_HIDDEN, DFLASH_BLOCK, m.rms_eps)
 
 
 def dflash_draft_block(
-    ctx: DeviceContext, mut m: DFlashDrafter, d_lmhead_q4: UInt64, abs_start_pos: Int
+    ctx: DeviceContext, mut m: DFlashDrafter, d_lmhead_q4: UInt64,
+    anchor_token: Int, abs_start_pos: Int
 ) raises:
     dflash_forward_block_cached(ctx, m, abs_start_pos)
-    _dflash_readout_argmax(ctx, m, d_lmhead_q4)
+    _dflash_readout_argmax(ctx, m, d_lmhead_q4, anchor_token)
+
+
+def dflash_markov_bias(
+    ctx: DeviceContext, mut m: DFlashDrafter, ref token_ids: List[Int]
+) raises:
+    """Compute DSpark's rank-256 Markov bias for one complete block.
+
+    This is deliberately separate from backbone logits until the loop-level
+    readout gate passes: a correct backbone must not mask a shifted token-id row.
+    """
+    @parameter
+    if DFLASH_MARKOV_RANK <= 0:
+        raise Error("compiled DFlash assistant has no Markov head")
+    if len(token_ids) != DFLASH_BLOCK:
+        raise Error("Markov token count mismatch")
+    for row in range(DFLASH_BLOCK):
+        if token_ids[row] < 0 or token_ids[row] >= DFLASH_VOCAB:
+            raise Error("Markov token id out of range")
+        gpu_embed_load_bf16_mojo(
+            ctx,
+            m.d_markov_latent + UInt64(row * DFLASH_MARKOV_RANK * 4),
+            m.w_markov_1,
+            token_ids[row], DFLASH_MARKOV_RANK, 1.0,
+        )
+    _dflash_q4_batched(
+        ctx, m.handle, m.d_markov_bias, m.d_markov_latent, m.w_markov_2,
+        m.d_q4_scratch, DFLASH_MARKOV_RANK, DFLASH_VOCAB, DFLASH_BLOCK,
+    )
+
+
+def dflash_markov_sample_logits(
+    ctx: DeviceContext, mut m: DFlashDrafter, anchor_token: Int
+) raises:
+    """Apply the autoregressive Markov bias to preloaded backbone logits.
+
+    Row 0 uses the committed anchor. Each later row gathers w1 using the prior
+    row's newly selected token, matching DeepSpec's prev_token_ids contract.
+    """
+    _dflash_finish_readout(ctx, m, anchor_token)
 
 
 def _dflash_readout_argmax_nvfp4(
@@ -1020,10 +1362,11 @@ def _dflash_readout_argmax_nvfp4(
     handle: UInt64, d_embed_nvfp4: UInt64, embed_global: Float32,
     d_w4a4_packed: UInt64, d_w4a4_bs: UInt64, d_w4a4_global: UInt64,
     d_w4a4_bs_sf: UInt64, d_w4a4_wbs_sf: UInt64, d_lmhead_cpad: UInt64,
+    anchor_token: Int,
 ) raises:
     """Read out the 15 block-draft rows through the TARGET's NVFP4 W4A4 lm-head.
 
-    Discrete-VRAM re-wire (Gold RTX PRO 4000, sm_120): the GB10 build read out
+    Discrete-VRAM re-wire (RTX PRO 4000, sm_120): the GB10 build read out
     through the Q4 dp4a lm-head (d_embed_q4), which is not populated on the NVFP4
     weight build (d_embed_q4 == 0). This routes the readout through the SAME
     d_embed_nvfp4 W4A4 batched lm-head base decode / eagle3-verify use (the M-row
@@ -1033,24 +1376,13 @@ def _dflash_readout_argmax_nvfp4(
     gpu_matmul_nvfp4_w4a4_dev(
         ctx, handle,
         m.d_logits,
-        m.d_final_norm + UInt64(DFLASH_HIDDEN * 4),
+        m.d_final_norm + UInt64(DRAFTER_READOUT_SKIP_ROWS * DFLASH_HIDDEN * 4),
         d_embed_nvfp4, embed_global, Float32(0.0),
         d_w4a4_packed, d_w4a4_bs, d_w4a4_global,
         d_w4a4_bs_sf, d_w4a4_wbs_sf, d_lmhead_cpad,
         DFLASH_CANDIDATES, 16, DFLASH_HIDDEN, DFLASH_VOCAB,
     )
-    var k = ctx.compile_function[dflash_argmax_rows_kernel]()
-    ctx.enqueue_function(
-        k,
-        UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=Int(m.d_decode_ids)),
-        _as_f32_ptr(m.d_logits),
-        Int32(DFLASH_CANDIDATES),
-        Int32(DFLASH_VOCAB),
-        _as_f32_ptr(m.d_vocab_mask),
-        Int32(1) if m.d_vocab_mask != 0 else Int32(0),
-        grid_dim=DFLASH_CANDIDATES,
-        block_dim=DFLASH_ARGMAX_TPB,
-    )
+    _dflash_finish_readout(ctx, m, anchor_token)
 
 
 def dflash_draft_block_nvfp4(
@@ -1058,7 +1390,7 @@ def dflash_draft_block_nvfp4(
     handle: UInt64, d_embed_nvfp4: UInt64, embed_global: Float32,
     d_w4a4_packed: UInt64, d_w4a4_bs: UInt64, d_w4a4_global: UInt64,
     d_w4a4_bs_sf: UInt64, d_w4a4_wbs_sf: UInt64, d_lmhead_cpad: UInt64,
-    abs_start_pos: Int,
+    anchor_token: Int, abs_start_pos: Int,
 ) raises:
     """NVFP4/discrete-card twin of dflash_draft_block: same block forward, NVFP4
     lm-head readout instead of the Q4 dp4a one."""
@@ -1066,19 +1398,21 @@ def dflash_draft_block_nvfp4(
     _dflash_readout_argmax_nvfp4(
         ctx, m, handle, d_embed_nvfp4, embed_global,
         d_w4a4_packed, d_w4a4_bs, d_w4a4_global,
-        d_w4a4_bs_sf, d_w4a4_wbs_sf, d_lmhead_cpad,
+        d_w4a4_bs_sf, d_w4a4_wbs_sf, d_lmhead_cpad, anchor_token,
     )
 
 
 def release_dflash_drafter_handle(handle: UInt64):
     if handle == 0:
         return
-    var ptr = UnsafePointer[DFlashDrafter, MutExternalOrigin](
+    var ptr = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
         unsafe_from_address=Int(handle)
     )
     if ptr[0].w_fc != 0: cuda_free(ptr[0].w_fc)
     if ptr[0].w_hidden_norm != 0: cuda_free(ptr[0].w_hidden_norm)
     if ptr[0].w_norm != 0: cuda_free(ptr[0].w_norm)
+    if ptr[0].w_markov_1 != 0: cuda_free(ptr[0].w_markov_1)
+    if ptr[0].w_markov_2 != 0: cuda_free(ptr[0].w_markov_2)
     for layer in range(DFLASH_LAYERS):
         if ptr[0].w_qkv[layer] != 0: cuda_free(ptr[0].w_qkv[layer])
         if ptr[0].w_o[layer] != 0: cuda_free(ptr[0].w_o[layer])
@@ -1120,6 +1454,8 @@ def release_dflash_drafter_handle(handle: UInt64):
     if ptr[0].d_decode_ids != 0: cuda_free(ptr[0].d_decode_ids)
     if ptr[0].d_q4_scratch != 0: cuda_free(ptr[0].d_q4_scratch)
     if ptr[0].d_scores != 0: cuda_free(ptr[0].d_scores)
+    if ptr[0].d_markov_latent != 0: cuda_free(ptr[0].d_markov_latent)
+    if ptr[0].d_markov_bias != 0: cuda_free(ptr[0].d_markov_bias)
     cuda_sync()
     ptr.destroy_pointee()
     ptr.free()

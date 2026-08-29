@@ -16,8 +16,8 @@ out list. It manages its own temporary GPU buffers so callers don't have to.
 from std.ffi import external_call, c_int, c_float
 from std.memory import UnsafePointer, bitcast
 from std.collections import List
-from std.gpu.host import DeviceContext
-from std.gpu.host._nvidia_cuda import CUDA, CUstream
+from max.gpu.host import DeviceContext
+from max.gpu.host._nvidia_cuda import CUDA, CUstream
 
 from lib.cuda import cuda_malloc, cuda_free, cuda_sync, cuda_upload, cuda_upload_u16, cuda_download, cuda_memcpy
 from lib.cast_gpu_mojo import gpu_fp32_to_bf16_mojo

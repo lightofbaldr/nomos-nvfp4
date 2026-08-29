@@ -18,10 +18,11 @@ Reduction mirrors softmax_gpu_mojo's warp-shuffle + smem cross-warp pattern, ext
 argmax index alongside the max value.
 """
 
-from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx, block_dim, barrier
+from max.gpu.host import DeviceContext
+from std.gpu.primitives import thread_idx, block_idx, block_dim
+from max.gpu import barrier
 from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
-from std.gpu.memory import AddressSpace
+from max.gpu.memory import AddressSpace
 from std.memory import UnsafePointer
 from layout import row_major
 from layout import stack_allocation
