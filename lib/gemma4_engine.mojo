@@ -571,8 +571,27 @@ struct GemmaEngine(Movable):
             @parameter
             if HAS_LEARNED_QK_NORM:
                 if not HAS_LINEAR_ATTENTION or self.layer_is_full[layer]:
-                    q_norms_h.append(read_f32(p + "self_attn_q_norm_weight.bin"))
-                    k_norms_h.append(read_f32(p + "self_attn_k_norm_weight.bin"))
+                    var qn = read_f32(p + "self_attn_q_norm_weight.bin")
+                    var kn = read_f32(p + "self_attn_k_norm_weight.bin")
+                    # The original Qwen converter accidentally preserved the
+                    # checkpoint dots in these two filenames. Accept those
+                    # already-deployed artifacts, but never accept an empty or
+                    # wrong-sized learned norm again: zero Q/K silently turns
+                    # every full-attention island into uniform attention.
+                    @parameter
+                    if HAS_LINEAR_ATTENTION:
+                        if len(qn) == 0:
+                            qn = read_f32(p + "self_attn.q_norm_weight.bin")
+                        if len(kn) == 0:
+                            kn = read_f32(p + "self_attn.k_norm_weight.bin")
+                    var qk_norm_dim = (
+                        self.layer_qd[layer]
+                        if QK_NORM_FULL_VECTOR else self.layer_hd[layer]
+                    )
+                    if len(qn) != qk_norm_dim or len(kn) != qk_norm_dim:
+                        raise Error("learned Q/K norm artifact missing or wrong-sized")
+                    q_norms_h.append(qn^)
+                    k_norms_h.append(kn^)
                 else:
                     q_norms_h.append(List[Float32]())
                     k_norms_h.append(List[Float32]())

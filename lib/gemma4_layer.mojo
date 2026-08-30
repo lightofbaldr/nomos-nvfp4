@@ -466,6 +466,12 @@ def prepare_qkv_dev(
         else:
             gpu_rope_mojo(ctx, d_q, pos, l_nh, l_hd, ROPE_THETA_SLIDING, l_hd)
             gpu_rope_mojo(ctx, d_k_new, pos, l_nkv, l_hd, ROPE_THETA_SLIDING, l_hd)
+    if debug_out != 0 and debug_stage == 30:
+        ctx.synchronize()
+        cuda_memcpy(UInt64(debug_out), d_k_new, l_kvd * 4, 2)
+    elif debug_out != 0 and debug_stage == 31:
+        ctx.synchronize()
+        cuda_memcpy(UInt64(debug_out), d_v_new, l_kvd * 4, 2)
     return grouped_attn_gate
 
 
@@ -598,6 +604,19 @@ def prepare_qkv_batched(
         else:
             gpu_rope_batched_mojo(ctx, d_q, base_pos, S, l_nh, l_hd, ROPE_THETA_SLIDING, l_hd)
             gpu_rope_batched_mojo(ctx, d_k_new, base_pos, S, l_nkv, l_hd, ROPE_THETA_SLIDING, l_hd)
+    if debug_out != 0 and debug_row >= 0 and debug_row < S:
+        if debug_stage == 30:
+            ctx.synchronize()
+            cuda_memcpy(
+                UInt64(debug_out),
+                d_k_new + UInt64(debug_row * l_kvd * 4), l_kvd * 4, 2,
+            )
+        elif debug_stage == 31:
+            ctx.synchronize()
+            cuda_memcpy(
+                UInt64(debug_out),
+                d_v_new + UInt64(debug_row * l_kvd * 4), l_kvd * 4, 2,
+            )
     return attn_gate_ready
 
 
@@ -659,7 +678,19 @@ def apply_output_and_mlp_batched(
                 UInt64(debug_out),
                 d_attn_out + UInt64(debug_row * l_qd * 4), l_qd * 4, 2,
             )
+        if debug_out != 0 and debug_row >= 0 and debug_row < S and debug_stage == 27:
+            ctx.synchronize()
+            cuda_memcpy(
+                UInt64(debug_out),
+                d_attn_gate + UInt64(debug_row * l_qd * 4), l_qd * 4, 2,
+            )
         gpu_sigmoid_mul_inplace_mojo(ctx, d_attn_out, d_attn_gate, S * l_qd)
+        if debug_out != 0 and debug_row >= 0 and debug_row < S and debug_stage == 28:
+            ctx.synchronize()
+            cuda_memcpy(
+                UInt64(debug_out),
+                d_attn_out + UInt64(debug_row * l_qd * 4), l_qd * 4, 2,
+            )
         _mm_dev_batched(ctx, handle, d_o_out, d_attn_out, d_ow,
                         d_scratch_in_bf16, S, l_qd, d, d_q4_scratch,
                         g_o, ag_o, w4a4, layer_idx, "qwen_o_proj")
@@ -822,7 +853,13 @@ def apply_output_and_mlp_dev(
         if debug_out != 0 and debug_stage == 0:
             ctx.synchronize()
             cuda_memcpy(UInt64(debug_out), d_attn_out, l_qd * 4, 2)
+        if debug_out != 0 and debug_stage == 27:
+            ctx.synchronize()
+            cuda_memcpy(UInt64(debug_out), d_attn_gate, l_qd * 4, 2)
         gpu_sigmoid_mul_inplace_mojo(ctx, d_attn_out, d_attn_gate, l_qd)
+        if debug_out != 0 and debug_stage == 28:
+            ctx.synchronize()
+            cuda_memcpy(UInt64(debug_out), d_attn_out, l_qd * 4, 2)
         _mm_dev_batched(ctx, handle, d_o_out, d_attn_out, d_ow,
                         d_scratch_in_bf16, 1, l_qd, d, d_q4_scratch,
                         g_o, ag_o, w4a4, layer_idx, "qwen_o_proj")

@@ -1905,7 +1905,9 @@ def nomos_debug_omlp_stage_ab(
       In particular, a nonzero stage 25 characterizes the raw batched-prefill
       formulation; it is not a verdict on NOMOS_VERIFY_GDN_FAST_EXACT.  Gate
       that production verify route with GDN state parity and token identity.
-      26 post-Q-norm Q before RoPE [layer_qd].
+      26 post-Q-norm Q before RoPE [layer_qd], 27 raw embedded attention gate
+      [layer_qd], 28 post-sigmoid gated attention output [layer_qd],
+      30/31 current-row post-RoPE K / V [layer_kvd].
 
     out_i32: Int32[16]
       [0]=layer [1]=start_pos [2]=n_rows [3]=row [4]=stage [5]=token
@@ -1924,13 +1926,14 @@ def nomos_debug_omlp_stage_ab(
     # This debug A/B also serves as the real-prompt GDN stage dumper. Production
     # verify remains capped at MAX_VERIFY_ROWS; the probe may inspect a longer
     # prompt because it does not write the fixed verify-logits workspace.
-    if n_rows <= Int32(0) or n_rows > Int32(MAX_PROBE_TOKENS):
+    if n_rows <= Int32(0) or n_rows > Int32(512):
         return Int32(-1)
     if row_i < Int32(0) or row_i >= n_rows:
         return Int32(-1)
     if layer_i < Int32(0) or layer_i >= Int32(TOTAL_LAYERS):
         return Int32(-1)
-    if stage_i < Int32(0) or stage_i > Int32(26) or start_pos < Int32(0):
+    if (stage_i < Int32(0) or stage_i > Int32(31)
+            or stage_i == Int32(29) or start_pos < Int32(0)):
         return Int32(-1)
 
     var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](
@@ -1945,8 +1948,10 @@ def nomos_debug_omlp_stage_ab(
         _read_int32_array_into(tokens_ptr, rows, tokens)
 
         var dim = D
-        if stage == 0 or stage == 8 or stage == 26:
+        if stage == 0 or stage == 8 or stage == 26 or stage == 27 or stage == 28:
             dim = engine_ptr[0].layer_qd[layer]
+        elif stage == 30 or stage == 31:
+            dim = engine_ptr[0].layer_kvd[layer]
         elif stage == 13 or stage == 14 or stage == 20:
             dim = 6144
         elif stage == 19 or stage == 25:
@@ -2024,7 +2029,11 @@ def nomos_debug_omlp_stage_ab(
         if HAS_LINEAR_ATTENTION:
             engine_ptr[0].gdn_state.restore_verify_snapshot()
 
-        if row > 0:
+        # out_decode=-1 is the explicit production-prefill-only sentinel used
+        # by long-context stage dumps. It avoids replaying hundreds of decode
+        # steps merely to discard the comparison arm.
+        var batch_only = out_decode == Int64(-1)
+        if row > 0 and not batch_only:
             var tmp_logits = List[Float32](capacity=VOCAB)
             for _ in range(VOCAB):
                 tmp_logits.append(0.0)
@@ -2040,12 +2049,16 @@ def nomos_debug_omlp_stage_ab(
             for i in range(replay_start, row):
                 engine_ptr[0].step_logits(tokens[i], Int64(Int(tmp_logits.unsafe_ptr())))
 
-        engine_ptr[0].debug_decode_omlp_stage(
-            tokens[row],
-            layer,
-            stage,
-            Int64(Int(dec.unsafe_ptr())),
-        )
+        if batch_only:
+            for i in range(dim):
+                dec[i] = bat[i]
+        else:
+            engine_ptr[0].debug_decode_omlp_stage(
+                tokens[row],
+                layer,
+                stage,
+                Int64(Int(dec.unsafe_ptr())),
+            )
         engine_ptr[0].set_cache_len(Int(start_pos))
         @parameter
         if HAS_LINEAR_ATTENTION:
@@ -2082,7 +2095,7 @@ def nomos_debug_omlp_stage_ab(
                     first = i
                 count += 1
 
-        if out_decode != 0:
+        if out_decode > 0:
             var p = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(out_decode))
             for i in range(dim):
                 p[i] = dec[i]

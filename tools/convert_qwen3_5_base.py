@@ -116,7 +116,10 @@ def main() -> None:
             for lin in LINEARS_ATTN:
                 quant(T(pre + lin + ".weight"), stem(f"{i}.{lin}"))
             for nm in CENTERED_ATTN_NORMS:
-                center(pre + nm + ".weight", f"layers_{i}_{nm}_weight")
+                center(
+                    pre + nm + ".weight",
+                    f"layers_{i}_{nm.replace('.', '_')}_weight",
+                )
         if i % 8 == 0:
             print(f"  layer {i}/{n_layers} ({layer_types[i]})", flush=True)
 
