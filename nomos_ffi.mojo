@@ -30,6 +30,7 @@ from lib.model_config import (
     MODEL_ID, EAGLE3_TAPS, DRAFTER_EMBED_SQRT_SCALE, RMS_EPS_FINAL,
     HAS_LINEAR_ATTENTION, GDN_NUM_V_HEADS, GDN_KEY_HEAD_DIM,
     GDN_VALUE_HEAD_DIM, GDN_CONV_DIM, GDN_CONV_KERNEL,
+    MAX_PROBE_TOKENS,
 )
 from lib.gdn_scan import gpu_gdn_bf16_to_f32
 from lib.mtp_drafter import MTPDrafter, mtp_draft_k, release_mtp_drafter_handle
@@ -1920,7 +1921,10 @@ def nomos_debug_omlp_stage_ab(
     """
     if handle == 0 or tokens_ptr == 0 or out_i32 == 0:
         return Int32(-1)
-    if n_rows <= Int32(0) or n_rows > Int32(MAX_VERIFY_ROWS):
+    # This debug A/B also serves as the real-prompt GDN stage dumper. Production
+    # verify remains capped at MAX_VERIFY_ROWS; the probe may inspect a longer
+    # prompt because it does not write the fixed verify-logits workspace.
+    if n_rows <= Int32(0) or n_rows > Int32(MAX_PROBE_TOKENS):
         return Int32(-1)
     if row_i < Int32(0) or row_i >= n_rows:
         return Int32(-1)
