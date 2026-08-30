@@ -4,7 +4,7 @@ equal the host-stop loop token-for-token and stop on gemma eos {1,106} — no ba
 import os, ctypes as C, numpy as np
 from transformers import AutoTokenizer
 SO=os.environ["GEMMA_SO"]; WTS=os.environ["GEMMA_WEIGHTS"]
-tok=AutoTokenizer.from_pretrained("/home/adam/nomos_data/gemma-4-31b-it-bf16")
+tok=AutoTokenizer.from_pretrained(os.environ["TOK_DIR"])
 STOP={1,106}
 m=C.CDLL(SO)
 m.nomos_init.restype=C.c_int64; m.nomos_init.argtypes=[C.c_char_p]

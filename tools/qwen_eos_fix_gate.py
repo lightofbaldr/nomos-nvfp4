@@ -4,7 +4,7 @@ K1 (prefill+decode_step host-stop) token-for-token including the trailing eos. R
 import os, ctypes as C, numpy as np
 from transformers import AutoTokenizer
 SO=os.environ["QWEN_SO"]; WTS=os.environ["QWEN_WEIGHTS"]
-tok=AutoTokenizer.from_pretrained("/home/adam/nomos_data/qwen3_8_27b-base-bf16")
+tok=AutoTokenizer.from_pretrained(os.environ["TOK_DIR"])
 STOP={248046,248044}
 m=C.CDLL(SO)
 m.nomos_init.restype=C.c_int64; m.nomos_init.argtypes=[C.c_char_p]
