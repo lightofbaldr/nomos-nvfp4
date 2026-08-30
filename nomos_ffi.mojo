@@ -574,8 +574,9 @@ def nomos_generate(
     """Run prefill + decode. Returns the number of tokens written, or negative on error.
 
     Sampling params override the engine's per-request defaults: temperature < 0
-    keeps the current default (temperature == 0 means greedy); top_p / rep_penalty
-    <= 0 keep their defaults."""
+    keeps the current default (temperature == 0 means greedy); top_p <= 0 keeps
+    its default. Repetition penalty uses HF-style multiplicative semantics:
+    rep_penalty == 1.0 is OFF and, like <= 0, preserves the raw legacy path."""
     if handle == 0:
         return Int32(-1)
     if n_prompt <= 0 or max_new_tokens <= 0:
@@ -604,7 +605,9 @@ def nomos_generate(
         engine_ptr[0].reset_kv_cache()
         engine_ptr[0].run_inference(
             prompt, Int(max_new_tokens), False, out,
-            force_rep_penalty=rep_penalty > Float32(0.0),
+            force_rep_penalty=(
+                rep_penalty > Float32(0.0) and rep_penalty != Float32(1.0)
+            ),
         )
         engine_ptr[0].temp = saved_temp
         engine_ptr[0].top_p = saved_top_p
@@ -3301,7 +3304,9 @@ def nomos_generate_stream(
         engine_ptr[0].reset_kv_cache()
         engine_ptr[0].run_inference(
             prompt, Int(max_new_tokens), False, out, cb_id,
-            force_rep_penalty=rep_penalty > Float32(0.0),
+            force_rep_penalty=(
+                rep_penalty > Float32(0.0) and rep_penalty != Float32(1.0)
+            ),
         )
         engine_ptr[0].temp = saved_temp
         engine_ptr[0].top_p = saved_top_p
