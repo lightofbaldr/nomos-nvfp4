@@ -602,7 +602,10 @@ def nomos_generate(
         # append-only KV lengths and any recurrent GDN pools before prefill;
         # otherwise a reused handle leaks the previous request into this one.
         engine_ptr[0].reset_kv_cache()
-        engine_ptr[0].run_inference(prompt, Int(max_new_tokens), False, out)
+        engine_ptr[0].run_inference(
+            prompt, Int(max_new_tokens), False, out,
+            force_rep_penalty=rep_penalty > Float32(0.0),
+        )
         engine_ptr[0].temp = saved_temp
         engine_ptr[0].top_p = saved_top_p
         engine_ptr[0].rep_penalty = saved_rep
@@ -3296,7 +3299,10 @@ def nomos_generate_stream(
         # Streaming generation is also a complete independent request; it must
         # share nomos_generate/nomos_prefill's fresh-state contract.
         engine_ptr[0].reset_kv_cache()
-        engine_ptr[0].run_inference(prompt, Int(max_new_tokens), False, out, cb_id)
+        engine_ptr[0].run_inference(
+            prompt, Int(max_new_tokens), False, out, cb_id,
+            force_rep_penalty=rep_penalty > Float32(0.0),
+        )
         engine_ptr[0].temp = saved_temp
         engine_ptr[0].top_p = saved_top_p
         engine_ptr[0].rep_penalty = saved_rep

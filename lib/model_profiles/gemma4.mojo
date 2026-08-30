@@ -225,6 +225,8 @@ alias DRAFTER_EMBED_SQRT_SCALE = 1
 # Target-side output scalars.
 alias TARGET_SOFTCAP = 30.0
 alias TARGET_BOS_ID = 2
+alias TARGET_EOS_ID_0 = 1
+alias TARGET_EOS_ID_1 = 106
 
 # Target output multiplier, applied to logits before softcap.
 #

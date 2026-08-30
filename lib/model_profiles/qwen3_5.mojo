@@ -141,6 +141,10 @@ alias MLP_ACT_SILU = 1                  # hidden_act = silu.
 alias TARGET_SOFTCAP = 0.0              # 0 = disabled.
 alias TARGET_OUTPUT_MULTIPLIER = 1.0    # 1 = no scaling.
 alias TARGET_BOS_ID = 248044           # config bos_token_id (== eos_token_id 248044; pad_token_id = None).
+# Vendor generation_config stop set. 248046 is <|im_end|>; 248044 is
+# <|endoftext|>. Both terminate a complete response and must be emitted once.
+alias TARGET_EOS_ID_0 = 248046
+alias TARGET_EOS_ID_1 = 248044
 
 # ── RMS-norm epsilon (config rms_norm_eps = 1e-6, uniform — unlike Muse's per-site split) ─
 alias RMS_EPS_INPUT = 0.000001

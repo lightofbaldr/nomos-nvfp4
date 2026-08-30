@@ -973,11 +973,15 @@ struct GemmaEngine(Movable):
         store_mode: Bool,
         mut out_tokens: List[Int],
         cb_id: Int64 = Int64(0),
+        force_rep_penalty: Bool = False,
     ) raises:
         """Run prefill + decode (or store mode), appending generated token
         IDs to out_tokens. Body lives in lib/engine_decode.run_inference_impl;
         cb_id!=0 enables per-token Go streaming via nomos_token_cb."""
-        run_inference_impl(self, prompt, max_new_tokens, store_mode, out_tokens, cb_id)
+        run_inference_impl(
+            self, prompt, max_new_tokens, store_mode, out_tokens, cb_id,
+            force_rep_penalty=force_rep_penalty,
+        )
 
     def prefill_logits(mut self, prompt: List[Int], logits_out: Int64) raises:
         """Logits-engine path (Python host): prefill `prompt`, write the last-position

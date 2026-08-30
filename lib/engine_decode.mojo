@@ -20,6 +20,7 @@ from lib.q4_gemv_dp4a import gpu_matmul_q4_dp4a_dev, act_precision   # dp4a Q4 l
 from lib.gemma4_ops import rmsnorm, rmsnorm_no_weight
 from lib.model_config import (
     EMBED_RMSNORM, EMBED_SQRT_SCALE, RMS_EPS_INPUT, RMS_EPS_FINAL, TARGET_BOS_ID,
+    TARGET_EOS_ID_0, TARGET_EOS_ID_1,
     TARGET_OUTPUT_MULTIPLIER, TARGET_SOFTCAP, HAS_LINEAR_ATTENTION,
     ATTENTION_SCORE_SCALE,
 )
@@ -66,6 +67,7 @@ def run_inference_impl(
     debug_omlp_layer: Int = -1,
     debug_omlp_stage: Int = -1,
     debug_omlp_out: Int64 = 0,
+    force_rep_penalty: Bool = False,
 ) raises:
     """Run prefill + decode (or store mode). Appends generated token IDs
     to out_tokens.
@@ -996,7 +998,10 @@ def run_inference_impl(
         # masks are not merely wrong here: their 255999+ indices exceed VOCAB=202048.
         # Keep only model-agnostic optional repetition handling in this legacy sampler.
         var raw_sampling = _env_float("NOMOS_RAW_SAMPLING", 1.0) > Float32(0.5)
-        if pos >= prompt_end and not raw_sampling:
+        # The public generate APIs promise that an explicit repetition-penalty
+        # argument is operative. Raw sampling still suppresses the engine's
+        # optional default policy, but must not silently discard a caller override.
+        if pos >= prompt_end and (not raw_sampling or force_rep_penalty):
             # Greedy decoding is more vulnerable to repetition loops than
             # sampling (no diversity to break out). Floor the effective
             # rep_penalty at 1.5 when we're in the greedy regime, regardless
@@ -1111,7 +1116,11 @@ def run_inference_impl(
                 if stop != 0:
                     break
 
-            if bi == 200001:
+            # Emit-then-stop: out_tokens and the streaming callback both observe
+            # the profile EOS, then generation returns without a post-EOS tail.
+            if bi == TARGET_EOS_ID_0 or (
+                TARGET_EOS_ID_1 >= 0 and bi == TARGET_EOS_ID_1
+            ):
                 break
 
 
