@@ -24,7 +24,7 @@ if [ -d "$CODE/.git" ]; then
   rem=$(git -C "$CODE" rev-parse --short "origin/$BRANCH" 2>/dev/null)
   if [ -n "$rem" ] && [ "$cur" = "$rem" ]; then ok "$br ($cur) == origin/$BRANCH"
   else warn "$br ($cur) != origin/$BRANCH ($rem)  ← DRIFT: git checkout $BRANCH && git pull"; fi
-else bad "$CODE missing — clone: git clone <forgejo>/nomos-kernel.git $CODE"; fi
+else bad "$CODE missing — clone: git clone https://github.com/lightofbaldr/nomos-nvfp4.git $CODE"; fi
 if [ -f "$CODE/libnomos_kernel.so" ]; then
   ok ".so built $(stat -c '%y' "$CODE/libnomos_kernel.so" 2>/dev/null | cut -d. -f1)"
 else warn ".so not built on this box (build for its GPU arch)"; fi
