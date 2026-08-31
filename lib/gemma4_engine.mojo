@@ -584,11 +584,15 @@ struct GemmaEngine(Movable):
                             qn = read_f32(p + "self_attn.q_norm_weight.bin")
                         if len(kn) == 0:
                             kn = read_f32(p + "self_attn.k_norm_weight.bin")
-                    var qk_norm_dim = (
+                    var q_norm_dim = (
                         self.layer_qd[layer]
                         if QK_NORM_FULL_VECTOR else self.layer_hd[layer]
                     )
-                    if len(qn) != qk_norm_dim or len(kn) != qk_norm_dim:
+                    var k_norm_dim = (
+                        self.layer_kvd[layer]
+                        if QK_NORM_FULL_VECTOR else self.layer_hd[layer]
+                    )
+                    if len(qn) != q_norm_dim or len(kn) != k_norm_dim:
                         raise Error("learned Q/K norm artifact missing or wrong-sized")
                     q_norms_h.append(qn^)
                     k_norms_h.append(kn^)
