@@ -419,26 +419,24 @@ def rope_kernel(
     var head = block_idx.x
     var idx = thread_idx.x + block_idx.y * block_dim.x
     var rope_half = rope_dim // 2  # number of rotation pairs (= rope_angles)
-    var hd_half = hd // 2          # pair offset (matches JAX rotate_half split at head_dim/2)
     if head >= n_heads or idx >= rope_half:
         return
 
     var row_off = head * hd
     # Rotate-half convention to match HF/JAX Gemma-4 apply_rotary_pos_emb.
-    # Pair offset is hd/2 (the rotate_half split point), NOT rope_dim/2.
-    # Frequency denominator is hd (head_dim), NOT rope_dim. For sliding
-    # layers rope_dim == hd so these collapse to the same; for full-attn
-    # layers (proportional RoPE, rope_dim < hd) they differ.
-    var exponent = (2.0 * Float32(idx)) / Float32(hd)
+    # Partial RoPE is a self-contained leading slice: both the frequency
+    # basis and rotate-half pairing are defined by rope_dim.  Using hd here
+    # silently mixed Qwen's [:32] with [128:160] for its 64-of-256 slice.
+    var exponent = (2.0 * Float32(idx)) / Float32(rope_dim)
     var ln_theta = log(theta)
     var inv_freq = exp(-exponent * ln_theta)
     var angle = Float32(pos) * inv_freq
     var c = cos(angle)
     var s = sin(angle)
     var a = x[row_off + idx]
-    var b = x[row_off + idx + hd_half]
+    var b = x[row_off + idx + rope_half]
     x[row_off + idx]            = a * c - b * s
-    x[row_off + idx + hd_half]  = a * s + b * c
+    x[row_off + idx + rope_half]  = a * s + b * c
 
 
 def gpu_rope_mojo(ctx: DeviceContext, d_x: UInt64, pos: Int, n_heads: Int,
@@ -474,21 +472,20 @@ def rope_kernel_batched(
     var head = block_idx.x
     var idx = thread_idx.x + block_idx.y * block_dim.x
     var rope_half = rope_dim // 2
-    var hd_half = hd // 2
     if token >= S or head >= n_heads or idx >= rope_half:
         return
     var pos = base_pos + token
     var row_off = (token * n_heads + head) * hd
-    var exponent = (2.0 * Float32(idx)) / Float32(hd)
+    var exponent = (2.0 * Float32(idx)) / Float32(rope_dim)
     var ln_theta = log(theta)
     var inv_freq = exp(-exponent * ln_theta)
     var angle = Float32(pos) * inv_freq
     var c = cos(angle)
     var s = sin(angle)
     var a = x[row_off + idx]
-    var b = x[row_off + idx + hd_half]
+    var b = x[row_off + idx + rope_half]
     x[row_off + idx]           = a * c - b * s
-    x[row_off + idx + hd_half] = a * s + b * c
+    x[row_off + idx + rope_half] = a * s + b * c
 
 
 def gpu_rope_batched_mojo(ctx: DeviceContext, d_x: UInt64, base_pos: Int, S: Int,
