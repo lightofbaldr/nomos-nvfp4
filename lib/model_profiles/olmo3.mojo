@@ -4,7 +4,7 @@
 alias PROFILE_COMPLETE = 1
 alias MODEL_ID = 4
 alias MODEL_NAME = "olmo-3.1-32b-instruct"
-alias SERVE_PROTOCOL = 0
+alias SERVE_PROTOCOL = 3  # ChatML (im_start/im_end) — same wire format the qwen protocol implements
 alias SERVE_MODEL_NAME = "allenai/Olmo-3.1-32B-Instruct"
 
 alias D = 5120

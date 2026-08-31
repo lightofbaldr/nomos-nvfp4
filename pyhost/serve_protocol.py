@@ -377,6 +377,12 @@ class QwenServeProtocol:
             if tid is not None:
                 stop.add(tid)
         self.stop_ids = sorted(t for t in stop if t is not None)
+        # ChatML models differ on reasoning: qwen3's template branches on enable_thinking and
+        # pre-fills a <think> opener; olmo3's ignores the flag and answers plainly. Starting the
+        # stream in the think phase against a template that never opens a think block suppresses
+        # the ENTIRE reply (no </think> ever arrives), so thinking is only honoured when the
+        # template can actually render it.
+        self.supports_thinking = "enable_thinking" in (getattr(tokenizer, "chat_template", None) or "")
 
     @staticmethod
     def normalize(messages: list[dict]) -> list[dict]:
@@ -388,10 +394,9 @@ class QwenServeProtocol:
         del thinking  # qwen thinking is driven by the template's enable_thinking flag, not a suffix
         return rendered
 
-    @staticmethod
-    def resolve_thinking(requested: bool, force_tool: bool) -> bool:
+    def resolve_thinking(self, requested: bool, force_tool: bool) -> bool:
         del force_tool
-        return requested
+        return requested and self.supports_thinking
 
 
 def load_serve_protocol(tokenizer, profile_id: int):
