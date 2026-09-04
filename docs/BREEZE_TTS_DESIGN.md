@@ -17,9 +17,16 @@ CSM-lineage composite, four sub-models (~3.5B total, bf16 ≈ 7GB):
    prefix features (the `nomos_prefill_mm` pattern).
 3. **Depth decoder** — "llama-100M": 12L, hidden 1024, max_pos 33; per-frame inner AR across
    16 codebooks (audio_vocab 2051/codebook). Same .so as backbone (drafter-scale).
-4. **Mimi codec decoder** (kyutai/mimi) — conv/transformer, upsampling [8,6,5,4], 24kHz,
-   16-of-32 quantizers. **Standalone .so** (vision-encoder pattern, zero blast radius).
-   Streaming decode per frame for TTFA.
+4. **Audio codec decoder — Qwen3TTSTokenizerV2** (bundled `audio_tokenizer/`, 651MB; loaded via
+   the `qwen-tts` package). CORRECTED 2026-09-04, found by Codex pre-build: the top-level
+   `codec_config` (kyutai/mimi) is a legacy/training fallback the shipped inference path never
+   uses — `breeze_infer/runtime.py` REQUIRES the bundled artifact (raises without it) and all
+   generated codes decode through `audio_tokenizer.decode`. Real geometry: latent 1024,
+   decoder_dim 1536, 16 heads, 16 quantizers, pre-conv 512→1024, 8L pre-transformer (hidden
+   512), upsample_rates [8,5,4,3] + upsampling_ratios [2,2], transposed-conv/residual stack.
+   **Standalone .so** (vision-encoder pattern, zero blast radius); streaming decode per frame
+   for TTFA. M1 authority = bundled `audio_tokenizer/{config.json,model.safetensors}` + the
+   `audio_tokenizer.decode` path as oracle.
 
 CFG (voice design/direction): conditional + unconditional decode per step with logit mixing
 (`--cfg-scale`), clone path runs without CFG. Vocal events are plain text tokens.
