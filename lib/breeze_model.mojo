@@ -118,7 +118,7 @@ def bm_depth_inputs(ids:UnsafePointer[Int64,MutAnyOrigin],backbone:UnsafePointer
         if p==0:output[i]=backbone[d]
         else:var tok=Int(ids[p-1]);output[i]=Float32(table[((p-1)*DD_V+tok)*BB_D+d])
 
-def bm_depth_rope(x:UnsafePointer[Float32,MutAnyOrigin],rows:Int32,heads:Int32):
+def bm_depth_rope(x:UnsafePointer[Float32,MutAnyOrigin],rows:Int32,heads:Int32,start:Int32):
     var half=DD_HD//2;var i=Int(block_idx.x)*Int(block_dim.x)+Int(thread_idx.x)
     if i>=Int(rows)*Int(heads)*half:return
     var p=i//(Int(heads)*half);var hp=i%(Int(heads)*half);var h=hp//half;var d=hp%half;var o=(p*Int(heads)+h)*DD_HD
@@ -126,7 +126,18 @@ def bm_depth_rope(x:UnsafePointer[Float32,MutAnyOrigin],rows:Int32,heads:Int32):
     if wavelength>low:inv=base/Float32(32)
     elif wavelength>=high:
         var smooth=(Float32(16)/wavelength-Float32(0.001953125))/(Float32(0.0078125)-Float32(0.001953125));inv=(Float32(1)-smooth)*base/Float32(32)+smooth*base
-    var angle=Float32(p)*inv;var c=cos(angle);var s=sin(angle);var lo=o+d;var hi=lo+half;var u=x[lo];var v=x[hi];x[lo]=_mr(u*c-v*s);x[hi]=_mr(v*c+u*s)
+    var angle=Float32(Int(start)+p)*inv;var c=cos(angle);var s=sin(angle);var lo=o+d;var hi=lo+half;var u=x[lo];var v=x[hi];x[lo]=_mr(u*c-v*s);x[hi]=_mr(v*c+u*s)
+
+def bm_depth_two_inputs(ids:UnsafePointer[Int64,MutAnyOrigin],backbone:UnsafePointer[Float32,MutAnyOrigin],table:UnsafePointer[Scalar[DType.bfloat16],MutAnyOrigin],output:UnsafePointer[Float32,MutAnyOrigin]):
+    var i=Int(block_idx.x)*Int(block_dim.x)+Int(thread_idx.x)
+    if i<2*BB_D:
+        var p=i//BB_D;var d=i%BB_D
+        if p==0:output[i]=backbone[d]
+        else:output[i]=Float32(table[(Int(ids[0]))*BB_D+d])
+
+def bm_depth_one_input(ids:UnsafePointer[Int64,MutAnyOrigin],cb:Int32,table:UnsafePointer[Scalar[DType.bfloat16],MutAnyOrigin],output:UnsafePointer[Float32,MutAnyOrigin]):
+    var d=Int(block_idx.x)*Int(block_dim.x)+Int(thread_idx.x)
+    if d<BB_D:output[d]=Float32(table[(Int(cb)*DD_V+Int(ids[Int(cb)]))*BB_D+d])
 
 def bm_depth_head(hidden:UnsafePointer[Float32,MutAnyOrigin],weights:UnsafePointer[Scalar[DType.bfloat16],MutAnyOrigin],output:UnsafePointer[Float32,MutAnyOrigin]):
     var i=Int(block_idx.x)*Int(block_dim.x)+Int(thread_idx.x)
@@ -134,6 +145,13 @@ def bm_depth_head(hidden:UnsafePointer[Float32,MutAnyOrigin],weights:UnsafePoint
         var cb=i//DD_V;var token=i%DD_V;var z=Float32(0);var ho=(cb+1)*DD_D;var wo=(cb*DD_D*DD_V)+token
         for d in range(DD_D):z+=hidden[ho+d]*Float32(weights[wo+d*DD_V])
         output[i]=z
+
+def bm_depth_head_one(hidden:UnsafePointer[Float32,MutAnyOrigin],weights:UnsafePointer[Scalar[DType.bfloat16],MutAnyOrigin],cb:Int32,output:UnsafePointer[Float32,MutAnyOrigin]):
+    var token=Int(block_idx.x)*Int(block_dim.x)+Int(thread_idx.x)
+    if token<DD_V:
+        var z=Float32(0);var wo=Int(cb)*DD_D*DD_V+token
+        for d in range(DD_D):z+=hidden[d]*Float32(weights[wo+d*DD_V])
+        output[token]=z
 
 struct BMWeights(Movable):
     var q:List[UInt64];var k:List[UInt64];var v:List[UInt64];var o:List[UInt64];var qn:List[UInt64];var kn:List[UInt64];var ni:List[UInt64];var np:List[UInt64];var g:List[UInt64];var u:List[UInt64];var d:List[UInt64];var norm:UInt64;var head:UInt64;var audio:UInt64
@@ -194,12 +212,12 @@ struct BreezeModel(Movable):
 
     def step(mut self,lane:Int,codes_host:UInt64,lm_host:UInt64,depth_host:UInt64) raises:
         if lane<0 or lane>1:raise Error("invalid Breeze lane")
-        self.depth(codes_host,self.lanes[lane].last_hidden,depth_host)
+        self.depth_sequential(codes_host,self.lanes[lane].last_hidden,depth_host)
         var ids=cuda_malloc(CB*8);var x=cuda_malloc(BB_D*4);cuda_memcpy(ids,codes_host,CB*8,1);var ef=self.ctx.compile_function[bm_embed_frame]();self.ctx.enqueue_function(ef,_mi64(ids),_mbf16(self.w.audio),_mf32(x),grid_dim=(BB_D+255)//256,block_dim=256);self._run(lane,x,1,0,0,lm_host,0);cuda_free(x);cuda_free(ids)
 
     def depth_lane(mut self,lane:Int,codes_host:UInt64,depth_host:UInt64) raises:
         if lane<0 or lane>1:raise Error("invalid Breeze lane")
-        self.depth(codes_host,self.lanes[lane].last_hidden,depth_host)
+        self.depth_sequential(codes_host,self.lanes[lane].last_hidden,depth_host)
 
     def depth(mut self,codes_host:UInt64,backbone_host:UInt64,logits_host:UInt64) raises:
         var S=CB;var T=256;var he=S*DD_D;var qe=S*DD_QD;var ke=S*DD_KVD;var fe=S*DD_FF
@@ -207,9 +225,27 @@ struct BreezeModel(Movable):
         cuda_memcpy(ids,codes_host,CB*8,1);cuda_memcpy(bh,backbone_host,BB_D*4,1);var inf=self.ctx.compile_function[bm_depth_inputs]();self.ctx.enqueue_function(inf,_mi64(ids),_mf32(bh),_mbf16(self.w.audio),_mf32(raw),grid_dim=(CB*BB_D+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,x,raw,self.dw.project,bf,S,BB_D,DD_D)
         var rms=self.ctx.compile_function[bm_rms]();var rope=self.ctx.compile_function[bm_depth_rope]();var skv=self.ctx.compile_function[bm_store_kv]();var att=self.ctx.compile_function[bm_attn]();var add=self.ctx.compile_function[bm_add]();var sw=self.ctx.compile_function[bm_swiglu]()
         for l in range(DD_L):
-            self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.ni[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,q,n,self.dw.q[l],bf,S,DD_D,DD_QD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,k,n,self.dw.k[l],bf,S,DD_D,DD_KVD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,v,n,self.dw.v[l],bf,S,DD_D,DD_KVD);self.ctx.enqueue_function(rope,_mf32(q),Int32(S),Int32(DD_NH),grid_dim=(S*DD_NH*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(rope,_mf32(k),Int32(S),Int32(DD_NKV),grid_dim=(S*DD_NKV*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(skv,_mf32(k),_mf32(v),_mf32(kc),_mf32(vc),Int32(S),Int32(0),Int32(DD_KVD),grid_dim=(ke+T-1)//T,block_dim=T);self.ctx.enqueue_function(att,_mf32(q),_mf32(kc),_mf32(vc),_mf32(a),Int32(S),Int32(0),Int32(DD_NH),Int32(DD_NKV),grid_dim=S*DD_NH,block_dim=128);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,a,self.dw.o[l],bf,S,DD_QD,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T);self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.np[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,g,n,self.dw.g[l],bf,S,DD_D,DD_FF);gpu_matmul_bf16_dev_batched(self.ctx,self.h,up,n,self.dw.u[l],bf,S,DD_D,DD_FF);self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,g,self.dw.d[l],bf,S,DD_FF,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
+            self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.ni[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,q,n,self.dw.q[l],bf,S,DD_D,DD_QD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,k,n,self.dw.k[l],bf,S,DD_D,DD_KVD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,v,n,self.dw.v[l],bf,S,DD_D,DD_KVD);self.ctx.enqueue_function(rope,_mf32(q),Int32(S),Int32(DD_NH),Int32(0),grid_dim=(S*DD_NH*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(rope,_mf32(k),Int32(S),Int32(DD_NKV),Int32(0),grid_dim=(S*DD_NKV*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(skv,_mf32(k),_mf32(v),_mf32(kc),_mf32(vc),Int32(S),Int32(0),Int32(DD_KVD),grid_dim=(ke+T-1)//T,block_dim=T);self.ctx.enqueue_function(att,_mf32(q),_mf32(kc),_mf32(vc),_mf32(a),Int32(S),Int32(0),Int32(DD_NH),Int32(DD_NKV),grid_dim=S*DD_NH,block_dim=128);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,a,self.dw.o[l],bf,S,DD_QD,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T);self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.np[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,g,n,self.dw.g[l],bf,S,DD_D,DD_FF);gpu_matmul_bf16_dev_batched(self.ctx,self.h,up,n,self.dw.u[l],bf,S,DD_D,DD_FF);self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,g,self.dw.d[l],bf,S,DD_FF,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
         self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.norm),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);var hf=self.ctx.compile_function[bm_depth_head]();self.ctx.enqueue_function(hf,_mf32(n),_mbf16(self.dw.head),_mf32(lo),grid_dim=(15*DD_V+T-1)//T,block_dim=T);self.ctx.synchronize();cuda_memcpy(logits_host,lo,15*DD_V*4,2)
         cuda_free(lo);cuda_free(vc);cuda_free(kc);cuda_free(bf);cuda_free(up);cuda_free(g);cuda_free(u);cuda_free(a);cuda_free(v);cuda_free(k);cuda_free(q);cuda_free(n);cuda_free(x);cuda_free(raw);cuda_free(bh);cuda_free(ids)
+
+    def _depth_pass(mut self,x:UInt64,S:Int,start:Int,kcbase:UInt64,vcbase:UInt64,n:UInt64,q:UInt64,k:UInt64,v:UInt64,a:UInt64,u:UInt64,g:UInt64,up:UInt64,bf:UInt64,run_layers:Int=DD_L) raises:
+        var T=256;var he=S*DD_D;var qe=S*DD_QD;var ke=S*DD_KVD;var fe=S*DD_FF
+        var rms=self.ctx.compile_function[bm_rms]();var rope=self.ctx.compile_function[bm_depth_rope]();var skv=self.ctx.compile_function[bm_store_kv]();var att=self.ctx.compile_function[bm_attn]();var add=self.ctx.compile_function[bm_add]();var sw=self.ctx.compile_function[bm_swiglu]()
+        for l in range(run_layers):
+            var kc=kcbase+UInt64(l*CB*DD_KVD*4);var vc=vcbase+UInt64(l*CB*DD_KVD*4)
+            self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.ni[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,q,n,self.dw.q[l],bf,S,DD_D,DD_QD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,k,n,self.dw.k[l],bf,S,DD_D,DD_KVD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,v,n,self.dw.v[l],bf,S,DD_D,DD_KVD);self.ctx.enqueue_function(rope,_mf32(q),Int32(S),Int32(DD_NH),Int32(start),grid_dim=(S*DD_NH*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(rope,_mf32(k),Int32(S),Int32(DD_NKV),Int32(start),grid_dim=(S*DD_NKV*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(skv,_mf32(k),_mf32(v),_mf32(kc),_mf32(vc),Int32(S),Int32(start),Int32(DD_KVD),grid_dim=(ke+T-1)//T,block_dim=T);self.ctx.enqueue_function(att,_mf32(q),_mf32(kc),_mf32(vc),_mf32(a),Int32(S),Int32(start),Int32(DD_NH),Int32(DD_NKV),grid_dim=S*DD_NH,block_dim=128);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,a,self.dw.o[l],bf,S,DD_QD,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T);self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.np[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,g,n,self.dw.g[l],bf,S,DD_D,DD_FF);gpu_matmul_bf16_dev_batched(self.ctx,self.h,up,n,self.dw.u[l],bf,S,DD_D,DD_FF);self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,g,self.dw.d[l],bf,S,DD_FF,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
+        if run_layers==DD_L:self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.norm),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1)
+
+    def depth_sequential(mut self,codes_host:UInt64,backbone_dev:UInt64,logits_host:UInt64) raises:
+        var T=256;var ids=cuda_malloc(CB*8);cuda_memcpy(ids,codes_host,CB*8,1)
+        var raw=cuda_malloc(2*BB_D*4);var x=cuda_malloc(2*DD_D*4);var n=cuda_malloc(2*DD_D*4);var q=cuda_malloc(2*DD_QD*4);var k=cuda_malloc(2*DD_KVD*4);var v=cuda_malloc(2*DD_KVD*4);var a=cuda_malloc(2*DD_QD*4);var u=cuda_malloc(2*DD_D*4);var g=cuda_malloc(2*DD_FF*4);var up=cuda_malloc(2*DD_FF*4);var bf=cuda_malloc(2*DD_FF*2);var one=cuda_malloc(DD_V*4)
+        var kcbase=cuda_malloc(DD_L*CB*DD_KVD*4);var vcbase=cuda_malloc(DD_L*CB*DD_KVD*4)
+        var head=self.ctx.compile_function[bm_depth_head_one]();var inf=self.ctx.compile_function[bm_depth_two_inputs]();self.ctx.enqueue_function(inf,_mi64(ids),_mf32(backbone_dev),_mbf16(self.w.audio),_mf32(raw),grid_dim=(2*BB_D+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,x,raw,self.dw.project,bf,2,BB_D,DD_D);self._depth_pass(x,2,0,kcbase,vcbase,n,q,k,v,a,u,g,up,bf);self.ctx.enqueue_function(head,_mf32(n+UInt64(DD_D*4)),_mbf16(self.dw.head),Int32(0),_mf32(one),grid_dim=(DD_V+T-1)//T,block_dim=T);self.ctx.synchronize();cuda_memcpy(logits_host,one,DD_V*4,2)
+        var onein=self.ctx.compile_function[bm_depth_one_input]()
+        for cb in range(1,15):
+            self.ctx.enqueue_function(onein,_mi64(ids),Int32(cb),_mbf16(self.w.audio),_mf32(raw),grid_dim=(BB_D+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,x,raw,self.dw.project,bf,1,BB_D,DD_D);self._depth_pass(x,1,cb+1,kcbase,vcbase,n,q,k,v,a,u,g,up,bf);self.ctx.enqueue_function(head,_mf32(n),_mbf16(self.dw.head),Int32(cb),_mf32(one),grid_dim=(DD_V+T-1)//T,block_dim=T);self.ctx.synchronize();cuda_memcpy(logits_host+UInt64(cb*DD_V*4),one,DD_V*4,2)
+        cuda_free(vcbase);cuda_free(kcbase);cuda_free(one);cuda_free(bf);cuda_free(up);cuda_free(g);cuda_free(u);cuda_free(a);cuda_free(v);cuda_free(k);cuda_free(q);cuda_free(n);cuda_free(x);cuda_free(raw);cuda_free(ids)
 
     def free(mut self):
         for l in range(BB_L):
