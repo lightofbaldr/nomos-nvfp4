@@ -8,7 +8,7 @@ machinery class is independently comparable before the waveform stack lands.
 
 from std.gpu import block_idx, block_dim, thread_idx
 from std.collections import List
-from std.math import exp, log, cos, sin, sqrt
+from std.math import exp, log, cos, sin, sqrt, erf
 from max.gpu import barrier
 from max.gpu.memory import AddressSpace
 from layout import row_major, stack_allocation
@@ -276,6 +276,135 @@ def codec_swiglu_kernel(
         gate[i] = (v / (Float32(1.0) + exp(-v))) * up[i]
 
 
+def codec_transconv2_kernel(
+    input: UnsafePointer[Float32, MutAnyOrigin],   # [1024,T]
+    weight: UnsafePointer[Float32, MutAnyOrigin], # [1024,1024,2] Cin,Cout,K
+    bias: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],  # [1024,2T]
+    frames_arg: Int32,
+):
+    var frames = Int(frames_arg)
+    var out_frames = frames * 2
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= LATENT_DIM * out_frames:
+        return
+    var oc = i // out_frames
+    var ot = i % out_frames
+    var tap = ot % 2
+    var it = ot // 2
+    var acc = bias[oc]
+    for ic in range(LATENT_DIM):
+        acc += input[ic * frames + it] * weight[(ic * LATENT_DIM + oc) * 2 + tap]
+    output[i] = acc
+
+
+def codec_depthwise7_kernel(
+    input: UnsafePointer[Float32, MutAnyOrigin],
+    weight: UnsafePointer[Float32, MutAnyOrigin], # [C,1,7]
+    bias: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],
+    frames_arg: Int32,
+    channels_arg: Int32,
+):
+    var frames = Int(frames_arg)
+    var channels = Int(channels_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= channels * frames:
+        return
+    var c = i // frames
+    var t = i % frames
+    var acc = bias[c]
+    for tap in range(7):
+        var source = t + tap - 6
+        if source >= 0:
+            acc += input[c * frames + source] * weight[c * 7 + tap]
+    output[i] = acc
+
+
+def codec_channel_to_row_kernel(
+    input: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],
+    frames_arg: Int32,
+    channels_arg: Int32,
+):
+    var frames = Int(frames_arg)
+    var channels = Int(channels_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < channels * frames:
+        var c = i // frames
+        var t = i % frames
+        output[t * channels + c] = input[i]
+
+
+def codec_row_to_channel_kernel(
+    input: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],
+    frames_arg: Int32,
+    channels_arg: Int32,
+):
+    var frames = Int(frames_arg)
+    var channels = Int(channels_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < channels * frames:
+        var c = i // frames
+        var t = i % frames
+        output[i] = input[t * channels + c]
+
+
+def codec_layernorm_kernel(
+    input: UnsafePointer[Float32, MutAnyOrigin],
+    weight: UnsafePointer[Float32, MutAnyOrigin],
+    bias: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],
+    frames_arg: Int32,
+    channels_arg: Int32,
+):
+    if Int(thread_idx.x) != 0:
+        return
+    var row = Int(block_idx.x)
+    var frames = Int(frames_arg)
+    var channels = Int(channels_arg)
+    if row >= frames:
+        return
+    var off = row * channels
+    var mean = Float32(0.0)
+    for c in range(channels):
+        mean += input[off + c]
+    mean /= Float32(channels)
+    var variance = Float32(0.0)
+    for c in range(channels):
+        var d = input[off + c] - mean
+        variance += d * d
+    variance /= Float32(channels)
+    var inv = Float32(1.0) / sqrt(variance + Float32(1.0e-6))
+    for c in range(channels):
+        output[off + c] = (input[off + c] - mean) * inv * weight[c] + bias[c]
+
+
+def codec_gelu_kernel(x: UnsafePointer[Float32, MutAnyOrigin], n_arg: Int32):
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(n_arg):
+        var v = x[i]
+        x[i] = Float32(0.5) * v * (Float32(1.0) + erf(v / Float32(1.4142135623730951)))
+
+
+def codec_convnext_finish_kernel(
+    residual: UnsafePointer[Float32, MutAnyOrigin], # [C,T]
+    update: UnsafePointer[Float32, MutAnyOrigin],   # [T,C]
+    gamma: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],   # [C,T]
+    frames_arg: Int32,
+    channels_arg: Int32,
+):
+    var frames = Int(frames_arg)
+    var channels = Int(channels_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < channels * frames:
+        var c = i // frames
+        var t = i % frames
+        output[i] = residual[i] + gamma[c] * update[t * channels + c]
+
+
 struct BreezeCodec:
     var ctx: DeviceContext
     var cublas: UInt64
@@ -300,6 +429,17 @@ struct BreezeCodec:
     var transformer_final_norm: UInt64
     var transformer_output_weight: UInt64
     var transformer_output_bias: UInt64
+    var up_trans_w: List[UInt64]
+    var up_trans_b: List[UInt64]
+    var up_dw_w: List[UInt64]
+    var up_dw_b: List[UInt64]
+    var up_norm_w: List[UInt64]
+    var up_norm_b: List[UInt64]
+    var up_pw1_w: List[UInt64]
+    var up_pw1_b: List[UInt64]
+    var up_pw2_w: List[UInt64]
+    var up_pw2_b: List[UInt64]
+    var up_gamma: List[UInt64]
 
     def __init__(out self, weights_dir: String) raises:
         self.ctx = DeviceContext()
@@ -367,6 +507,25 @@ struct BreezeCodec:
         self.transformer_final_norm = load_f32_file_to_gpu(prefix + "codec_pre_transformer_norm_weight.f32")
         self.transformer_output_weight = load_f32_file_to_gpu(prefix + "codec_pre_transformer_output_proj_weight.f32")
         self.transformer_output_bias = load_f32_file_to_gpu(prefix + "codec_pre_transformer_output_proj_bias.f32")
+        self.up_trans_w = List[UInt64](); self.up_trans_b = List[UInt64]()
+        self.up_dw_w = List[UInt64](); self.up_dw_b = List[UInt64]()
+        self.up_norm_w = List[UInt64](); self.up_norm_b = List[UInt64]()
+        self.up_pw1_w = List[UInt64](); self.up_pw1_b = List[UInt64]()
+        self.up_pw2_w = List[UInt64](); self.up_pw2_b = List[UInt64]()
+        self.up_gamma = List[UInt64]()
+        for stage in range(2):
+            var up = prefix + "codec_upsample_" + String(stage) + "_"
+            self.up_trans_w.append(load_f32_file_to_gpu(up + "0_conv_weight.f32"))
+            self.up_trans_b.append(load_f32_file_to_gpu(up + "0_conv_bias.f32"))
+            self.up_dw_w.append(load_f32_file_to_gpu(up + "1_dwconv_conv_weight.f32"))
+            self.up_dw_b.append(load_f32_file_to_gpu(up + "1_dwconv_conv_bias.f32"))
+            self.up_norm_w.append(load_f32_file_to_gpu(up + "1_norm_weight.f32"))
+            self.up_norm_b.append(load_f32_file_to_gpu(up + "1_norm_bias.f32"))
+            self.up_pw1_w.append(load_f32_file_to_gpu(up + "1_pwconv1_weight.f32"))
+            self.up_pw1_b.append(load_f32_file_to_gpu(up + "1_pwconv1_bias.f32"))
+            self.up_pw2_w.append(load_f32_file_to_gpu(up + "1_pwconv2_weight.f32"))
+            self.up_pw2_b.append(load_f32_file_to_gpu(up + "1_pwconv2_bias.f32"))
+            self.up_gamma.append(load_f32_file_to_gpu(up + "1_gamma.f32"))
 
     def run_frontend(
         mut self,
@@ -548,6 +707,96 @@ struct BreezeCodec:
         cuda_free(d_norm)
         cuda_free(d_x)
 
+    def run_upsample(
+        mut self,
+        input_host: UInt64,
+        frames: Int,
+        stage0_host: UInt64,
+        stage1_host: UInt64,
+    ) raises:
+        """Run the two x2 causal-transpose + ConvNeXt upsample stages."""
+        if frames <= 0 or frames > 2000:
+            raise Error("codec upsample frame count outside [1,2000]")
+        var threads = 256
+        var max_frames = frames * 4
+        var max_elems = LATENT_DIM * max_frames
+        var d_x = cuda_malloc(max_elems * 4)
+        var d_trans = cuda_malloc(max_elems * 4)
+        var d_dw = cuda_malloc(max_elems * 4)
+        var d_row = cuda_malloc(max_elems * 4)
+        var d_norm = cuda_malloc(max_elems * 4)
+        var d_pw1 = cuda_malloc(max_frames * 4096 * 4)
+        var d_pw2 = cuda_malloc(max_elems * 4)
+        var d_finished = cuda_malloc(max_elems * 4)
+        var d_input_row = cuda_malloc(frames * LATENT_DIM * 4)
+        cuda_memcpy(d_input_row, input_host, frames * LATENT_DIM * 4, 1)
+        var r2c = self.ctx.compile_function[codec_row_to_channel_kernel]()
+        self.ctx.enqueue_function(
+            r2c, _f32(d_input_row), _f32(d_x), Int32(frames), Int32(LATENT_DIM),
+            grid_dim=(frames * LATENT_DIM + threads - 1) // threads, block_dim=threads,
+        )
+        cuda_free(d_input_row)
+        var trans_fn = self.ctx.compile_function[codec_transconv2_kernel]()
+        var dw_fn = self.ctx.compile_function[codec_depthwise7_kernel]()
+        var c2r = self.ctx.compile_function[codec_channel_to_row_kernel]()
+        var ln_fn = self.ctx.compile_function[codec_layernorm_kernel]()
+        var gelu_fn = self.ctx.compile_function[codec_gelu_kernel]()
+        var finish_fn = self.ctx.compile_function[codec_convnext_finish_kernel]()
+        var bias_fn = self.ctx.compile_function[codec_add_bias_kernel]()
+        var current_frames = frames
+        for stage in range(2):
+            var next_frames = current_frames * 2
+            var elems = next_frames * LATENT_DIM
+            self.ctx.enqueue_function(
+                trans_fn, _f32(d_x), _f32(self.up_trans_w[stage]), _f32(self.up_trans_b[stage]),
+                _f32(d_trans), Int32(current_frames),
+                grid_dim=(elems + threads - 1) // threads, block_dim=threads,
+            )
+            self.ctx.enqueue_function(
+                dw_fn, _f32(d_trans), _f32(self.up_dw_w[stage]), _f32(self.up_dw_b[stage]),
+                _f32(d_dw), Int32(next_frames), Int32(LATENT_DIM),
+                grid_dim=(elems + threads - 1) // threads, block_dim=threads,
+            )
+            self.ctx.enqueue_function(
+                c2r, _f32(d_dw), _f32(d_row), Int32(next_frames), Int32(LATENT_DIM),
+                grid_dim=(elems + threads - 1) // threads, block_dim=threads,
+            )
+            self.ctx.enqueue_function(
+                ln_fn, _f32(d_row), _f32(self.up_norm_w[stage]), _f32(self.up_norm_b[stage]),
+                _f32(d_norm), Int32(next_frames), Int32(LATENT_DIM),
+                grid_dim=next_frames, block_dim=1,
+            )
+            cublas_sgemm(self.cublas, d_norm, self.up_pw1_w[stage], d_pw1, next_frames, LATENT_DIM, 4096)
+            self.ctx.enqueue_function(
+                bias_fn, _f32(d_pw1), _f32(self.up_pw1_b[stage]), Int32(next_frames), Int32(4096),
+                grid_dim=(next_frames * 4096 + threads - 1) // threads, block_dim=threads,
+            )
+            self.ctx.enqueue_function(
+                gelu_fn, _f32(d_pw1), Int32(next_frames * 4096),
+                grid_dim=(next_frames * 4096 + threads - 1) // threads, block_dim=threads,
+            )
+            cublas_sgemm(self.cublas, d_pw1, self.up_pw2_w[stage], d_pw2, next_frames, 4096, LATENT_DIM)
+            self.ctx.enqueue_function(
+                bias_fn, _f32(d_pw2), _f32(self.up_pw2_b[stage]), Int32(next_frames), Int32(LATENT_DIM),
+                grid_dim=(elems + threads - 1) // threads, block_dim=threads,
+            )
+            self.ctx.enqueue_function(
+                finish_fn, _f32(d_trans), _f32(d_pw2), _f32(self.up_gamma[stage]), _f32(d_finished),
+                Int32(next_frames), Int32(LATENT_DIM),
+                grid_dim=(elems + threads - 1) // threads, block_dim=threads,
+            )
+            self.ctx.synchronize()
+            if stage == 0:
+                cuda_memcpy(stage0_host, d_finished, elems * 4, 2)
+            else:
+                cuda_memcpy(stage1_host, d_finished, elems * 4, 2)
+            var swap = d_x
+            d_x = d_finished
+            d_finished = swap
+            current_frames = next_frames
+        cuda_free(d_finished); cuda_free(d_pw2); cuda_free(d_pw1); cuda_free(d_norm)
+        cuda_free(d_row); cuda_free(d_dw); cuda_free(d_trans); cuda_free(d_x)
+
     def free(mut self):
         for q in range(CODEBOOKS):
             if self.tables_host[q] != 0:
@@ -580,3 +829,10 @@ struct BreezeCodec:
         cuda_free(self.transformer_final_norm)
         cuda_free(self.transformer_output_weight)
         cuda_free(self.transformer_output_bias)
+        for stage in range(2):
+            cuda_free(self.up_trans_w[stage]); cuda_free(self.up_trans_b[stage])
+            cuda_free(self.up_dw_w[stage]); cuda_free(self.up_dw_b[stage])
+            cuda_free(self.up_norm_w[stage]); cuda_free(self.up_norm_b[stage])
+            cuda_free(self.up_pw1_w[stage]); cuda_free(self.up_pw1_b[stage])
+            cuda_free(self.up_pw2_w[stage]); cuda_free(self.up_pw2_b[stage])
+            cuda_free(self.up_gamma[stage])

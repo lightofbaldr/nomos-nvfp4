@@ -100,6 +100,28 @@ def nomos_breeze_codec_transformer(
 
 
 @export
+def nomos_breeze_codec_upsample(
+    handle: Int64,
+    input_ptr: Int64,
+    frames: Int32,
+    stage0_ptr: Int64,
+    stage1_ptr: Int64,
+) -> Int32:
+    """Debug/parity seam: [1,T,1024] -> [1,1024,2T] and [1,1024,4T]."""
+    if handle == 0 or input_ptr == 0 or stage0_ptr == 0 or stage1_ptr == 0:
+        return Int32(-1)
+    try:
+        var ptr = UnsafePointer[BreezeCodec, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+        ptr[0].run_upsample(
+            UInt64(input_ptr), Int(frames), UInt64(stage0_ptr), UInt64(stage1_ptr)
+        )
+        return Int32(0)
+    except e:
+        print("[nomos_breeze_codec_upsample EXC]", e)
+        return Int32(-99)
+
+
+@export
 def nomos_breeze_codec_free(handle: Int64) -> Int32:
     if handle == 0:
         return Int32(0)
