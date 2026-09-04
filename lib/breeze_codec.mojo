@@ -405,6 +405,93 @@ def codec_convnext_finish_kernel(
         output[i] = residual[i] + gamma[c] * update[t * channels + c]
 
 
+def codec_causal_conv_kernel(
+    input: UnsafePointer[Float32, MutAnyOrigin],
+    weight: UnsafePointer[Float32, MutAnyOrigin], # [Cout,Cin,K]
+    bias: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],
+    frames_arg: Int32,
+    in_channels_arg: Int32,
+    out_channels_arg: Int32,
+    kernel_arg: Int32,
+    dilation_arg: Int32,
+):
+    var frames = Int(frames_arg); var cin = Int(in_channels_arg)
+    var cout = Int(out_channels_arg); var kernel = Int(kernel_arg)
+    var dilation = Int(dilation_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= cout * frames: return
+    var oc = i // frames; var t = i % frames
+    var acc = bias[oc]
+    for ic in range(cin):
+        for tap in range(kernel):
+            var source = t + tap * dilation - (kernel - 1) * dilation
+            if source >= 0:
+                acc += input[ic * frames + source] * weight[(oc * cin + ic) * kernel + tap]
+    output[i] = acc
+
+
+def codec_transconv_kernel(
+    input: UnsafePointer[Float32, MutAnyOrigin],
+    weight: UnsafePointer[Float32, MutAnyOrigin], # [Cin,Cout,K]
+    bias: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],
+    in_frames_arg: Int32,
+    in_channels_arg: Int32,
+    out_channels_arg: Int32,
+    stride_arg: Int32,
+):
+    var tin = Int(in_frames_arg); var cin = Int(in_channels_arg)
+    var cout = Int(out_channels_arg); var stride = Int(stride_arg)
+    var kernel = 2 * stride; var tout = tin * stride
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= cout * tout: return
+    var oc = i // tout; var ot = i % tout
+    var acc = bias[oc]
+    for tap in range(kernel):
+        var source_numerator = ot - tap
+        if source_numerator >= 0 and source_numerator % stride == 0:
+            var it = source_numerator // stride
+            if it < tin:
+                for ic in range(cin):
+                    acc += input[ic * tin + it] * weight[(ic * cout + oc) * kernel + tap]
+    output[i] = acc
+
+
+def codec_snake_kernel(
+    input: UnsafePointer[Float32, MutAnyOrigin],
+    alpha_log: UnsafePointer[Float32, MutAnyOrigin],
+    beta_log: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],
+    frames_arg: Int32,
+    channels_arg: Int32,
+):
+    var frames = Int(frames_arg); var channels = Int(channels_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= channels * frames: return
+    var c = i // frames
+    var alpha = exp(alpha_log[c]); var beta = exp(beta_log[c])
+    var v = input[i]; var s = sin(v * alpha)
+    output[i] = v + (s * s) / (beta + Float32(1.0e-9))
+
+
+def codec_add_kernel(
+    residual: UnsafePointer[Float32, MutAnyOrigin],
+    update: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],
+    n_arg: Int32,
+):
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(n_arg): output[i] = residual[i] + update[i]
+
+
+def codec_clamp_kernel(x: UnsafePointer[Float32, MutAnyOrigin], n_arg: Int32):
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(n_arg):
+        if x[i] < -1.0: x[i] = -1.0
+        elif x[i] > 1.0: x[i] = 1.0
+
+
 struct BreezeCodec:
     var ctx: DeviceContext
     var cublas: UInt64
@@ -440,6 +527,15 @@ struct BreezeCodec:
     var up_pw2_w: List[UInt64]
     var up_pw2_b: List[UInt64]
     var up_gamma: List[UInt64]
+    var decoder_pre_w: UInt64; var decoder_pre_b: UInt64
+    var decoder_snake_a: List[UInt64]; var decoder_snake_b: List[UInt64]
+    var decoder_trans_w: List[UInt64]; var decoder_trans_b: List[UInt64]
+    var decoder_res_a1: List[UInt64]; var decoder_res_b1: List[UInt64]
+    var decoder_res_c1w: List[UInt64]; var decoder_res_c1b: List[UInt64]
+    var decoder_res_a2: List[UInt64]; var decoder_res_b2: List[UInt64]
+    var decoder_res_c2w: List[UInt64]; var decoder_res_c2b: List[UInt64]
+    var decoder_final_a: UInt64; var decoder_final_b: UInt64
+    var decoder_final_w: UInt64; var decoder_final_bias: UInt64
 
     def __init__(out self, weights_dir: String) raises:
         self.ctx = DeviceContext()
@@ -526,6 +622,34 @@ struct BreezeCodec:
             self.up_pw2_w.append(load_f32_file_to_gpu(up + "1_pwconv2_weight.f32"))
             self.up_pw2_b.append(load_f32_file_to_gpu(up + "1_pwconv2_bias.f32"))
             self.up_gamma.append(load_f32_file_to_gpu(up + "1_gamma.f32"))
+        self.decoder_pre_w = load_f32_file_to_gpu(prefix + "codec_decoder_0_conv_weight.f32")
+        self.decoder_pre_b = load_f32_file_to_gpu(prefix + "codec_decoder_0_conv_bias.f32")
+        self.decoder_snake_a = List[UInt64](); self.decoder_snake_b = List[UInt64]()
+        self.decoder_trans_w = List[UInt64](); self.decoder_trans_b = List[UInt64]()
+        self.decoder_res_a1 = List[UInt64](); self.decoder_res_b1 = List[UInt64]()
+        self.decoder_res_c1w = List[UInt64](); self.decoder_res_c1b = List[UInt64]()
+        self.decoder_res_a2 = List[UInt64](); self.decoder_res_b2 = List[UInt64]()
+        self.decoder_res_c2w = List[UInt64](); self.decoder_res_c2b = List[UInt64]()
+        for stage in range(4):
+            var dp = prefix + "codec_decoder_" + String(stage + 1) + "_block_"
+            self.decoder_snake_a.append(load_f32_file_to_gpu(dp + "0_alpha.f32"))
+            self.decoder_snake_b.append(load_f32_file_to_gpu(dp + "0_beta.f32"))
+            self.decoder_trans_w.append(load_f32_file_to_gpu(dp + "1_conv_weight.f32"))
+            self.decoder_trans_b.append(load_f32_file_to_gpu(dp + "1_conv_bias.f32"))
+            for unit in range(3):
+                var rp = dp + String(unit + 2) + "_"
+                self.decoder_res_a1.append(load_f32_file_to_gpu(rp + "act1_alpha.f32"))
+                self.decoder_res_b1.append(load_f32_file_to_gpu(rp + "act1_beta.f32"))
+                self.decoder_res_c1w.append(load_f32_file_to_gpu(rp + "conv1_conv_weight.f32"))
+                self.decoder_res_c1b.append(load_f32_file_to_gpu(rp + "conv1_conv_bias.f32"))
+                self.decoder_res_a2.append(load_f32_file_to_gpu(rp + "act2_alpha.f32"))
+                self.decoder_res_b2.append(load_f32_file_to_gpu(rp + "act2_beta.f32"))
+                self.decoder_res_c2w.append(load_f32_file_to_gpu(rp + "conv2_conv_weight.f32"))
+                self.decoder_res_c2b.append(load_f32_file_to_gpu(rp + "conv2_conv_bias.f32"))
+        self.decoder_final_a = load_f32_file_to_gpu(prefix + "codec_decoder_5_alpha.f32")
+        self.decoder_final_b = load_f32_file_to_gpu(prefix + "codec_decoder_5_beta.f32")
+        self.decoder_final_w = load_f32_file_to_gpu(prefix + "codec_decoder_6_conv_weight.f32")
+        self.decoder_final_bias = load_f32_file_to_gpu(prefix + "codec_decoder_6_conv_bias.f32")
 
     def run_frontend(
         mut self,
@@ -797,6 +921,109 @@ struct BreezeCodec:
         cuda_free(d_finished); cuda_free(d_pw2); cuda_free(d_pw1); cuda_free(d_norm)
         cuda_free(d_row); cuda_free(d_dw); cuda_free(d_trans); cuda_free(d_x)
 
+    def run_decoder(
+        mut self,
+        input_host: UInt64,
+        frames: Int,
+        pcm_host: UInt64,
+    ) raises:
+        """Run the causal waveform decoder from [1,1024,T] to [1,1920*T]."""
+        if frames <= 0 or frames > 1000:
+            raise Error("codec decoder frame count outside [1,1000]")
+        var threads = 256
+        var final_frames = frames * 8 * 5 * 4 * 3
+        var max_elems = 96 * final_frames
+        var d_input = cuda_malloc(LATENT_DIM * frames * 4)
+        var d_x = cuda_malloc(max_elems * 4)
+        var d_tmp = cuda_malloc(max_elems * 4)
+        var d_next = cuda_malloc(max_elems * 4)
+        var d_conv = cuda_malloc(max_elems * 4)
+        var d_tmp2 = cuda_malloc(max_elems * 4)
+        var d_pcm = cuda_malloc(final_frames * 4)
+        cuda_memcpy(d_input, input_host, LATENT_DIM * frames * 4, 1)
+        var conv_fn = self.ctx.compile_function[codec_causal_conv_kernel]()
+        var trans_fn = self.ctx.compile_function[codec_transconv_kernel]()
+        var snake_fn = self.ctx.compile_function[codec_snake_kernel]()
+        var add_fn = self.ctx.compile_function[codec_add_kernel]()
+        var clamp_fn = self.ctx.compile_function[codec_clamp_kernel]()
+        var pre_elems = 1536 * frames
+        self.ctx.enqueue_function(
+            conv_fn, _f32(d_input), _f32(self.decoder_pre_w), _f32(self.decoder_pre_b), _f32(d_x),
+            Int32(frames), Int32(LATENT_DIM), Int32(1536), Int32(7), Int32(1),
+            grid_dim=(pre_elems + threads - 1) // threads, block_dim=threads,
+        )
+        var current_frames = frames
+        var current_channels = 1536
+        for stage in range(4):
+            var stride = 8
+            if stage == 1: stride = 5
+            elif stage == 2: stride = 4
+            elif stage == 3: stride = 3
+            var next_channels = current_channels // 2
+            var next_frames = current_frames * stride
+            var current_elems = current_channels * current_frames
+            var next_elems = next_channels * next_frames
+            self.ctx.enqueue_function(
+                snake_fn, _f32(d_x), _f32(self.decoder_snake_a[stage]), _f32(self.decoder_snake_b[stage]),
+                _f32(d_tmp), Int32(current_frames), Int32(current_channels),
+                grid_dim=(current_elems + threads - 1) // threads, block_dim=threads,
+            )
+            self.ctx.enqueue_function(
+                trans_fn, _f32(d_tmp), _f32(self.decoder_trans_w[stage]), _f32(self.decoder_trans_b[stage]),
+                _f32(d_next), Int32(current_frames), Int32(current_channels), Int32(next_channels), Int32(stride),
+                grid_dim=(next_elems + threads - 1) // threads, block_dim=threads,
+            )
+            var swap_stage = d_x; d_x = d_next; d_next = swap_stage
+            current_frames = next_frames; current_channels = next_channels
+            for local_unit in range(3):
+                var unit = stage * 3 + local_unit
+                var dilation = 1
+                if local_unit == 1: dilation = 3
+                elif local_unit == 2: dilation = 9
+                self.ctx.enqueue_function(
+                    snake_fn, _f32(d_x), _f32(self.decoder_res_a1[unit]), _f32(self.decoder_res_b1[unit]),
+                    _f32(d_tmp), Int32(current_frames), Int32(current_channels),
+                    grid_dim=(next_elems + threads - 1) // threads, block_dim=threads,
+                )
+                self.ctx.enqueue_function(
+                    conv_fn, _f32(d_tmp), _f32(self.decoder_res_c1w[unit]), _f32(self.decoder_res_c1b[unit]), _f32(d_conv),
+                    Int32(current_frames), Int32(current_channels), Int32(current_channels), Int32(7), Int32(dilation),
+                    grid_dim=(next_elems + threads - 1) // threads, block_dim=threads,
+                )
+                self.ctx.enqueue_function(
+                    snake_fn, _f32(d_conv), _f32(self.decoder_res_a2[unit]), _f32(self.decoder_res_b2[unit]),
+                    _f32(d_tmp), Int32(current_frames), Int32(current_channels),
+                    grid_dim=(next_elems + threads - 1) // threads, block_dim=threads,
+                )
+                self.ctx.enqueue_function(
+                    conv_fn, _f32(d_tmp), _f32(self.decoder_res_c2w[unit]), _f32(self.decoder_res_c2b[unit]), _f32(d_tmp2),
+                    Int32(current_frames), Int32(current_channels), Int32(current_channels), Int32(1), Int32(1),
+                    grid_dim=(next_elems + threads - 1) // threads, block_dim=threads,
+                )
+                self.ctx.enqueue_function(
+                    add_fn, _f32(d_x), _f32(d_tmp2), _f32(d_conv), Int32(next_elems),
+                    grid_dim=(next_elems + threads - 1) // threads, block_dim=threads,
+                )
+                var swap_unit = d_x; d_x = d_conv; d_conv = swap_unit
+        self.ctx.enqueue_function(
+            snake_fn, _f32(d_x), _f32(self.decoder_final_a), _f32(self.decoder_final_b), _f32(d_tmp),
+            Int32(final_frames), Int32(96),
+            grid_dim=(final_frames * 96 + threads - 1) // threads, block_dim=threads,
+        )
+        self.ctx.enqueue_function(
+            conv_fn, _f32(d_tmp), _f32(self.decoder_final_w), _f32(self.decoder_final_bias), _f32(d_pcm),
+            Int32(final_frames), Int32(96), Int32(1), Int32(7), Int32(1),
+            grid_dim=(final_frames + threads - 1) // threads, block_dim=threads,
+        )
+        self.ctx.enqueue_function(
+            clamp_fn, _f32(d_pcm), Int32(final_frames),
+            grid_dim=(final_frames + threads - 1) // threads, block_dim=threads,
+        )
+        self.ctx.synchronize()
+        cuda_memcpy(pcm_host, d_pcm, final_frames * 4, 2)
+        cuda_free(d_pcm); cuda_free(d_tmp2); cuda_free(d_conv); cuda_free(d_next)
+        cuda_free(d_tmp); cuda_free(d_x); cuda_free(d_input)
+
     def free(mut self):
         for q in range(CODEBOOKS):
             if self.tables_host[q] != 0:
@@ -836,3 +1063,14 @@ struct BreezeCodec:
             cuda_free(self.up_pw1_w[stage]); cuda_free(self.up_pw1_b[stage])
             cuda_free(self.up_pw2_w[stage]); cuda_free(self.up_pw2_b[stage])
             cuda_free(self.up_gamma[stage])
+        cuda_free(self.decoder_pre_w); cuda_free(self.decoder_pre_b)
+        for stage in range(4):
+            cuda_free(self.decoder_snake_a[stage]); cuda_free(self.decoder_snake_b[stage])
+            cuda_free(self.decoder_trans_w[stage]); cuda_free(self.decoder_trans_b[stage])
+        for unit in range(12):
+            cuda_free(self.decoder_res_a1[unit]); cuda_free(self.decoder_res_b1[unit])
+            cuda_free(self.decoder_res_c1w[unit]); cuda_free(self.decoder_res_c1b[unit])
+            cuda_free(self.decoder_res_a2[unit]); cuda_free(self.decoder_res_b2[unit])
+            cuda_free(self.decoder_res_c2w[unit]); cuda_free(self.decoder_res_c2b[unit])
+        cuda_free(self.decoder_final_a); cuda_free(self.decoder_final_b)
+        cuda_free(self.decoder_final_w); cuda_free(self.decoder_final_bias)

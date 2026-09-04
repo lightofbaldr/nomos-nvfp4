@@ -122,6 +122,70 @@ def nomos_breeze_codec_upsample(
 
 
 @export
+def nomos_breeze_codec_decoder(
+    handle: Int64,
+    input_ptr: Int64,
+    frames: Int32,
+    pcm_ptr: Int64,
+) -> Int32:
+    """Decode [1,1024,T] channel-major into [1,1920*T] FP32 PCM."""
+    if handle == 0 or input_ptr == 0 or pcm_ptr == 0:
+        return Int32(-1)
+    try:
+        var ptr = UnsafePointer[BreezeCodec, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+        ptr[0].run_decoder(UInt64(input_ptr), Int(frames), UInt64(pcm_ptr))
+        return Int32(0)
+    except e:
+        print("[nomos_breeze_codec_decoder EXC]", e)
+        return Int32(-99)
+
+
+@export
+def nomos_breeze_codec_decode(
+    handle: Int64,
+    codes_ptr: Int64,
+    frames: Int32,
+    pcm_ptr: Int64,
+) -> Int32:
+    """Correctness-first one-shot [1,16,T] codes -> [1,1920*T] PCM."""
+    if handle == 0 or codes_ptr == 0 or pcm_ptr == 0 or frames <= 0:
+        return Int32(-1)
+    var T = Int(frames)
+    var quantized = alloc[Float32](512 * T)
+    var preconv = alloc[Float32](1024 * T)
+    var transformer_in = alloc[Float32](512 * T)
+    var layer0 = alloc[Float32](512 * T)
+    var layer7 = alloc[Float32](512 * T)
+    var transformer_out = alloc[Float32](1024 * T)
+    var up0 = alloc[Float32](1024 * T * 2)
+    var up1 = alloc[Float32](1024 * T * 4)
+    try:
+        var ptr = UnsafePointer[BreezeCodec, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+        ptr[0].run_frontend(
+            UInt64(codes_ptr), T, UInt64(Int(quantized)), UInt64(Int(preconv))
+        )
+        ptr[0].run_transformer_input(
+            UInt64(Int(preconv)), T, UInt64(Int(transformer_in))
+        )
+        ptr[0].run_transformer(
+            UInt64(Int(transformer_in)), T, UInt64(Int(layer0)), UInt64(Int(layer7)),
+            UInt64(Int(transformer_out)),
+        )
+        ptr[0].run_upsample(
+            UInt64(Int(transformer_out)), T, UInt64(Int(up0)), UInt64(Int(up1))
+        )
+        ptr[0].run_decoder(UInt64(Int(up1)), T * 4, UInt64(pcm_ptr))
+    except e:
+        print("[nomos_breeze_codec_decode EXC]", e)
+        quantized.free(); preconv.free(); transformer_in.free(); layer0.free()
+        layer7.free(); transformer_out.free(); up0.free(); up1.free()
+        return Int32(-99)
+    quantized.free(); preconv.free(); transformer_in.free(); layer0.free()
+    layer7.free(); transformer_out.free(); up0.free(); up1.free()
+    return Int32(0)
+
+
+@export
 def nomos_breeze_codec_free(handle: Int64) -> Int32:
     if handle == 0:
         return Int32(0)

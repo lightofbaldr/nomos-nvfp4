@@ -21,4 +21,5 @@ pixi run mojo build --emit shared-lib breeze_codec_ffi.mojo -o libnomos_codec-qw
   -Xlinker -lcudart -Xlinker -lcublas -Xlinker -lm
 nm -D libnomos_codec-qwen3_tts.so | grep nomos_breeze_codec_init
 nm -D libnomos_codec-qwen3_tts.so | grep nomos_breeze_codec_frontend
-echo "Breeze codec M1 frontend build green: libnomos_codec-qwen3_tts.so"
+nm -D libnomos_codec-qwen3_tts.so | grep nomos_breeze_codec_decode
+echo "Breeze codec M1 full decoder build green: libnomos_codec-qwen3_tts.so"
