@@ -61,6 +61,19 @@ def main():
     emit("codec_pre_conv_weight", t("decoder.pre_conv.conv.weight"))
     emit("codec_pre_conv_bias", t("decoder.pre_conv.conv.bias"))
 
+    # Everything else under decoder.* (pre_transformer / upsample / conv stack), raw fp32 LE,
+    # source layout preserved (ConvTranspose stays [Cin,Cout,K]), dots -> underscores.
+    done_prefixes = ("decoder.quantizer.rvq_first.vq", "decoder.quantizer.rvq_rest.vq",
+                     "decoder.quantizer.rvq_first.output_proj", "decoder.quantizer.rvq_rest.output_proj",
+                     "decoder.pre_conv.")
+    for key in f.keys():
+        if not key.startswith("decoder."):
+            continue
+        if any(key.startswith(p) for p in done_prefixes):
+            continue
+        name = "codec_" + key[len("decoder."):].replace(".", "_")
+        emit(name, t(key))
+
     with open(f"{OUT}/MANIFEST.json", "w") as m:
         json.dump(manifest, m, indent=1, sort_keys=True)
     print(f"emitted {len(manifest)} blobs -> {OUT}")
