@@ -7,6 +7,11 @@ machinery class is independently comparable before the waveform stack lands.
 """
 
 from std.gpu import block_idx, block_dim, thread_idx
+from std.collections import List
+from std.math import exp, log, cos, sin, sqrt
+from max.gpu import barrier
+from max.gpu.memory import AddressSpace
+from layout import row_major, stack_allocation
 from std.memory import UnsafePointer, alloc
 from max.gpu.host import DeviceContext
 
@@ -22,6 +27,14 @@ comptime CODE_DIM = 512
 comptime LATENT_DIM = 1024
 comptime PRE_KERNEL = 3
 comptime TRANSFORMER_D = 512
+comptime TRANSFORMER_FF = 1024
+comptime TRANSFORMER_QD = 1024
+comptime TRANSFORMER_LAYERS = 8
+comptime TRANSFORMER_HEADS = 16
+comptime TRANSFORMER_HD = 64
+comptime TRANSFORMER_WINDOW = 72
+comptime TRANSFORMER_EPS = 1.0e-5
+comptime TRANSFORMER_THETA = 10000.0
 
 
 def _f32(ptr: UInt64) -> UnsafePointer[Float32, MutAnyOrigin]:
@@ -140,6 +153,129 @@ def codec_add_bias_kernel(
         x[i] += bias[i % cols]
 
 
+def codec_rmsnorm_kernel(
+    x: UnsafePointer[Float32, MutAnyOrigin],
+    weight: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],
+    rows_arg: Int32,
+):
+    if Int(thread_idx.x) != 0:
+        return
+    var row = Int(block_idx.x)
+    if row >= Int(rows_arg):
+        return
+    var off = row * TRANSFORMER_D
+    var ss = Float32(0.0)
+    for d in range(TRANSFORMER_D):
+        var v = x[off + d]
+        ss += v * v
+    var inv = Float32(1.0) / sqrt(ss / Float32(TRANSFORMER_D) + Float32(TRANSFORMER_EPS))
+    for d in range(TRANSFORMER_D):
+        output[off + d] = x[off + d] * inv * weight[d]
+
+
+def codec_rope_kernel(
+    q: UnsafePointer[Float32, MutAnyOrigin],
+    k: UnsafePointer[Float32, MutAnyOrigin],
+    frames_arg: Int32,
+):
+    var frames = Int(frames_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var half = TRANSFORMER_HD // 2
+    var total = frames * TRANSFORMER_HEADS * half
+    if i >= total:
+        return
+    var pair = i % half
+    var th = i // half
+    var frame = th // TRANSFORMER_HEADS
+    var off = th * TRANSFORMER_HD
+    var inv = exp(-(Float32(2 * pair) / Float32(TRANSFORMER_HD)) * log(Float32(TRANSFORMER_THETA)))
+    var angle = Float32(frame) * inv
+    var c = cos(angle)
+    var s = sin(angle)
+    var lo = off + pair
+    var hi = lo + half
+    var qa = q[lo]
+    var qb = q[hi]
+    var ka = k[lo]
+    var kb = k[hi]
+    q[lo] = qa * c - qb * s
+    q[hi] = qb * c + qa * s
+    k[lo] = ka * c - kb * s
+    k[hi] = kb * c + ka * s
+
+
+def codec_sliding_attention_kernel(
+    q: UnsafePointer[Float32, MutAnyOrigin],
+    k: UnsafePointer[Float32, MutAnyOrigin],
+    v: UnsafePointer[Float32, MutAnyOrigin],
+    output: UnsafePointer[Float32, MutAnyOrigin],
+    frames_arg: Int32,
+):
+    var frames = Int(frames_arg)
+    var query_head = Int(block_idx.x)
+    var frame = query_head // TRANSFORMER_HEADS
+    var head = query_head % TRANSFORMER_HEADS
+    if frame >= frames:
+        return
+    var tid = Int(thread_idx.x)
+    var first = frame - (TRANSFORMER_WINDOW - 1)
+    if first < 0:
+        first = 0
+    var count = frame - first + 1
+    var scores = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[TRANSFORMER_WINDOW]())
+    var stats = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[2]())
+    if tid < count:
+        var key_frame = first + tid
+        var qoff = (frame * TRANSFORMER_HEADS + head) * TRANSFORMER_HD
+        var koff = (key_frame * TRANSFORMER_HEADS + head) * TRANSFORMER_HD
+        var dot = Float32(0.0)
+        for d in range(TRANSFORMER_HD):
+            dot += q[qoff + d] * k[koff + d]
+        scores[tid] = dot / sqrt(Float32(TRANSFORMER_HD))
+    barrier()
+    if tid == 0:
+        var mx = Float32(-3.4e38)
+        for j in range(count):
+            if scores[j] > mx:
+                mx = scores[j]
+        var den = Float32(0.0)
+        for j in range(count):
+            den += exp(scores[j] - mx)
+        stats[0] = mx
+        stats[1] = den
+    barrier()
+    if tid < TRANSFORMER_HD:
+        var acc = Float32(0.0)
+        for j in range(count):
+            var prob = exp(scores[j] - stats[0]) / stats[1]
+            var voff = ((first + j) * TRANSFORMER_HEADS + head) * TRANSFORMER_HD
+            acc += prob * v[voff + tid]
+        output[(frame * TRANSFORMER_HEADS + head) * TRANSFORMER_HD + tid] = acc
+
+
+def codec_scaled_residual_kernel(
+    x: UnsafePointer[Float32, MutAnyOrigin],
+    update: UnsafePointer[Float32, MutAnyOrigin],
+    scale: UnsafePointer[Float32, MutAnyOrigin],
+    n_arg: Int32,
+):
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(n_arg):
+        x[i] += update[i] * scale[i % TRANSFORMER_D]
+
+
+def codec_swiglu_kernel(
+    gate: UnsafePointer[Float32, MutAnyOrigin],
+    up: UnsafePointer[Float32, MutAnyOrigin],
+    n_arg: Int32,
+):
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(n_arg):
+        var v = gate[i]
+        gate[i] = (v / (Float32(1.0) + exp(-v))) * up[i]
+
+
 struct BreezeCodec:
     var ctx: DeviceContext
     var cublas: UInt64
@@ -150,6 +286,20 @@ struct BreezeCodec:
     var preconv_bias: UInt64
     var transformer_input_weight: UInt64
     var transformer_input_bias: UInt64
+    var transformer_q: List[UInt64]
+    var transformer_k: List[UInt64]
+    var transformer_v: List[UInt64]
+    var transformer_o: List[UInt64]
+    var transformer_gate: List[UInt64]
+    var transformer_up: List[UInt64]
+    var transformer_down: List[UInt64]
+    var transformer_in_norm: List[UInt64]
+    var transformer_post_norm: List[UInt64]
+    var transformer_attn_scale: List[UInt64]
+    var transformer_mlp_scale: List[UInt64]
+    var transformer_final_norm: UInt64
+    var transformer_output_weight: UInt64
+    var transformer_output_bias: UInt64
 
     def __init__(out self, weights_dir: String) raises:
         self.ctx = DeviceContext()
@@ -190,6 +340,33 @@ struct BreezeCodec:
             raise Error("missing/wrong-sized transformer input projection bias")
         self.transformer_input_weight = load_f32_file_to_gpu(tiw)
         self.transformer_input_bias = load_f32_file_to_gpu(tib)
+        self.transformer_q = List[UInt64]()
+        self.transformer_k = List[UInt64]()
+        self.transformer_v = List[UInt64]()
+        self.transformer_o = List[UInt64]()
+        self.transformer_gate = List[UInt64]()
+        self.transformer_up = List[UInt64]()
+        self.transformer_down = List[UInt64]()
+        self.transformer_in_norm = List[UInt64]()
+        self.transformer_post_norm = List[UInt64]()
+        self.transformer_attn_scale = List[UInt64]()
+        self.transformer_mlp_scale = List[UInt64]()
+        for layer in range(TRANSFORMER_LAYERS):
+            var lp = prefix + "codec_pre_transformer_layers_" + String(layer) + "_"
+            self.transformer_q.append(load_f32_file_to_gpu(lp + "self_attn_q_proj_weight.f32"))
+            self.transformer_k.append(load_f32_file_to_gpu(lp + "self_attn_k_proj_weight.f32"))
+            self.transformer_v.append(load_f32_file_to_gpu(lp + "self_attn_v_proj_weight.f32"))
+            self.transformer_o.append(load_f32_file_to_gpu(lp + "self_attn_o_proj_weight.f32"))
+            self.transformer_gate.append(load_f32_file_to_gpu(lp + "mlp_gate_proj_weight.f32"))
+            self.transformer_up.append(load_f32_file_to_gpu(lp + "mlp_up_proj_weight.f32"))
+            self.transformer_down.append(load_f32_file_to_gpu(lp + "mlp_down_proj_weight.f32"))
+            self.transformer_in_norm.append(load_f32_file_to_gpu(lp + "input_layernorm_weight.f32"))
+            self.transformer_post_norm.append(load_f32_file_to_gpu(lp + "post_attention_layernorm_weight.f32"))
+            self.transformer_attn_scale.append(load_f32_file_to_gpu(lp + "self_attn_layer_scale_scale.f32"))
+            self.transformer_mlp_scale.append(load_f32_file_to_gpu(lp + "mlp_layer_scale_scale.f32"))
+        self.transformer_final_norm = load_f32_file_to_gpu(prefix + "codec_pre_transformer_norm_weight.f32")
+        self.transformer_output_weight = load_f32_file_to_gpu(prefix + "codec_pre_transformer_output_proj_weight.f32")
+        self.transformer_output_bias = load_f32_file_to_gpu(prefix + "codec_pre_transformer_output_proj_bias.f32")
 
     def run_frontend(
         mut self,
@@ -274,6 +451,103 @@ struct BreezeCodec:
         cuda_free(d_row_major)
         cuda_free(d_channel_major)
 
+    def run_transformer(
+        mut self,
+        input_host: UInt64,
+        frames: Int,
+        layer0_host: UInt64,
+        layer7_host: UInt64,
+        output_host: UInt64,
+    ) raises:
+        """Run the 8-layer causal sliding transformer from [T,512]."""
+        if frames <= 0 or frames > 8000:
+            raise Error("codec frame count outside [1,8000]")
+        var threads = 256
+        var hidden_elems = frames * TRANSFORMER_D
+        var wide_elems = frames * TRANSFORMER_QD
+        var d_x = cuda_malloc(hidden_elems * 4)
+        var d_norm = cuda_malloc(hidden_elems * 4)
+        var d_q = cuda_malloc(wide_elems * 4)
+        var d_k = cuda_malloc(wide_elems * 4)
+        var d_v = cuda_malloc(wide_elems * 4)
+        var d_attn = cuda_malloc(wide_elems * 4)
+        var d_update = cuda_malloc(hidden_elems * 4)
+        var d_gate = cuda_malloc(wide_elems * 4)
+        var d_up = cuda_malloc(wide_elems * 4)
+        cuda_memcpy(d_x, input_host, hidden_elems * 4, 1)
+        var rms_fn = self.ctx.compile_function[codec_rmsnorm_kernel]()
+        var rope_fn = self.ctx.compile_function[codec_rope_kernel]()
+        var attn_fn = self.ctx.compile_function[codec_sliding_attention_kernel]()
+        var residual_fn = self.ctx.compile_function[codec_scaled_residual_kernel]()
+        var swiglu_fn = self.ctx.compile_function[codec_swiglu_kernel]()
+        for layer in range(TRANSFORMER_LAYERS):
+            self.ctx.enqueue_function(
+                rms_fn, _f32(d_x), _f32(self.transformer_in_norm[layer]), _f32(d_norm),
+                Int32(frames), grid_dim=frames, block_dim=1,
+            )
+            cublas_sgemm(self.cublas, d_norm, self.transformer_q[layer], d_q, frames, TRANSFORMER_D, TRANSFORMER_QD)
+            cublas_sgemm(self.cublas, d_norm, self.transformer_k[layer], d_k, frames, TRANSFORMER_D, TRANSFORMER_QD)
+            cublas_sgemm(self.cublas, d_norm, self.transformer_v[layer], d_v, frames, TRANSFORMER_D, TRANSFORMER_QD)
+            self.ctx.enqueue_function(
+                rope_fn, _f32(d_q), _f32(d_k), Int32(frames),
+                grid_dim=(frames * TRANSFORMER_HEADS * (TRANSFORMER_HD // 2) + threads - 1) // threads,
+                block_dim=threads,
+            )
+            self.ctx.enqueue_function(
+                attn_fn, _f32(d_q), _f32(d_k), _f32(d_v), _f32(d_attn), Int32(frames),
+                grid_dim=frames * TRANSFORMER_HEADS, block_dim=TRANSFORMER_WINDOW,
+            )
+            cublas_sgemm(self.cublas, d_attn, self.transformer_o[layer], d_update, frames, TRANSFORMER_QD, TRANSFORMER_D)
+            self.ctx.enqueue_function(
+                residual_fn, _f32(d_x), _f32(d_update), _f32(self.transformer_attn_scale[layer]),
+                Int32(hidden_elems), grid_dim=(hidden_elems + threads - 1) // threads, block_dim=threads,
+            )
+            self.ctx.enqueue_function(
+                rms_fn, _f32(d_x), _f32(self.transformer_post_norm[layer]), _f32(d_norm),
+                Int32(frames), grid_dim=frames, block_dim=1,
+            )
+            cublas_sgemm(self.cublas, d_norm, self.transformer_gate[layer], d_gate, frames, TRANSFORMER_D, TRANSFORMER_FF)
+            cublas_sgemm(self.cublas, d_norm, self.transformer_up[layer], d_up, frames, TRANSFORMER_D, TRANSFORMER_FF)
+            self.ctx.enqueue_function(
+                swiglu_fn, _f32(d_gate), _f32(d_up), Int32(wide_elems),
+                grid_dim=(wide_elems + threads - 1) // threads, block_dim=threads,
+            )
+            cublas_sgemm(self.cublas, d_gate, self.transformer_down[layer], d_update, frames, TRANSFORMER_FF, TRANSFORMER_D)
+            self.ctx.enqueue_function(
+                residual_fn, _f32(d_x), _f32(d_update), _f32(self.transformer_mlp_scale[layer]),
+                Int32(hidden_elems), grid_dim=(hidden_elems + threads - 1) // threads, block_dim=threads,
+            )
+            self.ctx.synchronize()
+            if layer == 0:
+                cuda_memcpy(layer0_host, d_x, hidden_elems * 4, 2)
+            if layer == 7:
+                cuda_memcpy(layer7_host, d_x, hidden_elems * 4, 2)
+        self.ctx.enqueue_function(
+            rms_fn, _f32(d_x), _f32(self.transformer_final_norm), _f32(d_norm),
+            Int32(frames), grid_dim=frames, block_dim=1,
+        )
+        cublas_sgemm(
+            self.cublas, d_norm, self.transformer_output_weight, d_attn,
+            frames, TRANSFORMER_D, LATENT_DIM,
+        )
+        var bias_fn = self.ctx.compile_function[codec_add_bias_kernel]()
+        self.ctx.enqueue_function(
+            bias_fn, _f32(d_attn), _f32(self.transformer_output_bias),
+            Int32(frames), Int32(LATENT_DIM),
+            grid_dim=(frames * LATENT_DIM + threads - 1) // threads, block_dim=threads,
+        )
+        self.ctx.synchronize()
+        cuda_memcpy(output_host, d_attn, frames * LATENT_DIM * 4, 2)
+        cuda_free(d_up)
+        cuda_free(d_gate)
+        cuda_free(d_update)
+        cuda_free(d_attn)
+        cuda_free(d_v)
+        cuda_free(d_k)
+        cuda_free(d_q)
+        cuda_free(d_norm)
+        cuda_free(d_x)
+
     def free(mut self):
         for q in range(CODEBOOKS):
             if self.tables_host[q] != 0:
@@ -291,3 +565,18 @@ struct BreezeCodec:
             cuda_free(self.transformer_input_weight)
         if self.transformer_input_bias != 0:
             cuda_free(self.transformer_input_bias)
+        for layer in range(TRANSFORMER_LAYERS):
+            cuda_free(self.transformer_q[layer])
+            cuda_free(self.transformer_k[layer])
+            cuda_free(self.transformer_v[layer])
+            cuda_free(self.transformer_o[layer])
+            cuda_free(self.transformer_gate[layer])
+            cuda_free(self.transformer_up[layer])
+            cuda_free(self.transformer_down[layer])
+            cuda_free(self.transformer_in_norm[layer])
+            cuda_free(self.transformer_post_norm[layer])
+            cuda_free(self.transformer_attn_scale[layer])
+            cuda_free(self.transformer_mlp_scale[layer])
+        cuda_free(self.transformer_final_norm)
+        cuda_free(self.transformer_output_weight)
+        cuda_free(self.transformer_output_bias)

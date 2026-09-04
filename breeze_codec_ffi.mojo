@@ -76,6 +76,30 @@ def nomos_breeze_codec_transformer_input(
 
 
 @export
+def nomos_breeze_codec_transformer(
+    handle: Int64,
+    input_ptr: Int64,
+    frames: Int32,
+    layer0_ptr: Int64,
+    layer7_ptr: Int64,
+    output_ptr: Int64,
+) -> Int32:
+    """Debug/parity seam for the complete 8-layer pre-transformer."""
+    if handle == 0 or input_ptr == 0 or layer0_ptr == 0 or layer7_ptr == 0 or output_ptr == 0:
+        return Int32(-1)
+    try:
+        var ptr = UnsafePointer[BreezeCodec, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+        ptr[0].run_transformer(
+            UInt64(input_ptr), Int(frames), UInt64(layer0_ptr),
+            UInt64(layer7_ptr), UInt64(output_ptr),
+        )
+        return Int32(0)
+    except e:
+        print("[nomos_breeze_codec_transformer EXC]", e)
+        return Int32(-99)
+
+
+@export
 def nomos_breeze_codec_free(handle: Int64) -> Int32:
     if handle == 0:
         return Int32(0)
