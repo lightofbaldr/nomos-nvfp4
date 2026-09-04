@@ -205,7 +205,13 @@ class BreezeTTS:
 
     @staticmethod
     def load_voice(name: str):
-        d = VOICES_DIR / name
+        # `name` arrives from the HTTP request — constrain to a bare registry slug so it can
+        # never traverse out of VOICES_DIR (security review finding, 2026-09-04).
+        if not name or not all(c.isalnum() or c in "_-" for c in name):
+            raise FileNotFoundError(f"invalid voice name {name!r}")
+        d = (VOICES_DIR / name).resolve()
+        if d.parent != VOICES_DIR.resolve():
+            raise FileNotFoundError(f"invalid voice name {name!r}")
         codes = np.load(d / "codes.npy").astype(np.int64)   # [T,16]
         ref_text = (d / "ref.txt").read_text().strip()
         return codes, ref_text
