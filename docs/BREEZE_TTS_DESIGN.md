@@ -8,9 +8,14 @@ Public docs must label the model's license class.
 
 ## Model (BreezeBlue/Breeze-TTS-2, HF, 2026-08-25)
 CSM-lineage composite, four sub-models (~3.5B total, bf16 ≈ 7GB):
-1. **Text encoder** — T5Gemma2, 26L, hidden 1152, gemma sliding/full mix (5:1, window 512),
-   vocab 262158 (gemma vocab + 12 speaker/instruction tokens). Output projected (linear) into
-   backbone embedding space.
+1. **Text encoder** — T5Gemma2, 26L, hidden 1152, vocab 262158 (gemma vocab + 12
+   speaker/instruction tokens). CORRECTED (Codex source audit 2026-09-04): **NON-CAUSAL** —
+   full layers (@5/11/17/23) attend bidirectionally; sliding layers use the SYMMETRIC 512
+   window (left 256 / right 257 incl current), not decoder-style causal sliding. Per-type
+   RoPE: sliding theta 1e4 default; full theta 1e6 with linear factor 8. Score scale
+   1/sqrt(256)=1/16; four-norm sandwich, (1+w) RMSNorm eps 1e-6; per-head q/k norm hd 256;
+   GQA 4:1; GELU-tanh SwiGLU; embed sqrt(1152) + EOI row override. Output projected (linear)
+   into backbone embedding space.
 2. **Backbone** — Qwen3 flavor "llama-1B": 28L, hidden 2048, GQA 16/8, head_dim 128, per-head
    QK-norm, llama3-type RoPE scaling (factor 32). AR over Mimi frames @ 12.5Hz: predicts
    codebook-0 + hidden for the depth decoder. Text conditioning = encoder output spliced as
