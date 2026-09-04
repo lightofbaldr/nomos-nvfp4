@@ -197,6 +197,9 @@ clean exports) · **greedy-id parity** (`tools/gold_parity_ids.py`) · **the bar
 - [docs/MODEL_PROFILES.md](docs/MODEL_PROFILES.md) — the per-model profile system (`--model`): how one repo serves Gemma-4, OLMo-3.1, Qwen3.8, and Muse-Glimmer from a single main.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — module map, the two 4-bit precision paths, the C ABI.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — the correctness gates and benchmark hygiene.
+- [docs/BREEZE_TTS_DESIGN.md](docs/BREEZE_TTS_DESIGN.md) — text-to-speech on the kernel:
+  Breeze-TTS-2 (codec / text encoder / backbone+depth as standalone `.so`s, converters,
+  the `/v1/audio/speech` serve with voice registry).
 
 ## License
 
@@ -204,4 +207,8 @@ MIT — see [LICENSE](LICENSE). Third-party components and design credits (DFlas
 z-lab·Anbeeld, llama.cpp, EAGLE-3, Mojo/MAX) are listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Nomos does not distribute model
 weights; each model's weights are obtained from its provider under that model's own
-license (e.g. Gemma-4 under the Gemma Terms of Use; OLMo under Apache-2.0).
+license (e.g. Gemma-4 under the Gemma Terms of Use; OLMo under Apache-2.0). Note in
+particular: **Breeze-TTS-2 weights are licensed for research and non-commercial use only**
+(BreezeBlue research license) — this repository's TTS support code is MIT like everything
+else here, but the model weights it loads, models derived from them, and self-hosted
+outputs are bound by the upstream weight license. Review it before deploying TTS.
