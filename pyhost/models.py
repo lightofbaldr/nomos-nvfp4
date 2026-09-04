@@ -49,10 +49,15 @@ MODELS = {
         "tok_dir": _p("~/nomos_data/olmo-3.1-32b-instruct-bf16"),      # tokenizer+chat_template
         # NVFP4 weight path (mirrors the qwen deploy pattern; no GDN — olmo is standard attention).
         # Q4 attn/dp4a disabled by default; NVFP4 is the supported olmo arm here.
+        # Serve-default repetition penalty 1.15 (Adam, 2026-09-03): at vendor sampling
+        # (temp .6 / top_p .95, no penalty) olmo loops on ~60% of title-bearing prompts
+        # (Prime's selfdistill pilot, 89/141 draws); 1.15 measured loop-free on the direct
+        # path at the same sampling. Per-request repetition_penalty overrides it.
         "env": {
             "NOMOS_WEIGHT_NVFP4": "1", "NOMOS_W4A4": "1", "NOMOS_PRECISION_BITS": "16",
             "NOMOS_Q4_ATTN": "0", "NOMOS_Q4_DP4A": "0",
             "NOMOS_KV_QUANT": "1", "NOMOS_KV_INT4": "1", "NOMOS_KV_I4_BLOCK": "32",
+            "NOMOS_SERVE_REP_PENALTY": "1.15",
         },
     },
 }

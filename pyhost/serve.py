@@ -86,6 +86,10 @@ class Engine:
               f"model={self.model_name}", flush=True)
         self.spec_loaded = False
         self.spec_vb = int(os.environ.get("SPEC_VB", "8"))
+        # Per-model serve default (models.py env; per-request repetition_penalty overrides).
+        self.rep_penalty_default = float(os.environ.get("NOMOS_SERVE_REP_PENALTY", "1.0"))
+        if self.rep_penalty_default != 1.0:
+            print(f"[serve] default repetition penalty {self.rep_penalty_default}", flush=True)
         dflash_dir = os.environ.get("DFLASH_DIR")
         if os.environ.get("NOMOS_SERVE_SPEC") == "1" and dflash_dir:
             try:
@@ -125,9 +129,16 @@ class ChatReq(BaseModel):
     temperature: float = 0.0
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
     top_k: int = Field(default=0, ge=0)
+    # None = use the model's serve default (Engine.rep_penalty_default); an explicit value
+    # always wins, including 1.0 to switch the model default off for this request.
+    repetition_penalty: float | None = Field(default=None, gt=0.0)
     max_tokens: int = Field(default=2048, ge=1)
     stream: bool = False
     enable_thinking: bool = True
+
+
+def _rep_penalty(req: "ChatReq", eng) -> float:
+    return req.repetition_penalty if req.repetition_penalty is not None else eng.rep_penalty_default
 
 
 def _visible(text: str, thinking: bool = False) -> str:
@@ -311,7 +322,8 @@ def _stream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool = True)
             token_source = eng.lm.generate_stream(
                 ids, max_new_tokens=req.max_tokens, stop_ids=eng.stop,
                 temperature=req.temperature, top_p=req.top_p,
-                top_k=req.top_k, processor=gram)
+                top_k=req.top_k, processor=gram,
+                rep_penalty=_rep_penalty(req, eng))
         if eng.protocol.kind == "atem":
             parser = eng.protocol.stream_parser(eng.tok)
             for tok in token_source:
@@ -469,7 +481,7 @@ def chat(req: ChatReq, request: Request):
         else:
             out = eng.lm.generate(ids, max_new_tokens=req.max_tokens, stop_ids=eng.stop,
                                   temperature=req.temperature, top_p=req.top_p, top_k=req.top_k,
-                                  processor=gram)
+                                  processor=gram, rep_penalty=_rep_penalty(req, eng))
         dt = time.time() - t0
     raw = eng.tok.decode(out, skip_special_tokens=False)
 

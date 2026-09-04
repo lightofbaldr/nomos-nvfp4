@@ -51,8 +51,9 @@ LogitsProcessor = Callable[[int, list[int], np.ndarray], np.ndarray]
 
 def _pick(logits: np.ndarray, temperature: float, top_p: float = 1.0, top_k: int = 0) -> int:
     """Greedy when temperature<=0, else temperature + nucleus (top-p) + top-k sampling.
-    No repetition penalty by design — applying one on softcapped logits diverges from
-    stock HF Gemma-4 (a prior band-aid we removed). Quality = nucleus, not penalties."""
+    _pick itself applies no repetition penalty: on softcapped logits (Gemma-4) a penalty
+    diverges from stock HF, so penalty is a PER-MODEL serve default (see models.py /
+    _apply_rep_penalty), off unless the model's registry entry or the request asks."""
     if temperature <= 0:
         return int(np.argmax(logits))
     z = logits.astype(np.float64) / temperature
@@ -76,17 +77,40 @@ def _pick(logits: np.ndarray, temperature: float, top_p: float = 1.0, top_k: int
     return int(np.random.choice(p.size, p=p))
 
 
+def _apply_rep_penalty(logits: np.ndarray, out: list[int], penalty: float,
+                       stop: set, window: int = 64) -> np.ndarray:
+    """Windowed repetition penalty, mirroring the kernel's apply_rep_penalty exactly
+    (lib/sampling.mojo): last `window` GENERATED tokens, once per unique token (HF
+    convention — divide positive logits, multiply negative), stop/EOS-class exempt.
+    Copy-on-write so the backend's logits buffer is never mutated."""
+    if penalty == 1.0 or not out:
+        return logits
+    lg = logits.copy()
+    for t in set(out[-window:]) - stop:
+        if 0 <= t < lg.size:
+            lg[t] = lg[t] / penalty if lg[t] > 0 else lg[t] * penalty
+    # Same-token loop safety net, ported with the penalty from engine_decode: four identical
+    # trailing tokens = a degenerate loop the penalty failed to break (measured: 1.15 alone
+    # leaves a residual quote-runaway rate on olmo) — force a switch. Fires only in a state
+    # that is already degenerate, so it cannot alter healthy generation.
+    if len(out) >= 4 and out[-1] == out[-2] == out[-3] == out[-4] and 0 <= out[-1] < lg.size:
+        lg[out[-1]] = np.float32(-1e9)
+    return lg
+
+
 class _GenMixin:
     """Decode logic shared by both backends. Requires the backend to provide:
     prefill(ids)->logits, step(token)->logits, set_cache_len(n), prefill_cont(suffix)->logits."""
 
     def generate(self, prompt_ids, max_new_tokens=1024, stop_ids=(), temperature=0.0,
-                 top_p=1.0, top_k=0, processor: LogitsProcessor | None = None) -> list[int]:
+                 top_p=1.0, top_k=0, processor: LogitsProcessor | None = None,
+                 rep_penalty: float = 1.0) -> list[int]:
         stop = set(int(s) for s in stop_ids)
         logits = self.prefill(prompt_ids)
         out: list[int] = []
         for i in range(max_new_tokens):
-            lg = logits if processor is None else processor(i, out, logits)
+            lg = _apply_rep_penalty(logits, out, rep_penalty, stop)
+            lg = lg if processor is None else processor(i, out, lg)
             tok = _pick(lg, temperature, top_p, top_k)
             out.append(tok)
             if tok in stop:
@@ -95,13 +119,15 @@ class _GenMixin:
         return out
 
     def generate_stream(self, prompt_ids, max_new_tokens=1024, stop_ids=(), temperature=0.0,
-                        top_p=1.0, top_k=0, processor: LogitsProcessor | None = None):
+                        top_p=1.0, top_k=0, processor: LogitsProcessor | None = None,
+                        rep_penalty: float = 1.0):
         """Yields each token id AS produced. The stop token IS yielded, then return."""
         stop = set(int(s) for s in stop_ids)
         logits = self.prefill(prompt_ids)
         out: list[int] = []
         for i in range(max_new_tokens):
-            lg = logits if processor is None else processor(i, out, logits)
+            lg = _apply_rep_penalty(logits, out, rep_penalty, stop)
+            lg = lg if processor is None else processor(i, out, lg)
             tok = _pick(lg, temperature, top_p, top_k)
             out.append(tok)
             yield tok
