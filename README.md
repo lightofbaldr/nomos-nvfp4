@@ -209,6 +209,11 @@ z-lab·Anbeeld, llama.cpp, EAGLE-3, Mojo/MAX) are listed in
 weights; each model's weights are obtained from its provider under that model's own
 license (e.g. Gemma-4 under the Gemma Terms of Use; OLMo under Apache-2.0). Note in
 particular: **Breeze-TTS-2 weights are licensed for research and non-commercial use only**
-(BreezeBlue research license) — this repository's TTS support code is MIT like everything
-else here, but the model weights it loads, models derived from them, and self-hosted
-outputs are bound by the upstream weight license. Review it before deploying TTS.
+(the [BreezeBlue Research and Non-Commercial License](https://huggingface.co/BreezeBlue/Breeze-TTS-2/blob/main/LICENSE),
+which covers the model weights, the bundled codec weights, converted blobs, derived models,
+and self-hosted outputs). This repository's TTS support code is MIT like everything else
+here, but that license permits research and non-commercial use only: production use, hosted
+services or APIs built on the weights, and an organization's internal use beyond evaluation
+are listed there as commercial purposes that need a separate commercial license from
+BreezeBlue, and outputs may not be used to train other models. Review the license before
+deploying TTS.

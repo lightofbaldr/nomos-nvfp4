@@ -15,6 +15,7 @@ Usage: python3 tools/convert_breeze_codec.py [src_dir] [out_dir]
 """
 import hashlib
 import json
+import os
 import sys
 
 import numpy as np
@@ -23,8 +24,8 @@ from safetensors import safe_open
 
 EPSILON = 1e-5  # EuclideanCodebook.__init__ default; config does not override it
 
-SRC = sys.argv[1] if len(sys.argv) > 1 else "/home/adam/nomos_data/breeze-tts-2/hf/audio_tokenizer"
-OUT = sys.argv[2] if len(sys.argv) > 2 else "/home/adam/nomos_data/breeze-tts-2/codec-blobs"
+SRC = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/nomos_data/breeze-tts-2/hf/audio_tokenizer")
+OUT = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser("~/nomos_data/breeze-tts-2/codec-blobs")
 
 
 def main():

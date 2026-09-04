@@ -3,7 +3,8 @@
 Adam-approved scope: **all model capabilities** (voice clone, voice design, voice direction,
 vocal events, bilingual en/zh, streaming), landing as a **LAN fleet TTS service**. Support code
 is public-repo eligible (usual Freyja rounds); **weights are research/non-commercial**
-(breezeblue-research-and-non-commercial-license) — the service is local-only, nothing sold.
+(BreezeBlue Research and Non-Commercial License) — research and non-commercial use only; any
+production, hosted, or organizational use beyond evaluation needs BreezeBlue's commercial license.
 Public docs must label the model's license class.
 
 ## Model (BreezeBlue/Breeze-TTS-2, HF, 2026-08-25)
@@ -44,7 +45,7 @@ service (H100/flash-attn targeted, heavy on aarch64, and it's the dependency thi
 replaces).
 
 ## Milestones (implementer ≠ verifier; HF reference is the external anchor at every gate)
-- **M0** — weights + converters + HF reference running on Spark 2 (bf16), per-stage goldens
+- **M0** — weights + converters + HF reference running on a DGX Spark (bf16), per-stage goldens
   captured (encoder hiddens, backbone logits/hidden per frame, depth codebook tokens, mimi
   waveform). Owner: Kvasir.
 - **M1** — Mimi decoder .so: tokens→waveform parity vs HF goldens (relL2 gate + audible spot

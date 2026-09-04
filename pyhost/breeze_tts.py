@@ -26,12 +26,12 @@ from pathlib import Path
 import numpy as np
 from tokenizers import Tokenizer
 
-DEPLOY = Path(os.environ.get("BREEZE_DEPLOY", "/home/adam/nomos_data/breeze-tts-2/deploy"))
-BLOBS_MODEL = os.environ.get("BREEZE_MODEL_BLOBS", "/home/adam/nomos_data/breeze-tts-2/model-blobs")
-BLOBS_ENC = os.environ.get("BREEZE_ENC_BLOBS", "/home/adam/nomos_data/breeze-tts-2/encoder-blobs")
-BLOBS_CODEC = os.environ.get("BREEZE_CODEC_BLOBS", "/home/adam/nomos_data/breeze-tts-2/codec-blobs")
-TOKENIZER_JSON = os.environ.get("BREEZE_TOKENIZER", "/home/adam/nomos_data/breeze-tts-2/hf/tokenizer.json")
-VOICES_DIR = Path(os.environ.get("BREEZE_VOICES", "/home/adam/nomos_data/breeze-tts-2/voices"))
+DEPLOY = Path(os.environ.get("BREEZE_DEPLOY", os.path.expanduser("~/nomos_data/breeze-tts-2/deploy")))
+BLOBS_MODEL = os.environ.get("BREEZE_MODEL_BLOBS", os.path.expanduser("~/nomos_data/breeze-tts-2/model-blobs"))
+BLOBS_ENC = os.environ.get("BREEZE_ENC_BLOBS", os.path.expanduser("~/nomos_data/breeze-tts-2/encoder-blobs"))
+BLOBS_CODEC = os.environ.get("BREEZE_CODEC_BLOBS", os.path.expanduser("~/nomos_data/breeze-tts-2/codec-blobs"))
+TOKENIZER_JSON = os.environ.get("BREEZE_TOKENIZER", os.path.expanduser("~/nomos_data/breeze-tts-2/hf/tokenizer.json"))
+VOICES_DIR = Path(os.environ.get("BREEZE_VOICES", os.path.expanduser("~/nomos_data/breeze-tts-2/voices")))
 
 V = 2051
 EOS = 2051          # backbone extra EOS class

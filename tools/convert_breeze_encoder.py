@@ -15,8 +15,8 @@ import sys
 import torch
 from safetensors import safe_open
 
-SRC = sys.argv[1] if len(sys.argv) > 1 else "/home/adam/nomos_data/breeze-tts-2/hf"
-OUT = sys.argv[2] if len(sys.argv) > 2 else "/home/adam/nomos_data/breeze-tts-2/encoder-blobs"
+SRC = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/nomos_data/breeze-tts-2/hf")
+OUT = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser("~/nomos_data/breeze-tts-2/encoder-blobs")
 
 
 def main():
