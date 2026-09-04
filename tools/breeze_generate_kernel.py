@@ -16,6 +16,8 @@ def bind(path):
     x.nomos_breeze_model_init.argtypes=[ctypes.c_char_p];x.nomos_breeze_model_init.restype=ctypes.c_int64
     x.nomos_breeze_model_prefill_lane.argtypes=[ctypes.c_int64,ctypes.c_int32,P,ctypes.c_int32,P,P,P]
     x.nomos_breeze_model_depth_lane.argtypes=[ctypes.c_int64,ctypes.c_int32,P,P]
+    x.nomos_breeze_model_depth_begin.argtypes=[ctypes.c_int64,ctypes.c_int32,ctypes.c_int64,P]
+    x.nomos_breeze_model_depth_advance.argtypes=[ctypes.c_int64,ctypes.c_int32,ctypes.c_int32,ctypes.c_int64,P]
     x.nomos_breeze_model_step_backbone.argtypes=[ctypes.c_int64,ctypes.c_int32,P,P]
     return x
 
@@ -50,7 +52,10 @@ def main():
         for cb in range(1,CBS):
             ds=[]
             for lane in range(len(prefixes)):
-                d=np.empty((15,V),'f4');assert M.nomos_breeze_model_depth_lane(h,lane,codes.ctypes.data,d.ctypes.data)==0;ds.append(d[cb-1])
+                d=np.empty(V,'f4')
+                if cb==1:rc=M.nomos_breeze_model_depth_begin(h,lane,codes.ctypes.data,d.ctypes.data)
+                else:rc=M.nomos_breeze_model_depth_advance(h,lane,cb-1,codes.ctypes.data,d.ctypes.data)
+                assert rc==0;ds.append(d)
             codes[cb]=pick(cfg(ds[0],ds[1] if len(ds)>1 else None,a.cfg_scale),rng)
         frames.append(codes.copy());history.append(cb0)
         lm=[]

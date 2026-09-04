@@ -172,9 +172,9 @@ struct DDWeights(Movable):
         self.project=load_bf16_file_to_gpu(b+"depth_decoder_model_inputs_embeds_projector_weight.bf16");self.norm=load_bf16_file_to_gpu(b+"depth_decoder_model_norm_weight.bf16");self.head=load_bf16_file_to_gpu(b+"depth_decoder_codebooks_head_weight.bf16")
 
 struct BMLane(Movable):
-    var length:Int;var kc:List[UInt64];var vc:List[UInt64];var last_hidden:UInt64
+    var length:Int;var kc:List[UInt64];var vc:List[UInt64];var last_hidden:UInt64;var depth_kc:UInt64;var depth_vc:UInt64;var depth_pos:Int
     def __init__(out self):
-        self.length=0;self.kc=List[UInt64]();self.vc=List[UInt64]();self.last_hidden=cuda_malloc(BB_D*4)
+        self.length=0;self.kc=List[UInt64]();self.vc=List[UInt64]();self.last_hidden=cuda_malloc(BB_D*4);self.depth_kc=cuda_malloc(DD_L*CB*DD_KVD*4);self.depth_vc=cuda_malloc(DD_L*CB*DD_KVD*4);self.depth_pos=0
         for _ in range(BB_L):self.kc.append(cuda_malloc(MAX_SEQ*BB_KVD*4));self.vc.append(cuda_malloc(MAX_SEQ*BB_KVD*4))
 
 struct BreezeModel(Movable):
@@ -219,6 +219,20 @@ struct BreezeModel(Movable):
         if lane<0 or lane>1:raise Error("invalid Breeze lane")
         self.depth_sequential(codes_host,self.lanes[lane].last_hidden,depth_host)
 
+    def _depth_increment(mut self,raw:UInt64,S:Int,start:Int,head_index:Int,out_host:UInt64,kcbase:UInt64,vcbase:UInt64) raises:
+        var T=256;var x=cuda_malloc(S*DD_D*4);var n=cuda_malloc(S*DD_D*4);var q=cuda_malloc(S*DD_QD*4);var k=cuda_malloc(S*DD_KVD*4);var v=cuda_malloc(S*DD_KVD*4);var a=cuda_malloc(S*DD_QD*4);var u=cuda_malloc(S*DD_D*4);var g=cuda_malloc(S*DD_FF*4);var up=cuda_malloc(S*DD_FF*4);var bf=cuda_malloc(S*DD_FF*2);var one=cuda_malloc(DD_V*4)
+        gpu_matmul_bf16_dev_batched(self.ctx,self.h,x,raw,self.dw.project,bf,S,BB_D,DD_D);self._depth_pass(x,S,start,kcbase,vcbase,n,q,k,v,a,u,g,up,bf)
+        var head=self.ctx.compile_function[bm_depth_head_one]();self.ctx.enqueue_function(head,_mf32(n+UInt64((S-1)*DD_D*4)),_mbf16(self.dw.head),Int32(head_index),_mf32(one),grid_dim=(DD_V+T-1)//T,block_dim=T);self.ctx.synchronize();cuda_memcpy(out_host,one,DD_V*4,2)
+        cuda_free(one);cuda_free(bf);cuda_free(up);cuda_free(g);cuda_free(u);cuda_free(a);cuda_free(v);cuda_free(k);cuda_free(q);cuda_free(n);cuda_free(x)
+
+    def depth_begin(mut self,lane:Int,codes_host:UInt64,out_host:UInt64) raises:
+        if lane<0 or lane>1:raise Error("invalid Breeze depth begin")
+        var T=256;var ids=cuda_malloc(CB*8);cuda_memcpy(ids,codes_host,CB*8,1);var raw=cuda_malloc(2*BB_D*4);var inf=self.ctx.compile_function[bm_depth_two_inputs]();self.ctx.enqueue_function(inf,_mi64(ids),_mf32(self.lanes[lane].last_hidden),_mbf16(self.w.audio),_mf32(raw),grid_dim=(2*BB_D+T-1)//T,block_dim=T);self._depth_increment(raw,2,0,0,out_host,self.lanes[lane].depth_kc,self.lanes[lane].depth_vc);self.lanes[lane].depth_pos=2;cuda_free(raw);cuda_free(ids)
+
+    def depth_advance(mut self,lane:Int,input_codebook:Int,codes_host:UInt64,out_host:UInt64) raises:
+        if lane<0 or lane>1 or input_codebook<1 or input_codebook>=15 or self.lanes[lane].depth_pos!=input_codebook+1:raise Error("invalid Breeze depth advance")
+        var T=256;var ids=cuda_malloc(CB*8);cuda_memcpy(ids,codes_host,CB*8,1);var raw=cuda_malloc(BB_D*4);var onein=self.ctx.compile_function[bm_depth_one_input]();self.ctx.enqueue_function(onein,_mi64(ids),Int32(input_codebook),_mbf16(self.w.audio),_mf32(raw),grid_dim=(BB_D+T-1)//T,block_dim=T);self._depth_increment(raw,1,input_codebook+1,input_codebook,out_host,self.lanes[lane].depth_kc,self.lanes[lane].depth_vc);self.lanes[lane].depth_pos=input_codebook+2;cuda_free(raw);cuda_free(ids)
+
     def depth(mut self,codes_host:UInt64,backbone_host:UInt64,logits_host:UInt64) raises:
         var S=CB;var T=256;var he=S*DD_D;var qe=S*DD_QD;var ke=S*DD_KVD;var fe=S*DD_FF
         var ids=cuda_malloc(CB*8);var bh=cuda_malloc(BB_D*4);var raw=cuda_malloc(CB*BB_D*4);var x=cuda_malloc(he*4);var n=cuda_malloc(he*4);var q=cuda_malloc(qe*4);var k=cuda_malloc(ke*4);var v=cuda_malloc(ke*4);var a=cuda_malloc(qe*4);var u=cuda_malloc(he*4);var g=cuda_malloc(fe*4);var up=cuda_malloc(fe*4);var bf=cuda_malloc(fe*2);var kc=cuda_malloc(S*DD_KVD*4);var vc=cuda_malloc(S*DD_KVD*4);var lo=cuda_malloc(15*DD_V*4)
@@ -229,13 +243,13 @@ struct BreezeModel(Movable):
         self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.norm),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);var hf=self.ctx.compile_function[bm_depth_head]();self.ctx.enqueue_function(hf,_mf32(n),_mbf16(self.dw.head),_mf32(lo),grid_dim=(15*DD_V+T-1)//T,block_dim=T);self.ctx.synchronize();cuda_memcpy(logits_host,lo,15*DD_V*4,2)
         cuda_free(lo);cuda_free(vc);cuda_free(kc);cuda_free(bf);cuda_free(up);cuda_free(g);cuda_free(u);cuda_free(a);cuda_free(v);cuda_free(k);cuda_free(q);cuda_free(n);cuda_free(x);cuda_free(raw);cuda_free(bh);cuda_free(ids)
 
-    def _depth_pass(mut self,x:UInt64,S:Int,start:Int,kcbase:UInt64,vcbase:UInt64,n:UInt64,q:UInt64,k:UInt64,v:UInt64,a:UInt64,u:UInt64,g:UInt64,up:UInt64,bf:UInt64,run_layers:Int=DD_L) raises:
+    def _depth_pass(mut self,x:UInt64,S:Int,start:Int,kcbase:UInt64,vcbase:UInt64,n:UInt64,q:UInt64,k:UInt64,v:UInt64,a:UInt64,u:UInt64,g:UInt64,up:UInt64,bf:UInt64) raises:
         var T=256;var he=S*DD_D;var qe=S*DD_QD;var ke=S*DD_KVD;var fe=S*DD_FF
         var rms=self.ctx.compile_function[bm_rms]();var rope=self.ctx.compile_function[bm_depth_rope]();var skv=self.ctx.compile_function[bm_store_kv]();var att=self.ctx.compile_function[bm_attn]();var add=self.ctx.compile_function[bm_add]();var sw=self.ctx.compile_function[bm_swiglu]()
-        for l in range(run_layers):
+        for l in range(DD_L):
             var kc=kcbase+UInt64(l*CB*DD_KVD*4);var vc=vcbase+UInt64(l*CB*DD_KVD*4)
             self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.ni[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,q,n,self.dw.q[l],bf,S,DD_D,DD_QD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,k,n,self.dw.k[l],bf,S,DD_D,DD_KVD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,v,n,self.dw.v[l],bf,S,DD_D,DD_KVD);self.ctx.enqueue_function(rope,_mf32(q),Int32(S),Int32(DD_NH),Int32(start),grid_dim=(S*DD_NH*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(rope,_mf32(k),Int32(S),Int32(DD_NKV),Int32(start),grid_dim=(S*DD_NKV*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(skv,_mf32(k),_mf32(v),_mf32(kc),_mf32(vc),Int32(S),Int32(start),Int32(DD_KVD),grid_dim=(ke+T-1)//T,block_dim=T);self.ctx.enqueue_function(att,_mf32(q),_mf32(kc),_mf32(vc),_mf32(a),Int32(S),Int32(start),Int32(DD_NH),Int32(DD_NKV),grid_dim=S*DD_NH,block_dim=128);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,a,self.dw.o[l],bf,S,DD_QD,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T);self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.np[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,g,n,self.dw.g[l],bf,S,DD_D,DD_FF);gpu_matmul_bf16_dev_batched(self.ctx,self.h,up,n,self.dw.u[l],bf,S,DD_D,DD_FF);self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,g,self.dw.d[l],bf,S,DD_FF,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
-        if run_layers==DD_L:self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.norm),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1)
+        self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.norm),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1)
 
     def depth_sequential(mut self,codes_host:UInt64,backbone_dev:UInt64,logits_host:UInt64) raises:
         var T=256;var ids=cuda_malloc(CB*8);cuda_memcpy(ids,codes_host,CB*8,1)
@@ -256,4 +270,4 @@ struct BreezeModel(Movable):
         cuda_free(self.dw.project);cuda_free(self.dw.norm);cuda_free(self.dw.head)
         for lane in range(2):
             for l in range(BB_L):cuda_free(self.lanes[lane].kc[l]);cuda_free(self.lanes[lane].vc[l])
-            cuda_free(self.lanes[lane].last_hidden)
+            cuda_free(self.lanes[lane].last_hidden);cuda_free(self.lanes[lane].depth_kc);cuda_free(self.lanes[lane].depth_vc)

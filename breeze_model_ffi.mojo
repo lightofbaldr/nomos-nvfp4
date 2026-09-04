@@ -43,6 +43,18 @@ def nomos_breeze_model_depth_lane(handle:Int64,lane:Int32,frame_codes:Int64,dept
     except e:print("[nomos_breeze_model_depth_lane EXC]",e);return -99
 
 @export
+def nomos_breeze_model_depth_begin(handle:Int64,lane:Int32,frame_codes:Int64,logits:Int64)->Int32:
+    if handle==0 or logits==0:return -1
+    try:var p=UnsafePointer[BreezeModel,MutUntrackedOrigin](unsafe_from_address=Int(handle));p[0].depth_begin(Int(lane),UInt64(frame_codes),UInt64(logits));return 0
+    except e:print("[nomos_breeze_model_depth_begin EXC]",e);return -99
+
+@export
+def nomos_breeze_model_depth_advance(handle:Int64,lane:Int32,input_codebook:Int32,frame_codes:Int64,logits:Int64)->Int32:
+    if handle==0 or logits==0:return -1
+    try:var p=UnsafePointer[BreezeModel,MutUntrackedOrigin](unsafe_from_address=Int(handle));p[0].depth_advance(Int(lane),Int(input_codebook),UInt64(frame_codes),UInt64(logits));return 0
+    except e:print("[nomos_breeze_model_depth_advance EXC]",e);return -99
+
+@export
 def nomos_breeze_model_free(handle:Int64)->Int32:
     if handle==0:return 0
     var p=UnsafePointer[BreezeModel,MutUntrackedOrigin](unsafe_from_address=Int(handle));p[0].free();p.free();return 0
