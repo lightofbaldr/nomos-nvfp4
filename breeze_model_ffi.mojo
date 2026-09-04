@@ -37,6 +37,12 @@ def nomos_breeze_model_step(handle:Int64,lane:Int32,frame_codes:Int64,lm_logits:
     except e:print("[nomos_breeze_model_step EXC]",e);return -99
 
 @export
+def nomos_breeze_model_depth_lane(handle:Int64,lane:Int32,frame_codes:Int64,depth_logits:Int64)->Int32:
+    if handle==0 or frame_codes==0 or depth_logits==0:return -1
+    try:var p=UnsafePointer[BreezeModel,MutUntrackedOrigin](unsafe_from_address=Int(handle));p[0].depth_lane(Int(lane),UInt64(frame_codes),UInt64(depth_logits));return 0
+    except e:print("[nomos_breeze_model_depth_lane EXC]",e);return -99
+
+@export
 def nomos_breeze_model_free(handle:Int64)->Int32:
     if handle==0:return 0
     var p=UnsafePointer[BreezeModel,MutUntrackedOrigin](unsafe_from_address=Int(handle));p[0].free();p.free();return 0

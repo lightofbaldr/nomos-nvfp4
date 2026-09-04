@@ -197,6 +197,10 @@ struct BreezeModel(Movable):
         self.depth(codes_host,self.lanes[lane].last_hidden,depth_host)
         var ids=cuda_malloc(CB*8);var x=cuda_malloc(BB_D*4);cuda_memcpy(ids,codes_host,CB*8,1);var ef=self.ctx.compile_function[bm_embed_frame]();self.ctx.enqueue_function(ef,_mi64(ids),_mbf16(self.w.audio),_mf32(x),grid_dim=(BB_D+255)//256,block_dim=256);self._run(lane,x,1,0,0,lm_host,0);cuda_free(x);cuda_free(ids)
 
+    def depth_lane(mut self,lane:Int,codes_host:UInt64,depth_host:UInt64) raises:
+        if lane<0 or lane>1:raise Error("invalid Breeze lane")
+        self.depth(codes_host,self.lanes[lane].last_hidden,depth_host)
+
     def depth(mut self,codes_host:UInt64,backbone_host:UInt64,logits_host:UInt64) raises:
         var S=CB;var T=256;var he=S*DD_D;var qe=S*DD_QD;var ke=S*DD_KVD;var fe=S*DD_FF
         var ids=cuda_malloc(CB*8);var bh=cuda_malloc(BB_D*4);var raw=cuda_malloc(CB*BB_D*4);var x=cuda_malloc(he*4);var n=cuda_malloc(he*4);var q=cuda_malloc(qe*4);var k=cuda_malloc(ke*4);var v=cuda_malloc(ke*4);var a=cuda_malloc(qe*4);var u=cuda_malloc(he*4);var g=cuda_malloc(fe*4);var up=cuda_malloc(fe*4);var bf=cuda_malloc(fe*2);var kc=cuda_malloc(S*DD_KVD*4);var vc=cuda_malloc(S*DD_KVD*4);var lo=cuda_malloc(15*DD_V*4)
