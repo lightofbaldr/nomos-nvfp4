@@ -12,6 +12,7 @@ from max.gpu.host import DeviceContext
 
 from lib.cuda import cuda_malloc, cuda_free, cuda_memcpy
 from lib.io import file_size_bytes, load_f32_file_to_gpu
+from lib.cublas import cublas_create, cublas_set_stream, cublas_sgemm
 
 
 comptime CODEBOOKS = 16
@@ -20,6 +21,7 @@ comptime VQ_DIM = 256
 comptime CODE_DIM = 512
 comptime LATENT_DIM = 1024
 comptime PRE_KERNEL = 3
+comptime TRANSFORMER_D = 512
 
 
 def _f32(ptr: UInt64) -> UnsafePointer[Float32, MutAnyOrigin]:
@@ -112,16 +114,47 @@ def codec_causal_preconv_kernel(
     output[i] = acc
 
 
+def codec_transpose_preconv_kernel(
+    input: UnsafePointer[Float32, MutAnyOrigin],   # [1024,T]
+    output: UnsafePointer[Float32, MutAnyOrigin],  # [T,1024]
+    frames_arg: Int32,
+):
+    var frames = Int(frames_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < LATENT_DIM * frames:
+        var channel = i // frames
+        var frame = i % frames
+        output[frame * LATENT_DIM + channel] = input[i]
+
+
+def codec_add_bias_kernel(
+    x: UnsafePointer[Float32, MutAnyOrigin],
+    bias: UnsafePointer[Float32, MutAnyOrigin],
+    rows_arg: Int32,
+    cols_arg: Int32,
+):
+    var rows = Int(rows_arg)
+    var cols = Int(cols_arg)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < rows * cols:
+        x[i] += bias[i % cols]
+
+
 struct BreezeCodec:
     var ctx: DeviceContext
+    var cublas: UInt64
     var tables_host: UnsafePointer[UInt64, MutUntrackedOrigin]
     var semantic_proj: UInt64
     var acoustic_proj: UInt64
     var preconv_weight: UInt64
     var preconv_bias: UInt64
+    var transformer_input_weight: UInt64
+    var transformer_input_bias: UInt64
 
     def __init__(out self, weights_dir: String) raises:
         self.ctx = DeviceContext()
+        self.cublas = cublas_create()
+        cublas_set_stream(self.cublas, self.ctx)
         self.tables_host = alloc[UInt64](CODEBOOKS)
         var prefix = weights_dir
         if not prefix.endswith("/"):
@@ -149,6 +182,14 @@ struct BreezeCodec:
             raise Error("missing/wrong-sized codec pre-conv bias")
         self.preconv_weight = load_f32_file_to_gpu(wpath)
         self.preconv_bias = load_f32_file_to_gpu(bpath)
+        var tiw = prefix + "codec_pre_transformer_input_proj_weight.f32"
+        var tib = prefix + "codec_pre_transformer_input_proj_bias.f32"
+        if file_size_bytes(tiw) != TRANSFORMER_D * LATENT_DIM * 4:
+            raise Error("missing/wrong-sized transformer input projection weight")
+        if file_size_bytes(tib) != TRANSFORMER_D * 4:
+            raise Error("missing/wrong-sized transformer input projection bias")
+        self.transformer_input_weight = load_f32_file_to_gpu(tiw)
+        self.transformer_input_bias = load_f32_file_to_gpu(tib)
 
     def run_frontend(
         mut self,
@@ -196,6 +237,43 @@ struct BreezeCodec:
         cuda_free(d_semantic); cuda_free(d_acoustic)
         cuda_free(d_quantized); cuda_free(d_preconv)
 
+    def run_transformer_input(
+        mut self,
+        preconv_host: UInt64,
+        frames: Int,
+        output_host: UInt64,
+    ) raises:
+        """Run the canonical [1024,T] -> [T,512] transformer input seam."""
+        if frames <= 0 or frames > 8000:
+            raise Error("codec frame count outside [1,8000]")
+        var in_elems = LATENT_DIM * frames
+        var out_elems = TRANSFORMER_D * frames
+        var d_channel_major = cuda_malloc(in_elems * 4)
+        var d_row_major = cuda_malloc(in_elems * 4)
+        var d_output = cuda_malloc(out_elems * 4)
+        cuda_memcpy(d_channel_major, preconv_host, in_elems * 4, 1)
+        var threads = 256
+        var transpose_fn = self.ctx.compile_function[codec_transpose_preconv_kernel]()
+        self.ctx.enqueue_function(
+            transpose_fn, _f32(d_channel_major), _f32(d_row_major), Int32(frames),
+            grid_dim=(in_elems + threads - 1) // threads, block_dim=threads,
+        )
+        cublas_sgemm(
+            self.cublas, d_row_major, self.transformer_input_weight, d_output,
+            frames, LATENT_DIM, TRANSFORMER_D,
+        )
+        var bias_fn = self.ctx.compile_function[codec_add_bias_kernel]()
+        self.ctx.enqueue_function(
+            bias_fn, _f32(d_output), _f32(self.transformer_input_bias),
+            Int32(frames), Int32(TRANSFORMER_D),
+            grid_dim=(out_elems + threads - 1) // threads, block_dim=threads,
+        )
+        self.ctx.synchronize()
+        cuda_memcpy(output_host, d_output, out_elems * 4, 2)
+        cuda_free(d_output)
+        cuda_free(d_row_major)
+        cuda_free(d_channel_major)
+
     def free(mut self):
         for q in range(CODEBOOKS):
             if self.tables_host[q] != 0:
@@ -209,3 +287,7 @@ struct BreezeCodec:
             cuda_free(self.preconv_weight)
         if self.preconv_bias != 0:
             cuda_free(self.preconv_bias)
+        if self.transformer_input_weight != 0:
+            cuda_free(self.transformer_input_weight)
+        if self.transformer_input_bias != 0:
+            cuda_free(self.transformer_input_bias)

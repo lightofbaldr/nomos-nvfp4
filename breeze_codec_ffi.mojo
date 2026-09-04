@@ -55,6 +55,27 @@ def nomos_breeze_codec_frontend(
 
 
 @export
+def nomos_breeze_codec_transformer_input(
+    handle: Int64,
+    preconv_ptr: Int64,
+    frames: Int32,
+    output_ptr: Int64,
+) -> Int32:
+    """Debug/parity seam: [1,1024,T] channel-major -> [1,T,512]."""
+    if handle == 0 or preconv_ptr == 0 or output_ptr == 0:
+        return Int32(-1)
+    try:
+        var ptr = UnsafePointer[BreezeCodec, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+        ptr[0].run_transformer_input(
+            UInt64(preconv_ptr), Int(frames), UInt64(output_ptr)
+        )
+        return Int32(0)
+    except e:
+        print("[nomos_breeze_codec_transformer_input EXC]", e)
+        return Int32(-99)
+
+
+@export
 def nomos_breeze_codec_free(handle: Int64) -> Int32:
     if handle == 0:
         return Int32(0)
