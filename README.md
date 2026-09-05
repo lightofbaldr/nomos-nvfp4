@@ -167,6 +167,65 @@ token-exact comparison against greedy.
 - `pyhost/` — Python serving host over the Mojo logits engine.
 - `tools/` — converters, probes, the bar token set, the precision guard, build gates.
 
+## Text-to-speech (Breeze-TTS-2)
+
+The same kernel runs [Breeze-TTS-2](https://huggingface.co/BreezeBlue/Breeze-TTS-2) as
+three standalone `.so`s — text encoder, backbone+depth decoder, audio codec — behind an
+OpenAI-shaped `/v1/audio/speech` endpoint with voice clone, natural-language voice design,
+and low-latency streaming. Everything from text to waveform runs on-kernel; only reference-audio
+encoding (once, at voice registration) uses the upstream stack.
+
+> **Weight license — read before deploying.** Breeze-TTS-2 **weights** are under the
+> [BreezeBlue Research and Non-Commercial License](https://huggingface.co/BreezeBlue/Breeze-TTS-2/blob/main/LICENSE):
+> research and non-commercial use only. Running a TTS service for an organization's
+> operations is a commercial purpose under that license even if nothing is sold, and needs
+> a separate license from BreezeBlue. This repository's TTS **code** is MIT like the rest;
+> the weights it loads are not. Voice cloning of a real person needs that person's consent
+> (license §5(c)), and outputs may not be used to train other models (§5(b)).
+
+Convert the checkpoint to kernel blobs, build the three `.so`s, then serve:
+
+```bash
+# 1. blobs (bf16 — the shipping precision; run in an env with torch + safetensors)
+python3 tools/convert_breeze_codec.py    $HF_DIR $HOME/nomos_data/breeze-tts-2/codec-blobs
+python3 tools/convert_breeze_encoder.py  $HF_DIR $HOME/nomos_data/breeze-tts-2/encoder-blobs
+python3 tools/convert_breeze_model.py    $HF_DIR $HOME/nomos_data/breeze-tts-2/model-blobs
+
+# 2. build (on the target GPU) + place the three .so in the deploy dir
+bash refresh_breeze_codec_build.sh && bash refresh_breeze_encoder_build.sh && bash refresh_breeze_model_build.sh
+mkdir -p $HOME/nomos_data/breeze-tts-2/deploy
+cp libnomos_{codec-qwen3_tts,encoder-breeze,model-breeze}.so $HOME/nomos_data/breeze-tts-2/deploy/
+
+# 3. serve (its own port; independent of the text serve)
+BREEZE_PORT=8095 pixi run uvicorn pyhost.breeze_serve:app --host 0.0.0.0 --port 8095
+curl -s localhost:8095/health
+```
+
+Then generate. **Voice design** (a described voice, no reference audio — CFG-guided, the
+two-lane paired route):
+
+```bash
+curl localhost:8095/v1/audio/speech -H 'Content-Type: application/json' -d '{
+  "input": "(sigh) Welcome aboard. Your journey begins now.",
+  "instruction": "A warm, thoughtful young woman with a calm, reflective delivery."
+}' -o out.wav
+```
+
+**Voice clone** — register a reference clip + its exact transcript once, then call by name:
+
+```bash
+# registration runs in the reference env (torch + qwen-tts); it encodes the ref audio once
+python3 tools/breeze_register_voice.py alice ref.wav "The exact words spoken in ref.wav."
+curl localhost:8095/v1/audio/speech -H 'Content-Type: application/json' \
+  -d '{"input": "Now speaking in the registered voice.", "voice": "alice"}' -o out.wav
+```
+
+**Streaming** — `stream: true` with `response_format: "pcm"` yields s16le/24 kHz mono chunks
+as frames generate (matches the non-streaming waveform to within one int16 LSB; `wav` mode is
+the canonical output). Voice names are registry slugs (`[A-Za-z0-9_-]`). Vocal events go inline
+in the text — `(laugh)`, `(sigh)` in English; `[笑]`, `[叹气]` in Chinese. Design docs and the
+per-stage correctness gates: **[`docs/BREEZE_TTS_DESIGN.md`](docs/BREEZE_TTS_DESIGN.md)**.
+
 ## Hardware
 
 | Target | Arch | Precision | State |
