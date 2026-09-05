@@ -12,6 +12,8 @@ from layout import row_major, stack_allocation
 from lib.cuda import cuda_malloc, cuda_free, cuda_memcpy
 from lib.io import load_bf16_file_to_gpu
 from lib.cublas import cublas_create, cublas_set_stream, gpu_matmul_bf16_dev_batched
+from lib.fp4_weights import load_to_gpu_nvfp4
+from lib.gemma4_layer import _mm_dev_batched, W4A4Scratch
 
 comptime BB_D=2048
 comptime BB_FF=6144
@@ -153,13 +155,23 @@ def bm_depth_head_one(hidden:UnsafePointer[Float32,MutAnyOrigin],weights:UnsafeP
         for d in range(DD_D):z+=hidden[d]*Float32(weights[wo+d*DD_V])
         output[token]=z
 
+def _bm_load_projection(stem:String,mut gs:List[Float32],mut ags:List[Float32]) raises -> UInt64:
+    var w=load_to_gpu_nvfp4(stem+".nvfp4",gs,ags)
+    if w!=0:return w
+    w=load_bf16_file_to_gpu(stem+".bf16")
+    if w==0:raise Error("missing Breeze backbone projection: "+stem+".{nvfp4,bf16}")
+    return w
+
 struct BMWeights(Movable):
     var q:List[UInt64];var k:List[UInt64];var v:List[UInt64];var o:List[UInt64];var qn:List[UInt64];var kn:List[UInt64];var ni:List[UInt64];var np:List[UInt64];var g:List[UInt64];var u:List[UInt64];var d:List[UInt64];var norm:UInt64;var head:UInt64;var audio:UInt64
+    var qgs:List[Float32];var qags:List[Float32];var kgs:List[Float32];var kags:List[Float32];var vgs:List[Float32];var vags:List[Float32];var ogs:List[Float32];var oags:List[Float32];var ggs:List[Float32];var gags:List[Float32];var ugs:List[Float32];var uags:List[Float32];var dgs:List[Float32];var dags:List[Float32]
     def __init__(out self,b:String) raises:
         self.q=List[UInt64]();self.k=List[UInt64]();self.v=List[UInt64]();self.o=List[UInt64]();self.qn=List[UInt64]();self.kn=List[UInt64]();self.ni=List[UInt64]();self.np=List[UInt64]();self.g=List[UInt64]();self.u=List[UInt64]();self.d=List[UInt64]()
+        self.qgs=List[Float32]();self.qags=List[Float32]();self.kgs=List[Float32]();self.kags=List[Float32]();self.vgs=List[Float32]();self.vags=List[Float32]();self.ogs=List[Float32]();self.oags=List[Float32]();self.ggs=List[Float32]();self.gags=List[Float32]();self.ugs=List[Float32]();self.uags=List[Float32]();self.dgs=List[Float32]();self.dags=List[Float32]()
         for l in range(BB_L):
             var p=b+"backbone_model_layers_"+String(l)+"_"
-            self.q.append(load_bf16_file_to_gpu(p+"self_attn_q_proj_weight.bf16"));self.k.append(load_bf16_file_to_gpu(p+"self_attn_k_proj_weight.bf16"));self.v.append(load_bf16_file_to_gpu(p+"self_attn_v_proj_weight.bf16"));self.o.append(load_bf16_file_to_gpu(p+"self_attn_o_proj_weight.bf16"));self.qn.append(load_bf16_file_to_gpu(p+"self_attn_q_norm_weight.bf16"));self.kn.append(load_bf16_file_to_gpu(p+"self_attn_k_norm_weight.bf16"));self.ni.append(load_bf16_file_to_gpu(p+"input_layernorm_weight.bf16"));self.np.append(load_bf16_file_to_gpu(p+"post_attention_layernorm_weight.bf16"));self.g.append(load_bf16_file_to_gpu(p+"mlp_gate_proj_weight.bf16"));self.u.append(load_bf16_file_to_gpu(p+"mlp_up_proj_weight.bf16"));self.d.append(load_bf16_file_to_gpu(p+"mlp_down_proj_weight.bf16"))
+            self.q.append(_bm_load_projection(p+"self_attn_q_proj_weight",self.qgs,self.qags));self.k.append(_bm_load_projection(p+"self_attn_k_proj_weight",self.kgs,self.kags));self.v.append(_bm_load_projection(p+"self_attn_v_proj_weight",self.vgs,self.vags));self.o.append(_bm_load_projection(p+"self_attn_o_proj_weight",self.ogs,self.oags));self.g.append(_bm_load_projection(p+"mlp_gate_proj_weight",self.ggs,self.gags));self.u.append(_bm_load_projection(p+"mlp_up_proj_weight",self.ugs,self.uags));self.d.append(_bm_load_projection(p+"mlp_down_proj_weight",self.dgs,self.dags))
+            self.qn.append(load_bf16_file_to_gpu(p+"self_attn_q_norm_weight.bf16"));self.kn.append(load_bf16_file_to_gpu(p+"self_attn_k_norm_weight.bf16"));self.ni.append(load_bf16_file_to_gpu(p+"input_layernorm_weight.bf16"));self.np.append(load_bf16_file_to_gpu(p+"post_attention_layernorm_weight.bf16"))
         self.norm=load_bf16_file_to_gpu(b+"backbone_model_norm_weight.bf16");self.head=load_bf16_file_to_gpu(b+"lm_head_weight.bf16");self.audio=load_bf16_file_to_gpu(b+"depth_decoder_model_embed_tokens_weight.bf16")
 
 struct DDWeights(Movable):
@@ -182,18 +194,22 @@ struct BreezeModel(Movable):
     def __init__(out self,path:String) raises:
         self.ctx=DeviceContext();self.h=cublas_create();cublas_set_stream(self.h,self.ctx);var b=path if path.endswith("/") else path+"/";self.w=BMWeights(b);self.dw=DDWeights(b);self.lanes=List[BMLane]();self.lanes.append(BMLane());self.lanes.append(BMLane())
 
+    def _bbmm(mut self,dst:UInt64,src:UInt64,weight:UInt64,bf:UInt64,ws:UInt64,S:Int,K:Int,N:Int,gs:Float32,ags:Float32,w4:W4A4Scratch,l:Int,p:String) raises:
+        if gs!=0.0:_mm_dev_batched(self.ctx,self.h,dst,src,weight,bf,S,K,N,ws,gs,ags,w4,l,p)
+        else:gpu_matmul_bf16_dev_batched(self.ctx,self.h,dst,src,weight,bf,S,K,N)
+
     def _run(mut self,lane:Int,x:UInt64,S:Int,layers_host:UInt64,final_host:UInt64,logits_host:UInt64,last_dev:UInt64) raises:
         var start=self.lanes[lane].length;var T=256;var he=S*BB_D;var qe=S*BB_QD;var ke=S*BB_KVD;var fe=S*BB_FF
-        var n=cuda_malloc(he*4);var q=cuda_malloc(qe*4);var k=cuda_malloc(ke*4);var v=cuda_malloc(ke*4);var a=cuda_malloc(qe*4);var u=cuda_malloc(he*4);var g=cuda_malloc(fe*4);var up=cuda_malloc(fe*4);var bf=cuda_malloc(fe*2);var lo=cuda_malloc(BB_V*4)
+        var n=cuda_malloc(he*4);var q=cuda_malloc(qe*4);var k=cuda_malloc(ke*4);var v=cuda_malloc(ke*4);var a=cuda_malloc(qe*4);var u=cuda_malloc(he*4);var g=cuda_malloc(fe*4);var up=cuda_malloc(fe*4);var bf=cuda_malloc(fe*2);var lo=cuda_malloc(BB_V*4);var ws=cuda_malloc(BB_D*BB_FF*2);var w4=W4A4Scratch(0,0,0,0,0,False,0,0)
         var rms=self.ctx.compile_function[bm_rms]();var qkn=self.ctx.compile_function[bm_qknorm]();var rope=self.ctx.compile_function[bm_rope]();var skv=self.ctx.compile_function[bm_store_kv]();var att=self.ctx.compile_function[bm_attn]();var add=self.ctx.compile_function[bm_add]();var sw=self.ctx.compile_function[bm_swiglu]()
         for l in range(BB_L):
             self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.w.ni[l]),_mf32(n),Int32(S),Int32(BB_D),Float32(1e-6),grid_dim=S,block_dim=1)
-            gpu_matmul_bf16_dev_batched(self.ctx,self.h,q,n,self.w.q[l],bf,S,BB_D,BB_QD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,k,n,self.w.k[l],bf,S,BB_D,BB_KVD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,v,n,self.w.v[l],bf,S,BB_D,BB_KVD)
+            self._bbmm(q,n,self.w.q[l],bf,ws,S,BB_D,BB_QD,self.w.qgs[l],self.w.qags[l],w4,l,"q");self._bbmm(k,n,self.w.k[l],bf,ws,S,BB_D,BB_KVD,self.w.kgs[l],self.w.kags[l],w4,l,"k");self._bbmm(v,n,self.w.v[l],bf,ws,S,BB_D,BB_KVD,self.w.vgs[l],self.w.vags[l],w4,l,"v")
             self.ctx.enqueue_function(qkn,_mf32(q),_mbf16(self.w.qn[l]),Int32(S*BB_NH),Float32(1e-6),grid_dim=S*BB_NH,block_dim=1);self.ctx.enqueue_function(qkn,_mf32(k),_mbf16(self.w.kn[l]),Int32(S*BB_NKV),Float32(1e-6),grid_dim=S*BB_NKV,block_dim=1)
             self.ctx.enqueue_function(rope,_mf32(q),Int32(S),Int32(BB_NH),Int32(start),Float32(1e6),Float32(1),grid_dim=(S*BB_NH*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(rope,_mf32(k),Int32(S),Int32(BB_NKV),Int32(start),Float32(1e6),Float32(1),grid_dim=(S*BB_NKV*64+T-1)//T,block_dim=T)
             self.ctx.enqueue_function(skv,_mf32(k),_mf32(v),_mf32(self.lanes[lane].kc[l]),_mf32(self.lanes[lane].vc[l]),Int32(S),Int32(start),Int32(BB_KVD),grid_dim=(ke+T-1)//T,block_dim=T);self.ctx.enqueue_function(att,_mf32(q),_mf32(self.lanes[lane].kc[l]),_mf32(self.lanes[lane].vc[l]),_mf32(a),Int32(S),Int32(start),Int32(BB_NH),Int32(BB_NKV),grid_dim=S*BB_NH,block_dim=128)
-            gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,a,self.w.o[l],bf,S,BB_QD,BB_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
-            self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.w.np[l]),_mf32(n),Int32(S),Int32(BB_D),Float32(1e-6),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,g,n,self.w.g[l],bf,S,BB_D,BB_FF);gpu_matmul_bf16_dev_batched(self.ctx,self.h,up,n,self.w.u[l],bf,S,BB_D,BB_FF);self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,g,self.w.d[l],bf,S,BB_FF,BB_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
+            self._bbmm(u,a,self.w.o[l],bf,ws,S,BB_QD,BB_D,self.w.ogs[l],self.w.oags[l],w4,l,"o");self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
+            self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.w.np[l]),_mf32(n),Int32(S),Int32(BB_D),Float32(1e-6),grid_dim=S,block_dim=1);self._bbmm(g,n,self.w.g[l],bf,ws,S,BB_D,BB_FF,self.w.ggs[l],self.w.gags[l],w4,l,"gate");self._bbmm(up,n,self.w.u[l],bf,ws,S,BB_D,BB_FF,self.w.ugs[l],self.w.uags[l],w4,l,"up");self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);self._bbmm(u,g,self.w.d[l],bf,ws,S,BB_FF,BB_D,self.w.dgs[l],self.w.dags[l],w4,l,"down");self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
             if layers_host!=0:self.ctx.synchronize();cuda_memcpy(layers_host+UInt64(l*he*4),x,he*4,2)
         self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.w.norm),_mf32(n),Int32(S),Int32(BB_D),Float32(1e-6),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,lo,n+UInt64((S-1)*BB_D*4),self.w.head,bf,1,BB_D,BB_V);self.ctx.synchronize()
         if final_host!=0:cuda_memcpy(final_host,n,he*4,2)
@@ -201,7 +217,7 @@ struct BreezeModel(Movable):
         cuda_memcpy(self.lanes[lane].last_hidden,n+UInt64((S-1)*BB_D*4),BB_D*4,3)
         if last_dev!=0:cuda_memcpy(last_dev,self.lanes[lane].last_hidden,BB_D*4,3)
         self.lanes[lane].length=start+S
-        cuda_free(lo);cuda_free(bf);cuda_free(up);cuda_free(g);cuda_free(u);cuda_free(a);cuda_free(v);cuda_free(k);cuda_free(q);cuda_free(n)
+        cuda_free(ws);cuda_free(lo);cuda_free(bf);cuda_free(up);cuda_free(g);cuda_free(u);cuda_free(a);cuda_free(v);cuda_free(k);cuda_free(q);cuda_free(n)
 
     def prefill_lane(mut self,lane:Int,embeds_host:UInt64,S:Int,layers_host:UInt64,final_host:UInt64,logits_host:UInt64) raises:
         if lane<0 or lane>1 or S<=0 or S>MAX_SEQ:raise Error("invalid Breeze lane/prefill length")
