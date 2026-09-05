@@ -178,10 +178,12 @@ encoding (once, at voice registration) uses the upstream stack.
 > **Weight license — read before deploying.** Breeze-TTS-2 **weights** are under the
 > [BreezeBlue Research and Non-Commercial License](https://huggingface.co/BreezeBlue/Breeze-TTS-2/blob/main/LICENSE):
 > research and non-commercial use only. Running a TTS service for an organization's
-> operations is a commercial purpose under that license even if nothing is sold, and needs
-> a separate license from BreezeBlue. This repository's TTS **code** is MIT like the rest;
-> the weights it loads are not. Voice cloning of a real person needs that person's consent
-> (license §5(c)), and outputs may not be used to train other models (§5(b)).
+> operations beyond limited evaluation is a commercial purpose under that license even if
+> nothing is sold, and needs a separate written license from BreezeBlue. This repository's
+> TTS **code** is MIT like the rest; the weights it loads are not, and converted or NVFP4
+> blobs are derivative models under the same license (do not redistribute them). Voice
+> cloning of a real person needs that person's explicit consent (license §5(c)), and outputs
+> may not be used to train other models (§5(b)).
 
 Convert the checkpoint to kernel blobs, build the three `.so`s, then serve:
 

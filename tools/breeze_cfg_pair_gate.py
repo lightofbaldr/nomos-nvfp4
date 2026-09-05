@@ -10,6 +10,7 @@ import argparse
 import ctypes as C
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -110,8 +111,10 @@ def metrics(lm, dp, lg, dg):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--so", default="./libnomos_model-breeze.so")
-    ap.add_argument("--blobs", default="/home/adam/nomos_data/breeze-tts-2/model-blobs/")
-    ap.add_argument("--bench", default="/home/adam/kvasir/bench")
+    ap.add_argument("--blobs", default=os.path.expanduser("~/nomos_data/breeze-tts-2/model-blobs/"))
+    ap.add_argument("--bench", required=True,
+                    help="dir holding breeze_model_goldens.npz + breeze_codec_codes_golden.npz "
+                         "(captured from the HF reference; not distributed)")
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--output", type=Path)
     a = ap.parse_args()

@@ -49,9 +49,12 @@ returns -99 through the existing exception convention.
 
 ```sh
 ./refresh_breeze_model_build.sh
-python3 tools/breeze_cfg_pair_gate.py --repeats 3 --output /tmp/cfg-pair.json
-python3 /home/adam/kvasir/bench/breeze_m3_gate.py ./libnomos_model-breeze.so
+python3 tools/breeze_cfg_pair_gate.py --bench <dir with the two golden .npz> --repeats 3 --output /tmp/cfg-pair.json
 ```
+
+The goldens (`breeze_model_goldens.npz`, `breeze_codec_codes_golden.npz`) are captured
+from the HF reference per the design doc's M0 and are not distributed here (they derive
+from the model weights). The sequential arm of this replay is the original M3 gate.
 
 The paired replay uses the two actual prefixes and all 35 captured frames.
 It requires 36/36 backbone top1 matches for each lane, zero depth misses at
