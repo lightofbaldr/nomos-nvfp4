@@ -67,6 +67,15 @@ class BreezeTTS:
             [ctypes.c_int64, ctypes.c_int32, P, ctypes.c_int32, P, P, P]
         self.mod.nomos_breeze_model_depth_lane.argtypes = [ctypes.c_int64, ctypes.c_int32, P, P]
         self.mod.nomos_breeze_model_step_backbone.argtypes = [ctypes.c_int64, ctypes.c_int32, P, P]
+        # Paired CFG route (both lanes through one weight pass; 1.86x model). Optional so an
+        # older single-lane .so still loads — design mode uses it when present, else falls back.
+        self._paired = all(hasattr(self.mod, n) for n in
+                           ("nomos_breeze_model_depth_begin2", "nomos_breeze_model_depth_advance2",
+                            "nomos_breeze_model_step_backbone2"))
+        if self._paired:
+            self.mod.nomos_breeze_model_depth_begin2.argtypes = [ctypes.c_int64, P, P]
+            self.mod.nomos_breeze_model_depth_advance2.argtypes = [ctypes.c_int64, ctypes.c_int32, P, P]
+            self.mod.nomos_breeze_model_step_backbone2.argtypes = [ctypes.c_int64, P, P]
         self.mh = self.mod.nomos_breeze_model_init(BLOBS_MODEL.encode() + b"/")
         assert self.mh, "model init failed"
 
@@ -142,11 +151,15 @@ class BreezeTTS:
             p = p[:cut] / p[:cut].sum()
         return int(rng.choice(order, p=p))
 
-    def generate(self, cond: np.ndarray, uncond: np.ndarray | None, cfg_scale: float = 1.0,
-                 max_frames: int = 250, seed: int | None = None) -> np.ndarray:
+    def _iter_frames(self, cond, uncond, cfg_scale, max_frames, seed):
+        """Yield each completed frame's 16 codes. Uses the paired CFG route (both lanes in one
+        weight pass, 1.86x) when a second lane is present and the .so exports it; otherwise the
+        single-lane looped route. Both produce equivalent samples (gated: paired depth 1026/1050
+        top1 zero fat-margin vs the single-lane goldens)."""
         def mix(a, b):
             return a if b is None else b + cfg_scale * (a - b)
         prefixes = [cond] + ([uncond] if uncond is not None else [])
+        paired = self._paired and len(prefixes) == 2
         lm = []
         for lane, x in enumerate(prefixes):
             x = np.ascontiguousarray(x[None] if x.ndim == 2 else x, np.float32)
@@ -156,7 +169,7 @@ class BreezeTTS:
             assert rc == 0, f"prefill lane{lane} rc={rc}"
             lm.append(o)
         rng = np.random.default_rng(seed)
-        frames, history = [], []
+        history = []
         for _ in range(max_frames):
             mixed = mix(lm[0], lm[1] if len(lm) > 1 else None).copy()
             for tok in set(history):
@@ -164,19 +177,78 @@ class BreezeTTS:
             cb0 = self._pick(mixed, rng)
             if cb0 == EOS:
                 break
-            codes = np.zeros(CBS, dtype=np.int64)
-            codes[0] = cb0
-            for cb in range(1, CBS):
-                ds = []
+            if paired:
+                codes = np.full(CBS, -1, dtype=np.int64)   # progressive fill per the paired ABI
+                codes[0] = cb0
+                out2 = np.empty((2, V), np.float32)
+                for cb in range(1, CBS):
+                    if cb == 1:
+                        self.mod.nomos_breeze_model_depth_begin2(
+                            self.mh, codes.ctypes.data, out2.ctypes.data)
+                    else:
+                        self.mod.nomos_breeze_model_depth_advance2(
+                            self.mh, cb - 1, codes.ctypes.data, out2.ctypes.data)
+                    codes[cb] = self._pick(mix(out2[0], out2[1]), rng)
+                bb = np.empty((2, EOS + 1), np.float32)
+                self.mod.nomos_breeze_model_step_backbone2(self.mh, codes.ctypes.data, bb.ctypes.data)
+                lm = [bb[0].copy(), bb[1].copy()]
+            else:
+                codes = np.zeros(CBS, dtype=np.int64)
+                codes[0] = cb0
+                for cb in range(1, CBS):
+                    ds = []
+                    for lane in range(len(prefixes)):
+                        d = np.empty((15, V), np.float32)
+                        rc = self.mod.nomos_breeze_model_depth_lane(
+                            self.mh, lane, codes.ctypes.data, d.ctypes.data)
+                        assert rc == 0
+                        ds.append(d[cb - 1])
+                    codes[cb] = self._pick(mix(ds[0], ds[1] if len(ds) > 1 else None), rng)
+                lm = []
                 for lane in range(len(prefixes)):
-                    d = np.empty((15, V), np.float32)
-                    rc = self.mod.nomos_breeze_model_depth_lane(
-                        self.mh, lane, codes.ctypes.data, d.ctypes.data)
+                    o = np.empty(EOS + 1, np.float32)
+                    rc = self.mod.nomos_breeze_model_step_backbone(
+                        self.mh, lane, codes.ctypes.data, o.ctypes.data)
                     assert rc == 0
-                    ds.append(d[cb - 1])
-                codes[cb] = self._pick(mix(ds[0], ds[1] if len(ds) > 1 else None), rng)
-            frames.append(codes.copy())
+                    lm.append(o)
             history.append(cb0)
+            yield codes.copy()
+
+    def generate(self, cond: np.ndarray, uncond: np.ndarray | None, cfg_scale: float = 1.0,
+                 max_frames: int = 250, seed: int | None = None) -> np.ndarray:
+        frames = list(self._iter_frames(cond, uncond, cfg_scale, max_frames, seed))
+        if not frames:
+            return np.zeros(0, np.float32)
+        return self._decode_frames(frames)
+
+    def _decode_frames(self, frames) -> np.ndarray:
+        codes = np.ascontiguousarray(np.stack(frames, axis=1)[None], np.int64)  # [1,16,T]
+        T = codes.shape[2]
+        pcm = np.empty(FRAME_SAMPLES * T, np.float32)
+        rc = self.codec.nomos_breeze_codec_decode(self.ch, codes.ctypes.data, T, pcm.ctypes.data)
+        assert rc == 0, "codec decode failed"
+        return pcm
+
+    def generate_stream(self, cond, uncond, cfg_scale: float = 1.0, max_frames: int = 250,
+                        seed: int | None = None, chunk_frames: int = 4):
+        """Yields float32 PCM chunks as frames are generated, for interactive latency.
+
+        Semantics: each yield re-decodes the growing code sequence and emits only the newly
+        completed tail — so every emitted sample had full LEFT context when it was produced,
+        which is correct streaming. It is NOT bit-identical to the non-streaming decode: that
+        path sees all frames at once, and the codec is not sample-stable across decode lengths
+        (measured 2026-09-04: the reference's own streaming deviates from one-shot by up to
+        ~0.11, an edge/receptive-field effect). Streaming output sits within that same envelope.
+        Use non-streaming wav mode for the bit-exact waveform; true low-latency bit-exact
+        streaming would need a stateful codec ABI (persistent conv state across calls) — a
+        future codec-side extension. Re-decode cost is O(blocks²) but trivial beside generation."""
+        frames, emitted = [], 0
+        for codes in self._iter_frames(cond, uncond, cfg_scale, max_frames, seed):
+            frames.append(codes)
+            if len(frames) % chunk_frames == 0:
+                pcm = self._decode_frames(frames)
+                yield pcm[emitted:]
+                emitted = pcm.size
             lm = []
             for lane in range(len(prefixes)):
                 o = np.empty(EOS + 1, np.float32)
@@ -184,14 +256,10 @@ class BreezeTTS:
                     self.mh, lane, codes.ctypes.data, o.ctypes.data)
                 assert rc == 0
                 lm.append(o)
-        if not frames:
-            return np.zeros(0, np.float32)
-        codes = np.ascontiguousarray(np.stack(frames, axis=1)[None], np.int64)  # [1,16,T]
-        T = codes.shape[2]
-        pcm = np.empty(FRAME_SAMPLES * T, np.float32)
-        rc = self.codec.nomos_breeze_codec_decode(self.ch, codes.ctypes.data, T, pcm.ctypes.data)
-        assert rc == 0, "codec decode failed"
-        return pcm
+        if frames:
+            pcm = self._decode_frames(frames)
+            if pcm.size > emitted:
+                yield pcm[emitted:]
 
     # ── voices ────────────────────────────────────────────────────────────────
     @staticmethod

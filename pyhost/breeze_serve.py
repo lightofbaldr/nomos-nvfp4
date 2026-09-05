@@ -25,7 +25,7 @@ from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 import os
@@ -55,6 +55,7 @@ class SpeechReq(BaseModel):
     seed: int | None = None
     max_frames: int = Field(default=250, ge=1, le=1500)
     response_format: str = "wav"
+    stream: bool = False
 
 
 def _wav_bytes(pcm: np.ndarray) -> bytes:
@@ -81,8 +82,10 @@ def voices() -> dict[str, Any]:
 @app.post("/v1/audio/speech")
 def speech(req: SpeechReq) -> Response:
     tts: BreezeTTS = app.state.tts
-    if req.response_format not in ("wav",):
-        raise HTTPException(400, "response_format must be 'wav' (streaming pcm is the M6 follow-on)")
+    if req.stream and req.response_format not in ("pcm",):
+        raise HTTPException(400, "stream=true requires response_format 'pcm' (s16le mono 24000 Hz)")
+    if not req.stream and req.response_format not in ("wav",):
+        raise HTTPException(400, "response_format must be 'wav' (or 'pcm' with stream=true)")
     voice_codes = ref_text = None
     if req.voice:
         try:
@@ -90,6 +93,19 @@ def speech(req: SpeechReq) -> Response:
         except FileNotFoundError:
             raise HTTPException(404, f"unknown voice '{req.voice}'; see /v1/voices")
     cfg = req.cfg_scale if req.cfg_scale is not None else (4.0 if (req.instruction and not req.voice) else 1.0)
+    if req.stream:
+        def chunks():
+            # The lock spans the whole generation: the kernel handles are serial state.
+            with app.state.lock:
+                cond, uncond = tts.build_prefixes(req.input, speaker=req.speaker,
+                                                  instruction=req.instruction,
+                                                  voice_codes=voice_codes, ref_text=ref_text)
+                for pcm in tts.generate_stream(cond, uncond, cfg_scale=cfg,
+                                               max_frames=req.max_frames, seed=req.seed):
+                    yield (np.clip(pcm, -1, 1) * 32767).astype("<i2").tobytes()
+        return StreamingResponse(chunks(), media_type="audio/pcm",
+                                 headers={"X-Sample-Rate": "24000", "X-Channels": "1",
+                                          "X-Format": "s16le"})
     with app.state.lock:
         cond, uncond = tts.build_prefixes(req.input, speaker=req.speaker,
                                           instruction=req.instruction,
