@@ -198,25 +198,34 @@ struct BreezeModel(Movable):
         if gs!=0.0:_mm_dev_batched(self.ctx,self.h,dst,src,weight,bf,S,K,N,ws,gs,ags,w4,l,p)
         else:gpu_matmul_bf16_dev_batched(self.ctx,self.h,dst,src,weight,bf,S,K,N)
 
-    def _run(mut self,lane:Int,x:UInt64,S:Int,layers_host:UInt64,final_host:UInt64,logits_host:UInt64,last_dev:UInt64) raises:
-        var start=self.lanes[lane].length;var T=256;var he=S*BB_D;var qe=S*BB_QD;var ke=S*BB_KVD;var fe=S*BB_FF
-        var n=cuda_malloc(he*4);var q=cuda_malloc(qe*4);var k=cuda_malloc(ke*4);var v=cuda_malloc(ke*4);var a=cuda_malloc(qe*4);var u=cuda_malloc(he*4);var g=cuda_malloc(fe*4);var up=cuda_malloc(fe*4);var bf=cuda_malloc(fe*2);var lo=cuda_malloc(BB_V*4);var ws=cuda_malloc(BB_D*BB_FF*2);var w4=W4A4Scratch(0,0,0,0,0,False,0,0)
+    def _run(mut self,lane:Int,x:UInt64,S:Int,layers_host:UInt64,final_host:UInt64,logits_host:UInt64,last_dev:UInt64,paired:Bool=False) raises:
+        var start=self.lanes[lane].length;var count=2 if paired else 1;var rows=1 if paired else S;var T=256;var he=S*BB_D;var qe=S*BB_QD;var ke=S*BB_KVD;var fe=S*BB_FF
+        var n=cuda_malloc(he*4);var q=cuda_malloc(qe*4);var k=cuda_malloc(ke*4);var v=cuda_malloc(ke*4);var a=cuda_malloc(qe*4);var u=cuda_malloc(he*4);var g=cuda_malloc(fe*4);var up=cuda_malloc(fe*4);var bf=cuda_malloc(fe*2);var lo=cuda_malloc(count*BB_V*4);var ws=cuda_malloc(BB_D*BB_FF*2);var w4=W4A4Scratch(0,0,0,0,0,False,0,0)
         var rms=self.ctx.compile_function[bm_rms]();var qkn=self.ctx.compile_function[bm_qknorm]();var rope=self.ctx.compile_function[bm_rope]();var skv=self.ctx.compile_function[bm_store_kv]();var att=self.ctx.compile_function[bm_attn]();var add=self.ctx.compile_function[bm_add]();var sw=self.ctx.compile_function[bm_swiglu]()
         for l in range(BB_L):
             self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.w.ni[l]),_mf32(n),Int32(S),Int32(BB_D),Float32(1e-6),grid_dim=S,block_dim=1)
             self._bbmm(q,n,self.w.q[l],bf,ws,S,BB_D,BB_QD,self.w.qgs[l],self.w.qags[l],w4,l,"q");self._bbmm(k,n,self.w.k[l],bf,ws,S,BB_D,BB_KVD,self.w.kgs[l],self.w.kags[l],w4,l,"k");self._bbmm(v,n,self.w.v[l],bf,ws,S,BB_D,BB_KVD,self.w.vgs[l],self.w.vags[l],w4,l,"v")
             self.ctx.enqueue_function(qkn,_mf32(q),_mbf16(self.w.qn[l]),Int32(S*BB_NH),Float32(1e-6),grid_dim=S*BB_NH,block_dim=1);self.ctx.enqueue_function(qkn,_mf32(k),_mbf16(self.w.kn[l]),Int32(S*BB_NKV),Float32(1e-6),grid_dim=S*BB_NKV,block_dim=1)
-            self.ctx.enqueue_function(rope,_mf32(q),Int32(S),Int32(BB_NH),Int32(start),Float32(1e6),Float32(1),grid_dim=(S*BB_NH*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(rope,_mf32(k),Int32(S),Int32(BB_NKV),Int32(start),Float32(1e6),Float32(1),grid_dim=(S*BB_NKV*64+T-1)//T,block_dim=T)
-            self.ctx.enqueue_function(skv,_mf32(k),_mf32(v),_mf32(self.lanes[lane].kc[l]),_mf32(self.lanes[lane].vc[l]),Int32(S),Int32(start),Int32(BB_KVD),grid_dim=(ke+T-1)//T,block_dim=T);self.ctx.enqueue_function(att,_mf32(q),_mf32(self.lanes[lane].kc[l]),_mf32(self.lanes[lane].vc[l]),_mf32(a),Int32(S),Int32(start),Int32(BB_NH),Int32(BB_NKV),grid_dim=S*BB_NH,block_dim=128)
+            # Lane-major GEMM rows; each attention domain keeps its own prefix.
+            for ln in range(count):
+                var which=ln if paired else lane
+                var pos=self.lanes[which].length
+                var qo=q+UInt64(ln*rows*BB_QD*4);var ko=k+UInt64(ln*rows*BB_KVD*4);var vo=v+UInt64(ln*rows*BB_KVD*4);var ao=a+UInt64(ln*rows*BB_QD*4)
+                self.ctx.enqueue_function(rope,_mf32(qo),Int32(rows),Int32(BB_NH),Int32(pos),Float32(1e6),Float32(1),grid_dim=(rows*BB_NH*64+T-1)//T,block_dim=T)
+                self.ctx.enqueue_function(rope,_mf32(ko),Int32(rows),Int32(BB_NKV),Int32(pos),Float32(1e6),Float32(1),grid_dim=(rows*BB_NKV*64+T-1)//T,block_dim=T)
+                self.ctx.enqueue_function(skv,_mf32(ko),_mf32(vo),_mf32(self.lanes[which].kc[l]),_mf32(self.lanes[which].vc[l]),Int32(rows),Int32(pos),Int32(BB_KVD),grid_dim=(rows*BB_KVD+T-1)//T,block_dim=T)
+                self.ctx.enqueue_function(att,_mf32(qo),_mf32(self.lanes[which].kc[l]),_mf32(self.lanes[which].vc[l]),_mf32(ao),Int32(rows),Int32(pos),Int32(BB_NH),Int32(BB_NKV),grid_dim=rows*BB_NH,block_dim=128)
             self._bbmm(u,a,self.w.o[l],bf,ws,S,BB_QD,BB_D,self.w.ogs[l],self.w.oags[l],w4,l,"o");self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
             self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.w.np[l]),_mf32(n),Int32(S),Int32(BB_D),Float32(1e-6),grid_dim=S,block_dim=1);self._bbmm(g,n,self.w.g[l],bf,ws,S,BB_D,BB_FF,self.w.ggs[l],self.w.gags[l],w4,l,"gate");self._bbmm(up,n,self.w.u[l],bf,ws,S,BB_D,BB_FF,self.w.ugs[l],self.w.uags[l],w4,l,"up");self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);self._bbmm(u,g,self.w.d[l],bf,ws,S,BB_FF,BB_D,self.w.dgs[l],self.w.dags[l],w4,l,"down");self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
             if layers_host!=0:self.ctx.synchronize();cuda_memcpy(layers_host+UInt64(l*he*4),x,he*4,2)
-        self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.w.norm),_mf32(n),Int32(S),Int32(BB_D),Float32(1e-6),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,lo,n+UInt64((S-1)*BB_D*4),self.w.head,bf,1,BB_D,BB_V);self.ctx.synchronize()
+        self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.w.norm),_mf32(n),Int32(S),Int32(BB_D),Float32(1e-6),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,lo,n+UInt64((0 if paired else S-1)*BB_D*4),self.w.head,bf,count,BB_D,BB_V);self.ctx.synchronize()
         if final_host!=0:cuda_memcpy(final_host,n,he*4,2)
-        if logits_host!=0:cuda_memcpy(logits_host,lo,BB_V*4,2)
-        cuda_memcpy(self.lanes[lane].last_hidden,n+UInt64((S-1)*BB_D*4),BB_D*4,3)
+        if logits_host!=0:cuda_memcpy(logits_host,lo,count*BB_V*4,2)
+        for ln in range(count):
+            var which=ln if paired else lane
+            cuda_memcpy(self.lanes[which].last_hidden,n+UInt64((ln if paired else S-1)*BB_D*4),BB_D*4,3)
+            self.lanes[which].length+=rows
         if last_dev!=0:cuda_memcpy(last_dev,self.lanes[lane].last_hidden,BB_D*4,3)
-        self.lanes[lane].length=start+S
         cuda_free(ws);cuda_free(lo);cuda_free(bf);cuda_free(up);cuda_free(g);cuda_free(u);cuda_free(a);cuda_free(v);cuda_free(k);cuda_free(q);cuda_free(n)
 
     def prefill_lane(mut self,lane:Int,embeds_host:UInt64,S:Int,layers_host:UInt64,final_host:UInt64,logits_host:UInt64) raises:
@@ -235,10 +244,13 @@ struct BreezeModel(Movable):
         if lane<0 or lane>1:raise Error("invalid Breeze lane")
         self.depth_sequential(codes_host,self.lanes[lane].last_hidden,depth_host)
 
-    def _depth_increment(mut self,raw:UInt64,S:Int,start:Int,head_index:Int,out_host:UInt64,kcbase:UInt64,vcbase:UInt64) raises:
-        var T=256;var x=cuda_malloc(S*DD_D*4);var n=cuda_malloc(S*DD_D*4);var q=cuda_malloc(S*DD_QD*4);var k=cuda_malloc(S*DD_KVD*4);var v=cuda_malloc(S*DD_KVD*4);var a=cuda_malloc(S*DD_QD*4);var u=cuda_malloc(S*DD_D*4);var g=cuda_malloc(S*DD_FF*4);var up=cuda_malloc(S*DD_FF*4);var bf=cuda_malloc(S*DD_FF*2);var one=cuda_malloc(DD_V*4)
-        gpu_matmul_bf16_dev_batched(self.ctx,self.h,x,raw,self.dw.project,bf,S,BB_D,DD_D);self._depth_pass(x,S,start,kcbase,vcbase,n,q,k,v,a,u,g,up,bf)
-        var head=self.ctx.compile_function[bm_depth_head_one]();self.ctx.enqueue_function(head,_mf32(n+UInt64((S-1)*DD_D*4)),_mbf16(self.dw.head),Int32(head_index),_mf32(one),grid_dim=(DD_V+T-1)//T,block_dim=T);self.ctx.synchronize();cuda_memcpy(out_host,one,DD_V*4,2)
+    def _depth_increment(mut self,raw:UInt64,S:Int,start:Int,head_index:Int,out_host:UInt64,kcbase:UInt64,vcbase:UInt64,paired:Bool=False) raises:
+        var count=2 if paired else 1;var rows=S//count;var T=256;var x=cuda_malloc(S*DD_D*4);var n=cuda_malloc(S*DD_D*4);var q=cuda_malloc(S*DD_QD*4);var k=cuda_malloc(S*DD_KVD*4);var v=cuda_malloc(S*DD_KVD*4);var a=cuda_malloc(S*DD_QD*4);var u=cuda_malloc(S*DD_D*4);var g=cuda_malloc(S*DD_FF*4);var up=cuda_malloc(S*DD_FF*4);var bf=cuda_malloc(S*DD_FF*2);var one=cuda_malloc(count*DD_V*4)
+        gpu_matmul_bf16_dev_batched(self.ctx,self.h,x,raw,self.dw.project,bf,S,BB_D,DD_D);self._depth_pass(x,S,start,kcbase,vcbase,n,q,k,v,a,u,g,up,bf,paired)
+        var head=self.ctx.compile_function[bm_depth_head_one]()
+        for ln in range(count):
+            self.ctx.enqueue_function(head,_mf32(n+UInt64(((ln+1)*rows-1)*DD_D*4)),_mbf16(self.dw.head),Int32(head_index),_mf32(one+UInt64(ln*DD_V*4)),grid_dim=(DD_V+T-1)//T,block_dim=T)
+        self.ctx.synchronize();cuda_memcpy(out_host,one,count*DD_V*4,2)
         cuda_free(one);cuda_free(bf);cuda_free(up);cuda_free(g);cuda_free(u);cuda_free(a);cuda_free(v);cuda_free(k);cuda_free(q);cuda_free(n);cuda_free(x)
 
     def depth_begin(mut self,lane:Int,codes_host:UInt64,out_host:UInt64) raises:
@@ -248,6 +260,44 @@ struct BreezeModel(Movable):
     def depth_advance(mut self,lane:Int,input_codebook:Int,codes_host:UInt64,out_host:UInt64) raises:
         if lane<0 or lane>1 or input_codebook<1 or input_codebook>=15 or self.lanes[lane].depth_pos!=input_codebook+1:raise Error("invalid Breeze depth advance")
         var T=256;var ids=cuda_malloc(CB*8);cuda_memcpy(ids,codes_host,CB*8,1);var raw=cuda_malloc(BB_D*4);var onein=self.ctx.compile_function[bm_depth_one_input]();self.ctx.enqueue_function(onein,_mi64(ids),Int32(input_codebook),_mbf16(self.w.audio),_mf32(raw),grid_dim=(BB_D+T-1)//T,block_dim=T);self._depth_increment(raw,1,input_codebook+1,input_codebook,out_host,self.lanes[lane].depth_kc,self.lanes[lane].depth_vc);self.lanes[lane].depth_pos=input_codebook+2;cuda_free(raw);cuda_free(ids)
+
+
+    def step_backbone2(mut self,codes_host:UInt64,logits_host:UInt64) raises:
+        # Prefills remain separate (e.g. 23 cond / 10 uncond tokens).
+        for ln in range(2):
+            if self.lanes[ln].length<=0 or self.lanes[ln].length>=MAX_SEQ:raise Error("paired backbone requires two live prefixes with cache capacity")
+        var ids=cuda_malloc(CB*8);var x=cuda_malloc(2*BB_D*4)
+        cuda_memcpy(ids,codes_host,CB*8,1)
+        var ef=self.ctx.compile_function[bm_embed_frame]()
+        for ln in range(2):
+            self.ctx.enqueue_function(ef,_mi64(ids),_mbf16(self.w.audio),_mf32(x+UInt64(ln*BB_D*4)),grid_dim=(BB_D+255)//256,block_dim=256)
+        self._run(0,x,2,0,0,logits_host,0,True)
+        cuda_free(x);cuda_free(ids)
+
+    def depth_begin2(mut self,codes_host:UInt64,out_host:UInt64) raises:
+        for ln in range(2):
+            if self.lanes[ln].length<=0:raise Error("paired depth requires two live prefixes")
+        var ids=cuda_malloc(CB*8);var raw=cuda_malloc(4*BB_D*4)
+        cuda_memcpy(ids,codes_host,CB*8,1)
+        var inf=self.ctx.compile_function[bm_depth_two_inputs]()
+        for ln in range(2):
+            self.ctx.enqueue_function(inf,_mi64(ids),_mf32(self.lanes[ln].last_hidden),_mbf16(self.w.audio),_mf32(raw+UInt64(ln*2*BB_D*4)),grid_dim=(2*BB_D+255)//256,block_dim=256)
+        self._depth_increment(raw,4,0,0,out_host,0,0,True)
+        for ln in range(2):self.lanes[ln].depth_pos=2
+        cuda_free(raw);cuda_free(ids)
+
+    def depth_advance2(mut self,input_codebook:Int,codes_host:UInt64,out_host:UInt64) raises:
+        if input_codebook<1 or input_codebook>=15:raise Error("invalid paired codebook")
+        for ln in range(2):
+            if self.lanes[ln].depth_pos!=input_codebook+1:raise Error("paired depth cache positions disagree")
+        var ids=cuda_malloc(CB*8);var raw=cuda_malloc(2*BB_D*4)
+        cuda_memcpy(ids,codes_host,CB*8,1)
+        var inf=self.ctx.compile_function[bm_depth_one_input]()
+        for ln in range(2):
+            self.ctx.enqueue_function(inf,_mi64(ids),Int32(input_codebook),_mbf16(self.w.audio),_mf32(raw+UInt64(ln*BB_D*4)),grid_dim=(BB_D+255)//256,block_dim=256)
+        self._depth_increment(raw,2,input_codebook+1,input_codebook,out_host,0,0,True)
+        for ln in range(2):self.lanes[ln].depth_pos=input_codebook+2
+        cuda_free(raw);cuda_free(ids)
 
     def depth(mut self,codes_host:UInt64,backbone_host:UInt64,logits_host:UInt64) raises:
         var S=CB;var T=256;var he=S*DD_D;var qe=S*DD_QD;var ke=S*DD_KVD;var fe=S*DD_FF
@@ -259,12 +309,21 @@ struct BreezeModel(Movable):
         self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.norm),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);var hf=self.ctx.compile_function[bm_depth_head]();self.ctx.enqueue_function(hf,_mf32(n),_mbf16(self.dw.head),_mf32(lo),grid_dim=(15*DD_V+T-1)//T,block_dim=T);self.ctx.synchronize();cuda_memcpy(logits_host,lo,15*DD_V*4,2)
         cuda_free(lo);cuda_free(vc);cuda_free(kc);cuda_free(bf);cuda_free(up);cuda_free(g);cuda_free(u);cuda_free(a);cuda_free(v);cuda_free(k);cuda_free(q);cuda_free(n);cuda_free(x);cuda_free(raw);cuda_free(bh);cuda_free(ids)
 
-    def _depth_pass(mut self,x:UInt64,S:Int,start:Int,kcbase:UInt64,vcbase:UInt64,n:UInt64,q:UInt64,k:UInt64,v:UInt64,a:UInt64,u:UInt64,g:UInt64,up:UInt64,bf:UInt64) raises:
-        var T=256;var he=S*DD_D;var qe=S*DD_QD;var ke=S*DD_KVD;var fe=S*DD_FF
+    def _depth_pass(mut self,x:UInt64,S:Int,start:Int,kcbase:UInt64,vcbase:UInt64,n:UInt64,q:UInt64,k:UInt64,v:UInt64,a:UInt64,u:UInt64,g:UInt64,up:UInt64,bf:UInt64,paired:Bool=False) raises:
+        var count=2 if paired else 1;var rows=S//count;var T=256;var he=S*DD_D;var qe=S*DD_QD;var ke=S*DD_KVD;var fe=S*DD_FF
         var rms=self.ctx.compile_function[bm_rms]();var rope=self.ctx.compile_function[bm_depth_rope]();var skv=self.ctx.compile_function[bm_store_kv]();var att=self.ctx.compile_function[bm_attn]();var add=self.ctx.compile_function[bm_add]();var sw=self.ctx.compile_function[bm_swiglu]()
         for l in range(DD_L):
             var kc=kcbase+UInt64(l*CB*DD_KVD*4);var vc=vcbase+UInt64(l*CB*DD_KVD*4)
-            self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.ni[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,q,n,self.dw.q[l],bf,S,DD_D,DD_QD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,k,n,self.dw.k[l],bf,S,DD_D,DD_KVD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,v,n,self.dw.v[l],bf,S,DD_D,DD_KVD);self.ctx.enqueue_function(rope,_mf32(q),Int32(S),Int32(DD_NH),Int32(start),grid_dim=(S*DD_NH*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(rope,_mf32(k),Int32(S),Int32(DD_NKV),Int32(start),grid_dim=(S*DD_NKV*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(skv,_mf32(k),_mf32(v),_mf32(kc),_mf32(vc),Int32(S),Int32(start),Int32(DD_KVD),grid_dim=(ke+T-1)//T,block_dim=T);self.ctx.enqueue_function(att,_mf32(q),_mf32(kc),_mf32(vc),_mf32(a),Int32(S),Int32(start),Int32(DD_NH),Int32(DD_NKV),grid_dim=S*DD_NH,block_dim=128);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,a,self.dw.o[l],bf,S,DD_QD,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T);self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.np[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,g,n,self.dw.g[l],bf,S,DD_D,DD_FF);gpu_matmul_bf16_dev_batched(self.ctx,self.h,up,n,self.dw.u[l],bf,S,DD_D,DD_FF);self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,g,self.dw.d[l],bf,S,DD_FF,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
+            self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.ni[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,q,n,self.dw.q[l],bf,S,DD_D,DD_QD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,k,n,self.dw.k[l],bf,S,DD_D,DD_KVD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,v,n,self.dw.v[l],bf,S,DD_D,DD_KVD)
+            for ln in range(count):
+                var lkc=(self.lanes[ln].depth_kc if paired else kcbase)+UInt64(l*CB*DD_KVD*4)
+                var lvc=(self.lanes[ln].depth_vc if paired else vcbase)+UInt64(l*CB*DD_KVD*4)
+                var qo=q+UInt64(ln*rows*DD_QD*4);var ko=k+UInt64(ln*rows*DD_KVD*4);var vo=v+UInt64(ln*rows*DD_KVD*4);var ao=a+UInt64(ln*rows*DD_QD*4)
+                self.ctx.enqueue_function(rope,_mf32(qo),Int32(rows),Int32(DD_NH),Int32(start),grid_dim=(rows*DD_NH*64+T-1)//T,block_dim=T)
+                self.ctx.enqueue_function(rope,_mf32(ko),Int32(rows),Int32(DD_NKV),Int32(start),grid_dim=(rows*DD_NKV*64+T-1)//T,block_dim=T)
+                self.ctx.enqueue_function(skv,_mf32(ko),_mf32(vo),_mf32(lkc),_mf32(lvc),Int32(rows),Int32(start),Int32(DD_KVD),grid_dim=(rows*DD_KVD+T-1)//T,block_dim=T)
+                self.ctx.enqueue_function(att,_mf32(qo),_mf32(lkc),_mf32(lvc),_mf32(ao),Int32(rows),Int32(start),Int32(DD_NH),Int32(DD_NKV),grid_dim=rows*DD_NH,block_dim=128)
+            gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,a,self.dw.o[l],bf,S,DD_QD,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T);self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.np[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,g,n,self.dw.g[l],bf,S,DD_D,DD_FF);gpu_matmul_bf16_dev_batched(self.ctx,self.h,up,n,self.dw.u[l],bf,S,DD_D,DD_FF);self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,g,self.dw.d[l],bf,S,DD_FF,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
         self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.norm),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1)
 
     def depth_sequential(mut self,codes_host:UInt64,backbone_dev:UInt64,logits_host:UInt64) raises:

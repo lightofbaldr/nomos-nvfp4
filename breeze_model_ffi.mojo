@@ -55,6 +55,27 @@ def nomos_breeze_model_depth_advance(handle:Int64,lane:Int32,input_codebook:Int3
     except e:print("[nomos_breeze_model_depth_advance EXC]",e);return -99
 
 @export
+def nomos_breeze_model_step_backbone2(handle:Int64,frame_codes:Int64,logits:Int64)->Int32:
+    # codes int64[16]; output float32[2,2052], cond then uncond.
+    if handle==0 or frame_codes==0 or logits==0:return -1
+    try:var p=UnsafePointer[BreezeModel,MutUntrackedOrigin](unsafe_from_address=Int(handle));p[0].step_backbone2(UInt64(frame_codes),UInt64(logits));return 0
+    except e:print("[nomos_breeze_model_step_backbone2 EXC]",e);return -99
+
+@export
+def nomos_breeze_model_depth_begin2(handle:Int64,frame_codes:Int64,logits:Int64)->Int32:
+    # codes int64[16]; output float32[2,2051], cond then uncond.
+    if handle==0 or frame_codes==0 or logits==0:return -1
+    try:var p=UnsafePointer[BreezeModel,MutUntrackedOrigin](unsafe_from_address=Int(handle));p[0].depth_begin2(UInt64(frame_codes),UInt64(logits));return 0
+    except e:print("[nomos_breeze_model_depth_begin2 EXC]",e);return -99
+
+@export
+def nomos_breeze_model_depth_advance2(handle:Int64,input_codebook:Int32,frame_codes:Int64,logits:Int64)->Int32:
+    # input_codebook in 1..14; consumes that code to predict the next.
+    if handle==0 or frame_codes==0 or logits==0:return -1
+    try:var p=UnsafePointer[BreezeModel,MutUntrackedOrigin](unsafe_from_address=Int(handle));p[0].depth_advance2(Int(input_codebook),UInt64(frame_codes),UInt64(logits));return 0
+    except e:print("[nomos_breeze_model_depth_advance2 EXC]",e);return -99
+
+@export
 def nomos_breeze_model_free(handle:Int64)->Int32:
     if handle==0:return 0
     var p=UnsafePointer[BreezeModel,MutUntrackedOrigin](unsafe_from_address=Int(handle));p[0].free();p.free();return 0

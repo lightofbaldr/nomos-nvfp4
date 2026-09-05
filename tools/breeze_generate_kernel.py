@@ -11,7 +11,7 @@ import numpy as np
 
 V=2051; EOS=2051; CODEBOOK=2048; CBS=16
 
-def bind(path):
+def bind(path, paired=False):
     x=ctypes.CDLL(str(path)); P=ctypes.c_void_p
     x.nomos_breeze_model_init.argtypes=[ctypes.c_char_p];x.nomos_breeze_model_init.restype=ctypes.c_int64
     x.nomos_breeze_model_prefill_lane.argtypes=[ctypes.c_int64,ctypes.c_int32,P,ctypes.c_int32,P,P,P]
@@ -19,6 +19,10 @@ def bind(path):
     x.nomos_breeze_model_depth_begin.argtypes=[ctypes.c_int64,ctypes.c_int32,ctypes.c_int64,P]
     x.nomos_breeze_model_depth_advance.argtypes=[ctypes.c_int64,ctypes.c_int32,ctypes.c_int32,ctypes.c_int64,P]
     x.nomos_breeze_model_step_backbone.argtypes=[ctypes.c_int64,ctypes.c_int32,P,P]
+    if paired:
+        x.nomos_breeze_model_depth_begin2.argtypes=[ctypes.c_int64,P,P]
+        x.nomos_breeze_model_depth_advance2.argtypes=[ctypes.c_int64,ctypes.c_int32,P,P]
+        x.nomos_breeze_model_step_backbone2.argtypes=[ctypes.c_int64,P,P]
     return x
 
 def pick(logits,rng,temp=.9,top_k=50,top_p=1.0):
@@ -34,12 +38,15 @@ def pick(logits,rng,temp=.9,top_k=50,top_p=1.0):
 def cfg(a,b,scale):return a if b is None else b+scale*(a-b)
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('--model-so',required=True);ap.add_argument('--codec-so',required=True);ap.add_argument('--model-blobs',required=True);ap.add_argument('--codec-blobs',required=True);ap.add_argument('--cond-prefix',required=True);ap.add_argument('--uncond-prefix');ap.add_argument('--cfg-scale',type=float,default=1.0);ap.add_argument('--frames',type=int,default=100);ap.add_argument('--seed',type=int,default=42);ap.add_argument('--output-prefix',required=True);a=ap.parse_args()
-    M=bind(a.model_so);h=M.nomos_breeze_model_init(a.model_blobs.encode());assert h
+    ap=argparse.ArgumentParser();ap.add_argument('--model-so',required=True);ap.add_argument('--codec-so',required=True);ap.add_argument('--model-blobs',required=True);ap.add_argument('--codec-blobs',required=True);ap.add_argument('--cond-prefix',required=True);ap.add_argument('--uncond-prefix');ap.add_argument('--cfg-scale',type=float,default=1.0);ap.add_argument('--frames',type=int,default=100);ap.add_argument('--seed',type=int,default=42);ap.add_argument('--output-prefix',required=True);ap.add_argument('--paired-cfg',action='store_true',help='Batch cond/uncond GEMMs; requires --uncond-prefix');a=ap.parse_args()
+    if a.paired_cfg and not a.uncond_prefix:ap.error('--paired-cfg requires --uncond-prefix')
+    M=bind(a.model_so,a.paired_cfg);h=M.nomos_breeze_model_init(a.model_blobs.encode());assert h
     prefixes=[np.ascontiguousarray(np.load(a.cond_prefix),'f4')]
     if a.uncond_prefix:prefixes.append(np.ascontiguousarray(np.load(a.uncond_prefix),'f4'))
     lm=[]
     for lane,x in enumerate(prefixes):
+        # Host assemblers may retain the leading batch dimension.
+        x=x.reshape(-1,2048)
         o=np.empty(EOS+1,'f4');assert M.nomos_breeze_model_prefill_lane(h,lane,x.ctypes.data,len(x),None,None,o.ctypes.data)==0;lm.append(o)
     rng=np.random.default_rng(a.seed);frames=[];history=[]
     for _ in range(a.frames):
@@ -51,16 +58,25 @@ def main():
         codes=np.zeros(CBS,dtype=np.int64);codes[0]=cb0
         for cb in range(1,CBS):
             ds=[]
-            for lane in range(len(prefixes)):
-                d=np.empty(V,'f4')
-                if cb==1:rc=M.nomos_breeze_model_depth_begin(h,lane,codes.ctypes.data,d.ctypes.data)
-                else:rc=M.nomos_breeze_model_depth_advance(h,lane,cb-1,codes.ctypes.data,d.ctypes.data)
-                assert rc==0;ds.append(d)
+            if a.paired_cfg:
+                d=np.empty((2,V),'f4')
+                if cb==1:rc=M.nomos_breeze_model_depth_begin2(h,codes.ctypes.data,d.ctypes.data)
+                else:rc=M.nomos_breeze_model_depth_advance2(h,cb-1,codes.ctypes.data,d.ctypes.data)
+                assert rc==0;ds=[d[0],d[1]]
+            else:
+                for lane in range(len(prefixes)):
+                    d=np.empty(V,'f4')
+                    if cb==1:rc=M.nomos_breeze_model_depth_begin(h,lane,codes.ctypes.data,d.ctypes.data)
+                    else:rc=M.nomos_breeze_model_depth_advance(h,lane,cb-1,codes.ctypes.data,d.ctypes.data)
+                    assert rc==0;ds.append(d)
             codes[cb]=pick(cfg(ds[0],ds[1] if len(ds)>1 else None,a.cfg_scale),rng)
         frames.append(codes.copy());history.append(cb0)
         lm=[]
-        for lane in range(len(prefixes)):
-            o=np.empty(EOS+1,'f4');assert M.nomos_breeze_model_step_backbone(h,lane,codes.ctypes.data,o.ctypes.data)==0;lm.append(o)
+        if a.paired_cfg:
+            o=np.empty((2,EOS+1),'f4');assert M.nomos_breeze_model_step_backbone2(h,codes.ctypes.data,o.ctypes.data)==0;lm=[o[0],o[1]]
+        else:
+            for lane in range(len(prefixes)):
+                o=np.empty(EOS+1,'f4');assert M.nomos_breeze_model_step_backbone(h,lane,codes.ctypes.data,o.ctypes.data)==0;lm.append(o)
     codes=np.stack(frames,axis=1)[None] if frames else np.empty((1,CBS,0),np.int64)
     out=Path(a.output_prefix);np.save(str(out)+'.codes.npy',codes)
     if len(frames):
