@@ -189,7 +189,7 @@ Convert the checkpoint to kernel blobs, build the three `.so`s, then serve:
 
 ```bash
 # 1. blobs (bf16 — the shipping precision; run in an env with torch + safetensors)
-python3 tools/convert_breeze_codec.py    $HF_DIR $HOME/nomos_data/breeze-tts-2/codec-blobs
+python3 tools/convert_breeze_codec.py    $HF_DIR/audio_tokenizer $HOME/nomos_data/breeze-tts-2/codec-blobs
 python3 tools/convert_breeze_encoder.py  $HF_DIR $HOME/nomos_data/breeze-tts-2/encoder-blobs
 python3 tools/convert_breeze_model.py    $HF_DIR $HOME/nomos_data/breeze-tts-2/model-blobs
 
