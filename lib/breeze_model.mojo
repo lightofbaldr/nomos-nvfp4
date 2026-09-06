@@ -34,7 +34,7 @@ comptime DD_NKV=2
 comptime DD_L=12
 comptime DD_V=2051
 comptime CB=16
-comptime MAX_SEQ=256
+comptime MAX_SEQ=2048   # backbone max_position_embeddings; 256 left clone only 32 frames after a 224-tok ref prefix (Opus sm_120 2026-09-06)
 
 def _mf32(p:UInt64)->UnsafePointer[Float32,MutAnyOrigin]: return UnsafePointer[Float32,MutAnyOrigin](unsafe_from_address=Int(p))
 def _mbf16(p:UInt64)->UnsafePointer[Scalar[DType.bfloat16],MutAnyOrigin]: return UnsafePointer[Scalar[DType.bfloat16],MutAnyOrigin](unsafe_from_address=Int(p))
@@ -233,6 +233,9 @@ struct BreezeModel(Movable):
         self.lanes[lane].length=0;var x=cuda_malloc(S*BB_D*4);cuda_memcpy(x,embeds_host,S*BB_D*4,1);self._run(lane,x,S,layers_host,final_host,logits_host,0);cuda_free(x)
 
     def step_backbone(mut self,lane:Int,codes_host:UInt64,logits_host:UInt64) raises:
+        if lane<0 or lane>1:raise Error("invalid Breeze lane")
+        if self.lanes[lane].length<=0:raise Error("step_backbone before prefill_lane")
+        if self.lanes[lane].length>=MAX_SEQ:raise Error("backbone KV cache full (MAX_SEQ reached) - refusing to overrun the allocation")
         var ids=cuda_malloc(CB*8);var x=cuda_malloc(BB_D*4);cuda_memcpy(ids,codes_host,CB*8,1);var ef=self.ctx.compile_function[bm_embed_frame]();self.ctx.enqueue_function(ef,_mi64(ids),_mbf16(self.w.audio),_mf32(x),grid_dim=(BB_D+255)//256,block_dim=256);self._run(lane,x,1,0,0,logits_host,0);cuda_free(x);cuda_free(ids)
 
     def step(mut self,lane:Int,codes_host:UInt64,lm_host:UInt64,depth_host:UInt64) raises:

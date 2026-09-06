@@ -66,6 +66,11 @@ class BreezeTTS:
         self.mod.nomos_breeze_model_prefill_lane.argtypes = \
             [ctypes.c_int64, ctypes.c_int32, P, ctypes.c_int32, P, P, P]
         self.mod.nomos_breeze_model_depth_lane.argtypes = [ctypes.c_int64, ctypes.c_int32, P, P]
+        # Stateful single-lane depth (KV persisted across codebooks) — the single-lane twin of
+        # depth_begin2/advance2, exported all along but never bound, so the single-lane route
+        # was re-running the whole depth decoder 15x/frame (§2.3, Opus sm_120 2026-09-06).
+        self.mod.nomos_breeze_model_depth_begin.argtypes = [ctypes.c_int64, ctypes.c_int32, P, P]
+        self.mod.nomos_breeze_model_depth_advance.argtypes = [ctypes.c_int64, ctypes.c_int32, ctypes.c_int32, P, P]
         self.mod.nomos_breeze_model_step_backbone.argtypes = [ctypes.c_int64, ctypes.c_int32, P, P]
         # Paired CFG route (both lanes through one weight pass; 1.86x model). Optional so an
         # older single-lane .so still loads — design mode uses it when present, else falls back.
@@ -121,9 +126,21 @@ class BreezeTTS:
         if voice_codes is not None:
             assert ref_text, "clone mode needs the reference transcript"
             seg_ref = self._encode_text(self._ids(f"{sp}{ref_text}"))
+            rows = self._audio_rows(voice_codes)
+            eos = self._audio_eos_row[None]
+            if instruction:
+                # Voice DIRECTION (ref + instruction): two-lane CFG, both carrying the
+                # reference prefix, differing only in whether the target text is
+                # instruction-wrapped. Positive = ref_edit, negative = ref_clone, per
+                # breeze_infer/templates.py. (Was unreachable — this branch fell through
+                # to clone before; found by Opus on sm_120, 2026-09-06.)
+                tgt_ins = self._encode_text(self._ids(f"{sp}<ins_bos>{instruction}<ins_eos>{text}"))
+                tgt_plain = self._encode_text(self._ids(text))
+                cond = np.concatenate([seg_ref, rows, eos, tgt_ins])
+                unc = np.concatenate([seg_ref, rows, eos, tgt_plain])
+                return cond.astype(np.float32), unc.astype(np.float32)
             seg_tgt = self._encode_text(self._ids(text))
-            cond = np.concatenate([seg_ref, self._audio_rows(voice_codes),
-                                   self._audio_eos_row[None], seg_tgt])
+            cond = np.concatenate([seg_ref, rows, eos, seg_tgt])
             return cond.astype(np.float32), None       # clone: single lane, cfg 1.0
         if instruction:
             cond = self._encode_text(self._ids(f"{sp}<ins_bos>{instruction}<ins_eos>{text}"))
@@ -180,36 +197,42 @@ class BreezeTTS:
             if paired:
                 codes = np.full(CBS, -1, dtype=np.int64)   # progressive fill per the paired ABI
                 codes[0] = cb0
-                out2 = np.empty((2, V), np.float32)
+                out2 = np.zeros((2, V), np.float32)
                 for cb in range(1, CBS):
                     if cb == 1:
-                        self.mod.nomos_breeze_model_depth_begin2(
+                        rc = self.mod.nomos_breeze_model_depth_begin2(
                             self.mh, codes.ctypes.data, out2.ctypes.data)
                     else:
-                        self.mod.nomos_breeze_model_depth_advance2(
+                        rc = self.mod.nomos_breeze_model_depth_advance2(
                             self.mh, cb - 1, codes.ctypes.data, out2.ctypes.data)
+                    assert rc == 0, f"paired depth cb={cb} rc={rc}"   # else NaN from stale buffer
                     codes[cb] = self._pick(mix(out2[0], out2[1]), rng)
-                bb = np.empty((2, EOS + 1), np.float32)
-                self.mod.nomos_breeze_model_step_backbone2(self.mh, codes.ctypes.data, bb.ctypes.data)
+                bb = np.zeros((2, EOS + 1), np.float32)
+                rc = self.mod.nomos_breeze_model_step_backbone2(self.mh, codes.ctypes.data, bb.ctypes.data)
+                assert rc == 0, f"paired backbone rc={rc} (KV cache full or lanes not live)"
                 lm = [bb[0].copy(), bb[1].copy()]
             else:
-                codes = np.zeros(CBS, dtype=np.int64)
+                # Single-lane: stateful depth_begin/advance (not the 15x-work depth_lane), with
+                # per-frame backbone step. Progressive fill so the cache cursors match (§2.3).
+                codes = np.full(CBS, -1, dtype=np.int64)
                 codes[0] = cb0
+                ds = [np.zeros(V, np.float32) for _ in prefixes]
                 for cb in range(1, CBS):
-                    ds = []
                     for lane in range(len(prefixes)):
-                        d = np.empty((15, V), np.float32)
-                        rc = self.mod.nomos_breeze_model_depth_lane(
-                            self.mh, lane, codes.ctypes.data, d.ctypes.data)
-                        assert rc == 0
-                        ds.append(d[cb - 1])
+                        if cb == 1:
+                            rc = self.mod.nomos_breeze_model_depth_begin(
+                                self.mh, lane, codes.ctypes.data, ds[lane].ctypes.data)
+                        else:
+                            rc = self.mod.nomos_breeze_model_depth_advance(
+                                self.mh, lane, cb - 1, codes.ctypes.data, ds[lane].ctypes.data)
+                        assert rc == 0, f"depth lane={lane} cb={cb} rc={rc}"
                     codes[cb] = self._pick(mix(ds[0], ds[1] if len(ds) > 1 else None), rng)
                 lm = []
                 for lane in range(len(prefixes)):
-                    o = np.empty(EOS + 1, np.float32)
+                    o = np.zeros(EOS + 1, np.float32)
                     rc = self.mod.nomos_breeze_model_step_backbone(
                         self.mh, lane, codes.ctypes.data, o.ctypes.data)
-                    assert rc == 0
+                    assert rc == 0, f"step_backbone lane={lane} rc={rc} (KV cache full?)"
                     lm.append(o)
             history.append(cb0)
             yield codes.copy()
