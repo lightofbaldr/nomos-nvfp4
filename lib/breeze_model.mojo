@@ -12,7 +12,8 @@ from layout import row_major, stack_allocation
 from lib.cuda import cuda_malloc, cuda_free, cuda_memcpy
 from lib.io import load_bf16_file_to_gpu
 from lib.cublas import cublas_create, cublas_set_stream, gpu_matmul_bf16_dev_batched
-from lib.fp4_weights import load_to_gpu_nvfp4
+from lib.fp4_weights import load_to_gpu_nvfp4, gpu_matmul_nvfp4_fused_dev
+from lib.engine_init import _read_env_bytes
 from lib.gemma4_layer import _mm_dev_batched, W4A4Scratch
 
 comptime BB_D=2048
@@ -191,11 +192,25 @@ struct BMLane(Movable):
 
 struct BreezeModel(Movable):
     var ctx:DeviceContext;var h:UInt64;var w:BMWeights;var dw:DDWeights;var lanes:List[BMLane]
+    var nvfp4_fused_decode:Bool
     def __init__(out self,path:String) raises:
         self.ctx=DeviceContext();self.h=cublas_create();cublas_set_stream(self.h,self.ctx);var b=path if path.endswith("/") else path+"/";self.w=BMWeights(b);self.dw=DDWeights(b);self.lanes=List[BMLane]();self.lanes.append(BMLane());self.lanes.append(BMLane())
+        # Snapshot once per handle: no getenv/allocation in the projection loop.
+        # Opt-in until scratch-vs-fused fidelity and both-arch timing are gated.
+        var fused_env=_read_env_bytes("NOMOS_BREEZE_NVFP4_FUSED")
+        self.nvfp4_fused_decode=len(fused_env)==1 and fused_env[0]==49
+        print("Breeze NVFP4 small-S fused =",self.nvfp4_fused_decode,"(S=1/2 only; bf16 and depth unchanged)")
 
     def _bbmm(mut self,dst:UInt64,src:UInt64,weight:UInt64,bf:UInt64,ws:UInt64,S:Int,K:Int,N:Int,gs:Float32,ags:Float32,w4:W4A4Scratch,l:Int,p:String) raises:
-        if gs!=0.0:_mm_dev_batched(self.ctx,self.h,dst,src,weight,bf,S,K,N,ws,gs,ags,w4,l,p)
+        if gs!=0.0 and self.nvfp4_fused_decode and (S==1 or S==2):
+            # GEMV has no batch dimension. Row offsets are BYTES, with distinct
+            # K-wide inputs and N-wide outputs for the two independent CFG lanes.
+            # Inline FP32 dequant avoids materializing the entire bf16 weight.
+            # This is NOT promised bit-exact to scratch: scratch rounds W to
+            # bf16 first, whereas the fused kernel preserves FP32 dequant values.
+            for row in range(S):
+                gpu_matmul_nvfp4_fused_dev(self.ctx,dst+UInt64(row*N*4),src+UInt64(row*K*4),weight,gs,K,N)
+        elif gs!=0.0:_mm_dev_batched(self.ctx,self.h,dst,src,weight,bf,S,K,N,ws,gs,ags,w4,l,p)
         else:gpu_matmul_bf16_dev_batched(self.ctx,self.h,dst,src,weight,bf,S,K,N)
 
     def _run(mut self,lane:Int,x:UInt64,S:Int,layers_host:UInt64,final_host:UInt64,logits_host:UInt64,last_dev:UInt64,paired:Bool=False) raises:

@@ -185,9 +185,9 @@ def gpu_matmul_nvfp4_dev_batched(
 # DIRECTLY on-GPU (E2M1 nibble + per-16 e4m3 block scale + per-tensor global),
 # dequant inline, multiply-accumulate against the fp32 activation, warp-reduce.
 # No bf16 materialization, no cuBLAS — kills the per-token whole-weight dequant
-# that made W4A16 slow (~0.65 tok/s). Activation stays fp32 (W4A16), so REASONING
-# is preserved (unlike W4A4). The dequant math is the exact twin of
-# dequant_nvfp4_kernel above, so greedy output matches the M1 path.
+# that made W4A16 slow (~0.65 tok/s). Activation stays fp32 (no FP4 act quant).
+# Unlike dequant_nvfp4_kernel + bf16 GEMM, this does NOT round dequantized
+# weights/activations to bf16. Greedy equivalence is model-gated, not guaranteed.
 # ─────────────────────────────────────────────────────────────────────────
 
 def nvfp4_gemv_kernel(
@@ -262,8 +262,9 @@ def gpu_matmul_nvfp4_fused_dev(
     N: Int,
 ) raises:
     """M2 fused: out[N] = dequant_nvfp4(W[N,K]) @ in[K], reading the NVFP4 weight directly —
-    no bf16 scratch, no cuBLAS. One warp per output row. Activation fp32 (W4A16) -> reasoning
-    preserved; fast like the Q4_0 M2 GEMV. Greedy output matches the M1 path."""
+    no bf16 scratch, no cuBLAS. One warp per output row, FP32 activation/MAC.
+    The scratch path rounds W and A to bf16; this path does not. Numerical and
+    greedy equivalence must be measured against a reference for each model."""
     var nb = (K * N) // FP4_GROUP
     var kern = ctx.compile_function[nvfp4_gemv_kernel]()
     # N=VOCAB=262144 produced exactly 65536 blocks at WPB=4. That boundary is
