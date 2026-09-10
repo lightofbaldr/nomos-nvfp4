@@ -9,8 +9,8 @@ from max.gpu.memory import AddressSpace
 from max.gpu.host import DeviceContext
 from layout import row_major, stack_allocation
 
-from lib.cuda import cuda_malloc, cuda_free, cuda_memcpy
-from lib.io import load_bf16_file_to_gpu
+from lib.cuda import cuda_malloc, cuda_free, cuda_memcpy, cuda_upload_u8
+from lib.io import load_bf16_file_to_gpu, file_size_bytes, read_nvfp4_bytes
 from lib.cublas import cublas_create, cublas_set_stream, gpu_matmul_bf16_dev_batched
 from lib.fp4_weights import load_to_gpu_nvfp4, gpu_matmul_nvfp4_fused_dev
 from lib.engine_init import _read_env_bytes
@@ -163,6 +163,32 @@ def _bm_load_projection(stem:String,mut gs:List[Float32],mut ags:List[Float32]) 
     if w==0:raise Error("missing Breeze backbone projection: "+stem+".{nvfp4,bf16}")
     return w
 
+def _dd_load_projection(stem:String,K:Int,N:Int,enabled:Bool,mut gs:List[Float32],mut ags:List[Float32]) raises -> UInt64:
+    # A recipe is per TENSOR, never inferred from one representative file.
+    # Only absence permits fallback; a present malformed NVFP4 file is fatal.
+    var path=stem+".nvfp4"
+    if enabled and file_size_bytes(path)>=0:
+        var hdr=List[Int]();var global_scale=List[Float32]();var act_scale=List[Float32]()
+        var body=read_nvfp4_bytes(path,hdr,global_scale,act_scale)
+        if len(hdr)!=2 or len(global_scale)!=1 or len(act_scale)!=1:
+            raise Error("invalid Breeze depth NVFP4 header: "+path)
+        if hdr[0]!=K*N or hdr[1]!=K*N//16 or len(body)!=K*N//16+K*N//2:
+            raise Error("invalid Breeze depth NVFP4 dimensions/body: "+path)
+        # The format tag in dispatch is gs!=0. Zero/NaN/Inf must never make a
+        # live packed pointer look like BF16 (or poison the fused accumulator).
+        if not (global_scale[0]>0 and global_scale[0]<=Float32(3.402823466e38)):
+            raise Error("invalid Breeze depth NVFP4 global scale: "+path)
+        var weight=cuda_malloc(len(body));cuda_upload_u8(weight,body)
+        gs.append(global_scale[0]);ags.append(act_scale[0])
+        return weight
+    path=stem+".bf16"
+    if file_size_bytes(path)!=K*N*2:
+        raise Error("missing or wrong-sized Breeze depth BF16 projection: "+path)
+    var weight=load_bf16_file_to_gpu(path)
+    if weight==0:raise Error("failed Breeze depth BF16 load: "+path)
+    gs.append(Float32(0));ags.append(Float32(0))
+    return weight
+
 struct BMWeights(Movable):
     var q:List[UInt64];var k:List[UInt64];var v:List[UInt64];var o:List[UInt64];var qn:List[UInt64];var kn:List[UInt64];var ni:List[UInt64];var np:List[UInt64];var g:List[UInt64];var u:List[UInt64];var d:List[UInt64];var norm:UInt64;var head:UInt64;var audio:UInt64
     var qgs:List[Float32];var qags:List[Float32];var kgs:List[Float32];var kags:List[Float32];var vgs:List[Float32];var vags:List[Float32];var ogs:List[Float32];var oags:List[Float32];var ggs:List[Float32];var gags:List[Float32];var ugs:List[Float32];var uags:List[Float32];var dgs:List[Float32];var dags:List[Float32]
@@ -177,12 +203,26 @@ struct BMWeights(Movable):
 
 struct DDWeights(Movable):
     var q:List[UInt64];var k:List[UInt64];var v:List[UInt64];var o:List[UInt64];var ni:List[UInt64];var np:List[UInt64];var g:List[UInt64];var u:List[UInt64];var d:List[UInt64];var project:UInt64;var norm:UInt64;var head:UInt64
+    var qgs:List[Float32];var qags:List[Float32];var kgs:List[Float32];var kags:List[Float32];var vgs:List[Float32];var vags:List[Float32];var ogs:List[Float32];var oags:List[Float32];var ggs:List[Float32];var gags:List[Float32];var ugs:List[Float32];var uags:List[Float32];var dgs:List[Float32];var dags:List[Float32]
     def __init__(out self,b:String) raises:
         self.q=List[UInt64]();self.k=List[UInt64]();self.v=List[UInt64]();self.o=List[UInt64]();self.ni=List[UInt64]();self.np=List[UInt64]();self.g=List[UInt64]();self.u=List[UInt64]();self.d=List[UInt64]()
+        self.qgs=List[Float32]();self.qags=List[Float32]();self.kgs=List[Float32]();self.kags=List[Float32]();self.vgs=List[Float32]();self.vags=List[Float32]();self.ogs=List[Float32]();self.oags=List[Float32]();self.ggs=List[Float32]();self.gags=List[Float32]();self.ugs=List[Float32]();self.uags=List[Float32]();self.dgs=List[Float32]();self.dags=List[Float32]()
+        var flag=_read_env_bytes("NOMOS_BREEZE_DEPTH_NVFP4")
+        var enabled=len(flag)==1 and flag[0]==49
+        var quantized=0
         for l in range(DD_L):
             var p=b+"depth_decoder_model_layers_"+String(l)+"_"
-            self.q.append(load_bf16_file_to_gpu(p+"self_attn_q_proj_weight.bf16"));self.k.append(load_bf16_file_to_gpu(p+"self_attn_k_proj_weight.bf16"));self.v.append(load_bf16_file_to_gpu(p+"self_attn_v_proj_weight.bf16"));self.o.append(load_bf16_file_to_gpu(p+"self_attn_o_proj_weight.bf16"));self.ni.append(load_bf16_file_to_gpu(p+"input_layernorm_weight.bf16"));self.np.append(load_bf16_file_to_gpu(p+"post_attention_layernorm_weight.bf16"));self.g.append(load_bf16_file_to_gpu(p+"mlp_gate_proj_weight.bf16"));self.u.append(load_bf16_file_to_gpu(p+"mlp_up_proj_weight.bf16"));self.d.append(load_bf16_file_to_gpu(p+"mlp_down_proj_weight.bf16"))
+            self.q.append(_dd_load_projection(p+"self_attn_q_proj_weight",DD_D,DD_QD,enabled,self.qgs,self.qags))
+            self.k.append(_dd_load_projection(p+"self_attn_k_proj_weight",DD_D,DD_KVD,enabled,self.kgs,self.kags))
+            self.v.append(_dd_load_projection(p+"self_attn_v_proj_weight",DD_D,DD_KVD,enabled,self.vgs,self.vags))
+            self.o.append(_dd_load_projection(p+"self_attn_o_proj_weight",DD_QD,DD_D,enabled,self.ogs,self.oags))
+            self.g.append(_dd_load_projection(p+"mlp_gate_proj_weight",DD_D,DD_FF,enabled,self.ggs,self.gags))
+            self.u.append(_dd_load_projection(p+"mlp_up_proj_weight",DD_D,DD_FF,enabled,self.ugs,self.uags))
+            self.d.append(_dd_load_projection(p+"mlp_down_proj_weight",DD_FF,DD_D,enabled,self.dgs,self.dags))
+            self.ni.append(load_bf16_file_to_gpu(p+"input_layernorm_weight.bf16"));self.np.append(load_bf16_file_to_gpu(p+"post_attention_layernorm_weight.bf16"))
+            quantized+=Int(self.qgs[l]!=0)+Int(self.kgs[l]!=0)+Int(self.vgs[l]!=0)+Int(self.ogs[l]!=0)+Int(self.ggs[l]!=0)+Int(self.ugs[l]!=0)+Int(self.dgs[l]!=0)
         self.project=load_bf16_file_to_gpu(b+"depth_decoder_model_inputs_embeds_projector_weight.bf16");self.norm=load_bf16_file_to_gpu(b+"depth_decoder_model_norm_weight.bf16");self.head=load_bf16_file_to_gpu(b+"depth_decoder_codebooks_head_weight.bf16")
+        print("Breeze depth NVFP4 =",enabled,"projections =",quantized,"/",DD_L*7,"(fused per row; projector/norm/head bf16)")
 
 struct BMLane(Movable):
     var length:Int;var kc:List[UInt64];var vc:List[UInt64];var last_hidden:UInt64;var depth_kc:UInt64;var depth_vc:UInt64;var depth_pos:Int
@@ -199,7 +239,7 @@ struct BreezeModel(Movable):
         # Opt-in until scratch-vs-fused fidelity and both-arch timing are gated.
         var fused_env=_read_env_bytes("NOMOS_BREEZE_NVFP4_FUSED")
         self.nvfp4_fused_decode=len(fused_env)==1 and fused_env[0]==49
-        print("Breeze NVFP4 small-S fused =",self.nvfp4_fused_decode,"(S=1/2 only; bf16 and depth unchanged)")
+        print("Breeze backbone NVFP4 small-S fused =",self.nvfp4_fused_decode,"(S=1/2 only; depth controlled separately)")
 
     def _bbmm(mut self,dst:UInt64,src:UInt64,weight:UInt64,bf:UInt64,ws:UInt64,S:Int,K:Int,N:Int,gs:Float32,ags:Float32,w4:W4A4Scratch,l:Int,p:String) raises:
         if gs!=0.0 and self.nvfp4_fused_decode and (S==1 or S==2):
@@ -212,6 +252,16 @@ struct BreezeModel(Movable):
                 gpu_matmul_nvfp4_fused_dev(self.ctx,dst+UInt64(row*N*4),src+UInt64(row*K*4),weight,gs,K,N)
         elif gs!=0.0:_mm_dev_batched(self.ctx,self.h,dst,src,weight,bf,S,K,N,ws,gs,ags,w4,l,p)
         else:gpu_matmul_bf16_dev_batched(self.ctx,self.h,dst,src,weight,bf,S,K,N)
+
+    def _ddmm(mut self,dst:UInt64,src:UInt64,weight:UInt64,bf:UInt64,S:Int,K:Int,N:Int,gs:Float32) raises:
+        if gs!=0:
+            # Single-lane start/advance: S=2/1. Paired start/advance: S=4/2.
+            # The full-prefix diagnostic is S=16. Never interpret packed weights
+            # as BF16 on ANY of these paths, and never materialize weight scratch.
+            for row in range(S):
+                gpu_matmul_nvfp4_fused_dev(self.ctx,dst+UInt64(row*N*4),src+UInt64(row*K*4),weight,gs,K,N)
+        else:
+            gpu_matmul_bf16_dev_batched(self.ctx,self.h,dst,src,weight,bf,S,K,N)
 
     def _run(mut self,lane:Int,x:UInt64,S:Int,layers_host:UInt64,final_host:UInt64,logits_host:UInt64,last_dev:UInt64,paired:Bool=False) raises:
         var start=self.lanes[lane].length;var count=2 if paired else 1;var rows=1 if paired else S;var T=256;var he=S*BB_D;var qe=S*BB_QD;var ke=S*BB_KVD;var fe=S*BB_FF
@@ -325,7 +375,7 @@ struct BreezeModel(Movable):
         cuda_memcpy(ids,codes_host,CB*8,1);cuda_memcpy(bh,backbone_host,BB_D*4,1);var inf=self.ctx.compile_function[bm_depth_inputs]();self.ctx.enqueue_function(inf,_mi64(ids),_mf32(bh),_mbf16(self.w.audio),_mf32(raw),grid_dim=(CB*BB_D+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,x,raw,self.dw.project,bf,S,BB_D,DD_D)
         var rms=self.ctx.compile_function[bm_rms]();var rope=self.ctx.compile_function[bm_depth_rope]();var skv=self.ctx.compile_function[bm_store_kv]();var att=self.ctx.compile_function[bm_attn]();var add=self.ctx.compile_function[bm_add]();var sw=self.ctx.compile_function[bm_swiglu]()
         for l in range(DD_L):
-            self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.ni[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,q,n,self.dw.q[l],bf,S,DD_D,DD_QD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,k,n,self.dw.k[l],bf,S,DD_D,DD_KVD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,v,n,self.dw.v[l],bf,S,DD_D,DD_KVD);self.ctx.enqueue_function(rope,_mf32(q),Int32(S),Int32(DD_NH),Int32(0),grid_dim=(S*DD_NH*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(rope,_mf32(k),Int32(S),Int32(DD_NKV),Int32(0),grid_dim=(S*DD_NKV*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(skv,_mf32(k),_mf32(v),_mf32(kc),_mf32(vc),Int32(S),Int32(0),Int32(DD_KVD),grid_dim=(ke+T-1)//T,block_dim=T);self.ctx.enqueue_function(att,_mf32(q),_mf32(kc),_mf32(vc),_mf32(a),Int32(S),Int32(0),Int32(DD_NH),Int32(DD_NKV),grid_dim=S*DD_NH,block_dim=128);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,a,self.dw.o[l],bf,S,DD_QD,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T);self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.np[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,g,n,self.dw.g[l],bf,S,DD_D,DD_FF);gpu_matmul_bf16_dev_batched(self.ctx,self.h,up,n,self.dw.u[l],bf,S,DD_D,DD_FF);self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,g,self.dw.d[l],bf,S,DD_FF,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
+            self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.ni[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);self._ddmm(q,n,self.dw.q[l],bf,S,DD_D,DD_QD,self.dw.qgs[l]);self._ddmm(k,n,self.dw.k[l],bf,S,DD_D,DD_KVD,self.dw.kgs[l]);self._ddmm(v,n,self.dw.v[l],bf,S,DD_D,DD_KVD,self.dw.vgs[l]);self.ctx.enqueue_function(rope,_mf32(q),Int32(S),Int32(DD_NH),Int32(0),grid_dim=(S*DD_NH*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(rope,_mf32(k),Int32(S),Int32(DD_NKV),Int32(0),grid_dim=(S*DD_NKV*64+T-1)//T,block_dim=T);self.ctx.enqueue_function(skv,_mf32(k),_mf32(v),_mf32(kc),_mf32(vc),Int32(S),Int32(0),Int32(DD_KVD),grid_dim=(ke+T-1)//T,block_dim=T);self.ctx.enqueue_function(att,_mf32(q),_mf32(kc),_mf32(vc),_mf32(a),Int32(S),Int32(0),Int32(DD_NH),Int32(DD_NKV),grid_dim=S*DD_NH,block_dim=128);self._ddmm(u,a,self.dw.o[l],bf,S,DD_QD,DD_D,self.dw.ogs[l]);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T);self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.np[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);self._ddmm(g,n,self.dw.g[l],bf,S,DD_D,DD_FF,self.dw.ggs[l]);self._ddmm(up,n,self.dw.u[l],bf,S,DD_D,DD_FF,self.dw.ugs[l]);self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);self._ddmm(u,g,self.dw.d[l],bf,S,DD_FF,DD_D,self.dw.dgs[l]);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
         self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.norm),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);var hf=self.ctx.compile_function[bm_depth_head]();self.ctx.enqueue_function(hf,_mf32(n),_mbf16(self.dw.head),_mf32(lo),grid_dim=(15*DD_V+T-1)//T,block_dim=T);self.ctx.synchronize();cuda_memcpy(logits_host,lo,15*DD_V*4,2)
         cuda_free(lo);cuda_free(vc);cuda_free(kc);cuda_free(bf);cuda_free(up);cuda_free(g);cuda_free(u);cuda_free(a);cuda_free(v);cuda_free(k);cuda_free(q);cuda_free(n);cuda_free(x);cuda_free(raw);cuda_free(bh);cuda_free(ids)
 
@@ -334,7 +384,7 @@ struct BreezeModel(Movable):
         var rms=self.ctx.compile_function[bm_rms]();var rope=self.ctx.compile_function[bm_depth_rope]();var skv=self.ctx.compile_function[bm_store_kv]();var att=self.ctx.compile_function[bm_attn]();var add=self.ctx.compile_function[bm_add]();var sw=self.ctx.compile_function[bm_swiglu]()
         for l in range(DD_L):
             var kc=kcbase+UInt64(l*CB*DD_KVD*4);var vc=vcbase+UInt64(l*CB*DD_KVD*4)
-            self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.ni[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,q,n,self.dw.q[l],bf,S,DD_D,DD_QD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,k,n,self.dw.k[l],bf,S,DD_D,DD_KVD);gpu_matmul_bf16_dev_batched(self.ctx,self.h,v,n,self.dw.v[l],bf,S,DD_D,DD_KVD)
+            self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.ni[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);self._ddmm(q,n,self.dw.q[l],bf,S,DD_D,DD_QD,self.dw.qgs[l]);self._ddmm(k,n,self.dw.k[l],bf,S,DD_D,DD_KVD,self.dw.kgs[l]);self._ddmm(v,n,self.dw.v[l],bf,S,DD_D,DD_KVD,self.dw.vgs[l])
             for ln in range(count):
                 var lkc=(self.lanes[ln].depth_kc if paired else kcbase)+UInt64(l*CB*DD_KVD*4)
                 var lvc=(self.lanes[ln].depth_vc if paired else vcbase)+UInt64(l*CB*DD_KVD*4)
@@ -343,7 +393,7 @@ struct BreezeModel(Movable):
                 self.ctx.enqueue_function(rope,_mf32(ko),Int32(rows),Int32(DD_NKV),Int32(start),grid_dim=(rows*DD_NKV*64+T-1)//T,block_dim=T)
                 self.ctx.enqueue_function(skv,_mf32(ko),_mf32(vo),_mf32(lkc),_mf32(lvc),Int32(rows),Int32(start),Int32(DD_KVD),grid_dim=(rows*DD_KVD+T-1)//T,block_dim=T)
                 self.ctx.enqueue_function(att,_mf32(qo),_mf32(lkc),_mf32(lvc),_mf32(ao),Int32(rows),Int32(start),Int32(DD_NH),Int32(DD_NKV),grid_dim=rows*DD_NH,block_dim=128)
-            gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,a,self.dw.o[l],bf,S,DD_QD,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T);self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.np[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);gpu_matmul_bf16_dev_batched(self.ctx,self.h,g,n,self.dw.g[l],bf,S,DD_D,DD_FF);gpu_matmul_bf16_dev_batched(self.ctx,self.h,up,n,self.dw.u[l],bf,S,DD_D,DD_FF);self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);gpu_matmul_bf16_dev_batched(self.ctx,self.h,u,g,self.dw.d[l],bf,S,DD_FF,DD_D);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
+            self._ddmm(u,a,self.dw.o[l],bf,S,DD_QD,DD_D,self.dw.ogs[l]);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T);self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.np[l]),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1);self._ddmm(g,n,self.dw.g[l],bf,S,DD_D,DD_FF,self.dw.ggs[l]);self._ddmm(up,n,self.dw.u[l],bf,S,DD_D,DD_FF,self.dw.ugs[l]);self.ctx.enqueue_function(sw,_mf32(g),_mf32(up),Int32(fe),grid_dim=(fe+T-1)//T,block_dim=T);self._ddmm(u,g,self.dw.d[l],bf,S,DD_FF,DD_D,self.dw.dgs[l]);self.ctx.enqueue_function(add,_mf32(x),_mf32(u),Int32(he),grid_dim=(he+T-1)//T,block_dim=T)
         self.ctx.enqueue_function(rms,_mf32(x),_mbf16(self.dw.norm),_mf32(n),Int32(S),Int32(DD_D),Float32(1e-5),grid_dim=S,block_dim=1)
 
     def depth_sequential(mut self,codes_host:UInt64,backbone_dev:UInt64,logits_host:UInt64) raises:
