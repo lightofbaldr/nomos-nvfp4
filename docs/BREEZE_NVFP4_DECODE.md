@@ -76,7 +76,7 @@ For full-seven on the sm_120 host, backbone alone is 97.57 -> 30.81 ms paired
 This is a **41.6% paired latency reduction versus the bad NVFP4 route**, not a
 win over BF16: paired full-seven still costs 15.5% more than BF16.
 
-the sm_120 host GPU 2 was selected from live inventory and had no competing GPU compute
+The sm_120 host's GPU 2 was selected from live inventory and had no competing GPU compute
 process. Host load was high; q-only fused paired totals were 82.60, 95.06,
 82.56 ms. The middle run's depth phase was slower despite unchanged code.
 That outlier is retained in the report, not discarded. No small q-only versus
@@ -119,11 +119,11 @@ noise; neither that difference nor a shared docstring is the acceptance gate.
   `5c1d11ef95b50e37d0b8e81636540ac766bb61a3a389ce2273877cedbccfd502`.
   Preserved under `results/breeze-nvfp4-routing/4c6da29/` in the Breeze
   worktree; `qonly/report.json` and all per-frame arrays are beside it.
-- the sm_120 host library SHA256:
+- sm_120 host library SHA256:
   `e3fd56477e552b466b59ff20cd5fed438db76711330af6b2a0fa24afd2890c75`.
-  Isolated source archive/build at `/home/adam/Projects/breeze-routing.XaETcC`,
+  Isolated source archive/build in a scratch directory on the sm_120 host,
   with `results/{qonly,full7}/report.json`, all logits, and build/run logs.
-  Source checksum matched GB10; the existing the sm_120 host checkout/services were not
+  Source checksum matched GB10; the existing sm_120 host checkout/services were not
   changed. Both builds used `refresh_breeze_model_build.sh` successfully.
 
 No ABI, depth precision, active service, or deployed artifact was changed.
