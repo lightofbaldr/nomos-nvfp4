@@ -79,7 +79,7 @@ Implementation `25cc401`; artifact lineage `c48c9ae` includes converter commit
 Preserved in `results/breeze-depth-nvfp4/c48c9ae/` in the Breeze worktree.
 All 12 shipping model FFI exports are unchanged.
 
-- Canonical BF16 with the new flag ON passes the full M3 gate and matches the
+- Canonical BF16 with the new flag ON and OFF passes the full M3 gate and matches the
   pre-depth library's LM/depth arrays **byte-for-byte**, separately for combined,
   persistent, paired, and full-prefix frame zero. There are 0/84 NVFP4 selections.
 - The existing `mb-depth-q` recipe selects 12/84 NVFP4 projections, with the
