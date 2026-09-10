@@ -111,3 +111,28 @@ resolve that false red.
 
 The spectrum is still Kvasir's independent gate. Timing on either architecture
 is deferred until a quality-safe subset is identified. No service was changed.
+
+## Independent spectrum (Kvasir, GB10, 2026-09-09) — separate from the local results above
+
+Independent M3 zero-fat gate on artifact `9f014cf1`, `NOMOS_BREEZE_DEPTH_NVFP4=1`, my `depth_sequential`
+cadence (via `depth_lane`) — distinct instrument from the local `breeze_depth_route_gate.py` results above.
+Recipe dirs: `~/nomos_data/breeze-tts-2/mb-depth-{class}` (per-class NVFP4, rest symlinked bf16).
+
+| recipe | verdict | fat-misses (cond+uncond) | note |
+|---|---|---|---|
+| depth-q | PASS (my cadence) | 0+0 | but RED on the shipping begin/advance cadence (local result) — a failure on the required path, not a waiver |
+| depth-k | FAIL | 2+2 | borderline (~0.10) |
+| depth-gate | FAIL | 7+6 | up to 0.35 |
+| depth-up | FAIL | 11+9 | up to 0.40 |
+| depth-v | FAIL | 16+12 | up to 0.44 — not borderline |
+| depth-down | FAIL | 19+15 | up to 0.50 |
+| depth-o | FAIL | 20+17 | up to 0.40 |
+| depth-all | FAIL | 52+48 | up to 0.99 — catastrophic |
+
+**Precise verdict (per agreed boundaries):** no TESTED NVFP4 recipe is quality-safe across the required
+cadences — NOT proof no possible layer-selective/composite recipe exists, and NOT a verdict on untested
+precision strategies (calibrated GPTQ/AWQ, stochastic rounding, per-channel mixed). Only q_proj (~3% of
+depth bytes) marginally passes and only off the shipping cadence. Recurring hard-token coordinates
+(frame18/cb12, frame17/cb11=0.12024, frame25/cb12) establish sensitivity, not a proven chaos-floor
+mechanism. Within this task: RTN-NVFP4-per-class is not a viable Breeze recipe; no further RTN search
+warranted. Depth NVFP4 stays opt-in/default-OFF infra; bf16 ships; no promotion.
