@@ -70,3 +70,44 @@ Kvasir owns the per-class quality spectrum and its independent verification.
 Only after a quality-safe subset exists should GB10/sm_120 timing adjudicate
 its performance. Neither lower byte counts nor a successful build establish
 fidelity, effective bandwidth, or an end-to-end speedup.
+
+## Initial GB10 verification
+
+Implementation `25cc401`; artifact lineage `c48c9ae` includes converter commit
+`9f01a4f`. Library SHA256:
+`9f014cf1992c5332e7a14a11d2e0aa7268c7da2897cc237a1d5d82161326c27a`.
+Preserved in `results/breeze-depth-nvfp4/c48c9ae/` in the Breeze worktree.
+All 12 shipping model FFI exports are unchanged.
+
+- Canonical BF16 with the new flag ON passes the full M3 gate and matches the
+  pre-depth library's LM/depth arrays **byte-for-byte**, separately for combined,
+  persistent, paired, and full-prefix frame zero. There are 0/84 NVFP4 selections.
+- The existing `mb-depth-q` recipe selects 12/84 NVFP4 projections, with the
+  other six classes still BF16. All forced-code backbone logits remain exact
+  versus the BF16 baseline (36/36 top1 per lane).
+- Depth-q **FAILS** the unchanged quality bar on all three complete replay
+  cadences: frame index 10, depth-logit index 13 (predicting codebook 14), cond
+  lane 0; HF token 680, kernel token 1415, HF margin **0.1039953232**. This is
+  not the prior backbone-q recipe's frame17 token and is not waived as a tie.
+  Combined/persistent depth hits are 510/525 cond and 506/525 uncond; paired
+  503/525 and 514/525. Mean depth relL2 is about 0.017. Full-prefix frame zero
+  alone passes 15/15 both lanes; that smoke does not override the full replay.
+- `tools/test_breeze_depth_loader.py <loader-probe>` passes **18/18** generated
+  fixture tests: selection, BF16 fallback, disabled selection, missing siblings,
+  malformed headers/payloads, and zero/negative/NaN/Inf scales. Failure cases
+  check the loader error reason, not merely a nonzero process exit.
+
+For the standalone probe, build with `mojo build -I .` and the same CUDA
+library path and libc/token callback shim objects used by the model build.
+The pinned GB10 environment resolves CUDA from `/usr/local/cuda`, not the
+empty pixi CUDA library directory; an initial standalone link failure was
+corrected before executing these tests.
+
+The new S16 test was first fed the wrong (pre-final-norm) hidden and failed on
+the OLD binary. Reading `_run`'s `last_hidden` write identified the harness
+error. After switching to `prefill_lane`'s `final` output, the old binary and
+BF16 candidate both passed. No kernel change or gate relaxation was made to
+resolve that false red.
+
+The spectrum is still Kvasir's independent gate. Timing on either architecture
+is deferred until a quality-safe subset is identified. No service was changed.
