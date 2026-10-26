@@ -81,7 +81,7 @@ MODELS = {
         # reported earlier was STALE LOGITS, which is also why it was quant-independent. Measured:
         # position drift of exactly -1 per stripped token, dose-response 0 / -1 / -2 against a
         # prediction made IN ADVANCE, |(c,s)| = 1.000000 throughout (a pure rotation, so both RoPE
-        # kernels were innocent). honesty-probe ad90172.
+        # kernels were innocent). See the BOS-strip fix record.
         #
         # LOADED-BINARY ATTESTED (kernel 0606837, .so sha256 3c7bd468...a51a68), via the new
         # no-handle exports rather than inferred from source:

@@ -127,7 +127,7 @@ else
   echo "                              That is the bug, not a result. Do not quote arm B."
 fi
 echo "  pinned  : SPEC_VB=$SPEC_VB PERF_NTOK=$PERF_NTOK PERF_REPEAT=$PERF_REPEAT"
-# ── GB10 CANNOT HOST ARMS A/B. Measured on Spark 2, 2026-08-02, arm A (DP4A=0, BLOCK=1 — so
+# ── GB10 CANNOT HOST ARMS A/B. Measured on the GB10 box, 2026-08-02, arm A (DP4A=0, BLOCK=1 — so
 #    write and read agree and the block-32 bug CANNOT be present): base decode 4.17 tok/s against
 #    a ~21.7 reference, and acceptance EXACTLY 0.000 at every depth, E=1.00. Something about
 #    dropping dp4a on the Q4_0 path kills acceptance on its own — cause not yet isolated (q8

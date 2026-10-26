@@ -152,7 +152,7 @@ def run_inference_impl(
     # Measured cost of the old behaviour: a position drift of exactly -1 per stripped
     # token, since RoPE is the only consumer of position. Dose-response 0 / -1 / -2 against
     # a prediction made in advance, |(c,s)| = 1.000000 throughout (a pure rotation -- both
-    # RoPE kernels were innocent). See honesty-probe ad90172.
+    # RoPE kernels were innocent). See the BOS-strip fix record.
     #
     # The prefix-continuation case this strip exists for is always multi-token, so it is
     # unaffected. A lone [BOS] continuation would have prefilled nothing anyway.

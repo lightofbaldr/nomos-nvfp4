@@ -34,7 +34,7 @@ max-core = "==26.5.0"
 # Declaring CUDA on BOTH branches makes the shared env stable across switches.
 #
 # SCOPED TO linux-64 ON PURPOSE. This workspace declares two platforms (linux-aarch64 for
-# Spark 2 / GB10, linux-64 for the 5090). These are the x86 CUDA packages; forcing them to
+# the GB10 box, linux-64 for the 5090). These are the x86 CUDA packages; forcing them to
 # solve for aarch64 too is what made `pixi install` panic (aarch64 wants the sbsa layout).
 # Per-target is also the honest shape: every arch builds its own .so, and a .so is never
 # copied across arches.

@@ -1,6 +1,6 @@
 # Muse-Glimmer-30B — NVFP4 / 5090 arm run-book (#79)
 
-Staged by Kvasir (Spark 2) for Prime (Stealth-18-Prime, RTX 5090 Laptop, sm_120). This is the
+Staged by Kvasir (on the GB10 box) for Prime (RTX 5090 Laptop, sm_120). This is the
 **discrete/NVFP4 arm** of the Muse text-tower port. The GB10/Q4 arm's lossless (kernel-vs-kernel) + perf claims HOLD, but a sharper margin instrument
 (Prime, 2026-08-10) later found a small SHARED decode-quality gap vs HF the aggregate-sigma test missed
 (decode cos ~0.01-0.015 under prefill on BOTH arches, a few genuine HF-confident misses, worse on NVFP4)
@@ -28,9 +28,9 @@ Q4 numbers.
    Q4-only; the NVFP4 readout (`_dflash_readout_argmax_nvfp4`) is a *separate* path and must be gated on
    its own (that's G2 below — Codex flagged this explicitly).
 
-## Artifacts (all pre-built on Spark 2; nothing to convert)
+## Artifacts (all pre-built on the GB10 box; nothing to convert)
 
-| what | Spark 2 path | R2 | size |
+| what | GB10 path | R2 | size |
 |---|---|---|---|
 | NVFP4 target flat | `~/nomos_data/muse-glimmer-flat-nvfp4/` (417 `.nvfp4` + 211 `.bin`) | `r2:lofb-data/muse-nvfp4-5090/target/` | 24G |
 | Q4 assistant (drafter body) | `~/nomos_data/muse-assistant-flat-q4/` (36 `.q4` + 22 `.bin`) | `r2:lofb-data/muse-nvfp4-5090/assistant/` | 1.4G |
@@ -111,7 +111,7 @@ NOMOS_VERIFY_BLOCK_ATTN=0     # =1 is LOSSY on discrete/NVFP4 (#65) — it will 
 
 ## Caveats to carry in
 
-- `tools/convert_redhat_nvfp4.py` carries a 2026-06-29 note that NVFP4 correctness on **Spark 2 (GB10)**
+- `tools/convert_redhat_nvfp4.py` carries a 2026-06-29 note that NVFP4 correctness on **the GB10 box**
   was unsettled; that's a GB10-NVFP4 caveat, but re-read it before trusting any NVFP4 build — the 5090 is
   the shipping path for NVFP4, so this is the arch where it should be *most* correct, but verify G1 first.
 - Prove the code-under-test is IN the binary: `nm -D | grep nomos_dflash_draft_block` (exported entry)
@@ -124,7 +124,7 @@ NOMOS_VERIFY_BLOCK_ATTN=0     # =1 is LOSSY on discrete/NVFP4 (#65) — it will 
   building against a sibling env's CUDA doesn't put it on the loader path (Prime, 2026-08-10).
 - **Watch for `cudaMalloc rc=2` mid-run that looks like a kernel defect but is a memory race.** On the
   5090 box ollama re-loads qwen3-embedding (~10.7G) in ~4-min bursts; a 14.6 MB alloc landing during a
-  load OOMs and reads exactly like a kernel bug. Gold (.78) being down means it can't be stopped — retry
+  load OOMs and reads exactly like a kernel bug. the host that owns that process being down means it can't be stopped — retry
   the race, don't debug the kernel. (Prime, 2026-08-10.)
 - **Gate-design law (2026-08-10, learned twice in one day):** a gate that asks "is this difference big
   enough to matter?" MUST key on a **magnitude** (spread, prob-gap, max_abs) — NEVER an ordinal/shape

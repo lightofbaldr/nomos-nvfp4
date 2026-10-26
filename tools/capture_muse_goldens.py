@@ -2,8 +2,8 @@
 """Golden capture: HF Muse-Glimmer-30B text-tower reference for kernel parity.
 
 Run with the ISOLATED venv (transformers 5.16.0.dev0), never the system python:
-    ~/kvasir/muse-ref/.venv/bin/python tools/capture_muse_goldens.py \
-        ~/nomos_data/muse-glimmer/base ~/kvasir/muse-ref/goldens
+    $MUSE_REF_VENV/bin/python tools/capture_muse_goldens.py \
+        ~/nomos_data/muse-glimmer/base $MUSE_REF_DIR/goldens
 
 This is THE adjudicating instrument for #79. Eleven arithmetic deltas, one OOB
 write and two converter bugs were all found BEFORE any end-to-end run — every one
