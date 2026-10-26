@@ -34,7 +34,7 @@ Q4 numbers.
 |---|---|---|---|
 | NVFP4 target flat | `~/nomos_data/muse-glimmer-flat-nvfp4/` (417 `.nvfp4` + 211 `.bin`) | `r2:lofb-data/muse-nvfp4-5090/target/` | 24G |
 | Q4 assistant (drafter body) | `~/nomos_data/muse-assistant-flat-q4/` (36 `.q4` + 22 `.bin`) | `r2:lofb-data/muse-nvfp4-5090/assistant/` | 1.4G |
-| HF goldens (per-layer + logits) | `~/kvasir/muse-ref/goldens/` | `r2:lofb-data/muse-nvfp4-5090/goldens/` | 71M |
+| HF goldens (per-layer + logits) | `$MUSE_REF_DIR/goldens/` | `r2:lofb-data/muse-nvfp4-5090/goldens/` | 71M |
 
 Pull: `rclone copy r2:lofb-data/muse-nvfp4-5090/target ~/nomos_data/muse-glimmer-flat-nvfp4` (etc.).
 **Alternative (if you'd rather regenerate):** `tools/convert_muse_glimmer.py --format nvfp4 <base> <out>`
@@ -95,7 +95,7 @@ NOMOS_VERIFY_BLOCK_ATTN=0     # =1 is LOSSY on discrete/NVFP4 (#65) — it will 
   construction; the gate is "how much, acceptable for the demo?", its own axis and tolerance, not
   byte-parity.
 - **G2 — drafter readout through the NVFP4 head (Codex's named gate; does NOT inherit the Q4 v4 fix).**
-  Capture the HF drafter surfaces once (`~/kvasir/muse-ref/hf_drafter_surfaces.py`, isolated venv), then
+  Capture the HF drafter surfaces once (`$MUSE_REF_DIR/hf_drafter_surfaces.py`, isolated venv), then
   `python3 tools/muse_drafter_diff.py --so <so> --weights <nvfp4 target> --dflash <q4 assistant>`.
   PASS = final→logits cos high and proposals match HF. The harness teacher-forces the anchor to HF's and
   asserts the manifest anchor (fails loud on a stale reference). If this diverges, it is the W4A4 readout
