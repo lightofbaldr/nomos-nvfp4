@@ -5,7 +5,7 @@ Replaces the O(S²) per-token attention loop in engine_prefill (S calls ×
 prompt's attention for a layer is 5 launches: transpose-Q, batched Q·Kᵀ,
 causal softmax, batched scores·V, transpose-out.
 
-The GQA layout problem + fix (see internal notes):
+The GQA layout problem + fix (see docs/BATCHED_ATTENTION_PLAN.md):
   d_q_b is [S, nkv, kvg, l_hd] (token-major). A kv-head's kvg*S query rows
   are interleaved across tokens, so a strided GEMM can't read them. We first
   block-transpose Q to [nkv, S, kvg*l_hd] → then kv-head h is the contiguous

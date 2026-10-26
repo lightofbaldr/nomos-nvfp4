@@ -72,7 +72,7 @@ class BreezeTTS:
         self.mod.nomos_breeze_model_depth_begin.argtypes = [ctypes.c_int64, ctypes.c_int32, P, P]
         self.mod.nomos_breeze_model_depth_advance.argtypes = [ctypes.c_int64, ctypes.c_int32, ctypes.c_int32, P, P]
         self.mod.nomos_breeze_model_step_backbone.argtypes = [ctypes.c_int64, ctypes.c_int32, P, P]
-        # Paired CFG route (both lanes through one weight pass; 1.86x model). Optional so an
+        # Paired CFG route (both lanes through one weight pass; 1.87x model). Optional so an
         # older single-lane .so still loads — design mode uses it when present, else falls back.
         self._paired = all(hasattr(self.mod, n) for n in
                            ("nomos_breeze_model_depth_begin2", "nomos_breeze_model_depth_advance2",
@@ -170,7 +170,7 @@ class BreezeTTS:
 
     def _iter_frames(self, cond, uncond, cfg_scale, max_frames, seed):
         """Yield each completed frame's 16 codes. Uses the paired CFG route (both lanes in one
-        weight pass, 1.86x) when a second lane is present and the .so exports it; otherwise the
+        weight pass, 1.87x) when a second lane is present and the .so exports it; otherwise the
         single-lane looped route. Both produce equivalent samples (gated: paired depth 1026/1050
         top1 zero fat-margin vs the single-lane goldens)."""
         def mix(a, b):

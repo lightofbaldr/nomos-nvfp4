@@ -1,4 +1,9 @@
 #!/bin/bash
+# LEGACY container helper (Gemma on a rented Pro 6000: /workspace paths, logs to /workspace/pyhost_serve.log). Nothing
+# in this repo calls it, and it is not the laptop flow: pyhost/serve_nomos.sh is. It forwards neither NOMOS_MAX_SEQ nor
+# NOMOS_PREFILL_CHUNK, so a serve restarted with it admits requests by the serve's defaults (4096 and 0), whatever the
+# daemon runs; the serve prints both values at startup. Restarting the serve alone also breaks ledger R42 after a
+# protocol change: restart the daemon and the serve together.
 # restart_serve.sh — restart ONLY the pyhost serve (engine daemon untouched → ~instant
 # reconnect, no GPU reload). For the fast edit→deploy→test loop on the Pro 6000 box.
 # Honors NOMOS_DEBUG_RAW from the caller's env (so responses carry debug_raw/debug_prompt_tail).
@@ -7,7 +12,7 @@ SRC=/workspace/nomos_kernel_src
 pkill -TERM -f 'pyhost/serve.py' 2>/dev/null || true
 sleep 1
 cd "$SRC"
-export PATH=~/.pixi/bin:$PATH
+export PATH=/root/.pixi/bin:$PATH
 export TOK_DIR=/workspace/models/gemma-4-31b-it
 export LD_LIBRARY_PATH=/workspace/lib:$SRC:/usr/local/cuda/lib64
 export NOMOS_ENGINE_SOCKET=/tmp/nomos_engine.sock

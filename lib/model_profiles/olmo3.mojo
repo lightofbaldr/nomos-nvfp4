@@ -50,6 +50,7 @@ alias NORM_STYLE_POST = 1
 alias NORM_ADD_ONE = 0
 alias EMBED_RMSNORM = 0
 alias EMBED_SQRT_SCALE = 0
+alias MM_IMAGE_TOKEN_ID = -1
 alias MLP_ACT_SILU = 1
 
 alias RMS_EPS_INPUT = 0.000001
@@ -61,7 +62,10 @@ alias RMS_EPS_FINAL = 0.000001
 
 alias TARGET_SOFTCAP = 0.0
 alias TARGET_OUTPUT_MULTIPLIER = 1.0
-alias TARGET_BOS_ID = 1
+alias TARGET_BOS_ID = 100257   # <|endoftext|> — WAS 1, but id 1 is the literal '"' in olmo's
+                               # tokenizer, so the continue-mode BOS strip (engine_decode.mojo:131)
+                               # ate every standalone quote token -> the serve quote-runaway. Fixed
+                               # 2026-09-17 (Codex found, Adam approved). BOS aliases EOS here.
 alias TARGET_EOS_ID_0 = 100257
 alias TARGET_EOS_ID_1 = -1
 alias MAX_PROBE_TOKENS = 128

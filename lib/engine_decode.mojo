@@ -8,9 +8,9 @@ from lib.gemma4_engine import (
     D, FF, FULL_HD, MAX_PROBE_TOKENS, NH, SLIDING_WINDOW, TOTAL_LAYERS, VOCAB,
     FULL_LAYERS_V_EQ_K,
 )
-from lib.cuda import cuda_download, cuda_memcpy, cuda_memset_2d, cuda_sync, cuda_upload, cuda_last_error, cuda_malloc, cuda_free
+from lib.cuda import cuda_download, cuda_memcpy, cuda_memcpy_async, cuda_memset_2d, cuda_sync, cuda_upload, cuda_last_error, cuda_malloc, cuda_free
 from lib.cuda import cuda_budget_active, cuda_budget_token_begin, cuda_budget_mark, cuda_budget_token_end
-from lib.cublas import gpu_matmul
+from lib.cublas import gpu_matmul, cublas_sdot, cublas_saxpy
 from lib.fp4_act import gpu_matmul_nvfp4_w4a4_dev, _w4a4_sync_checkpoint
 from lib.fp4_act import w4a4_prequant_grouped4_env_enabled
 from lib.fp4_weights import gpu_matmul_nvfp4_fused_dev
@@ -22,7 +22,7 @@ from lib.model_config import (
     EMBED_RMSNORM, EMBED_SQRT_SCALE, RMS_EPS_INPUT, RMS_EPS_FINAL, TARGET_BOS_ID,
     TARGET_EOS_ID_0, TARGET_EOS_ID_1,
     TARGET_OUTPUT_MULTIPLIER, TARGET_SOFTCAP, HAS_LINEAR_ATTENTION,
-    ATTENTION_SCORE_SCALE,
+    ATTENTION_SCORE_SCALE, MM_IMAGE_TOKEN_ID,
 )
 from lib.gemma4_layer import (
     prepare_qkv_dev, apply_output_and_mlp_dev, apply_qwen_mlp_batched,
@@ -81,6 +81,12 @@ def run_inference_impl(
     Caller manages the start_pos via cache truncation (we always truncate
     to 0 here for simple stateless requests)."""
 
+    # KV session store: this writes KV that live_tokens does not describe. A tracked wrapper (prefill_logits,
+    # step_logits, step_token, prefill_cont_logits) vouches for its own write and restores the list afterwards;
+    # any other caller (nomos_generate, the debug exports) leaves the state marked untracked. First statement,
+    # so a call that raises is marked too.
+    self.mark_live_desync()
+
     if _env_float("NOMOS_SPEC_DECODE", 0.0) > Float32(0.5):
         var spec_k = Int(_env_float("NOMOS_SPEC_K", 6.0))
         if not e2b_draft_contract_ok(spec_k, VOCAB):
@@ -127,8 +133,31 @@ def run_inference_impl(
     # In continue mode, drop the model's leading <bos> from the live prompt: the
     # injected prefix already opened the sequence, and a mid-stream BOS makes
     # the model wander after the recalled content. We prefill from prompt[skip].
+    #
+    # 2026-09-17: the guard is `num_new > 1`, NOT `> 0`. NEVER strip on a SINGLE-token
+    # continuation. step_logits (gemma4_engine.mojo:1064-1072) appends exactly one token
+    # with kv_continue=True -- that is an APPEND-ONE-TOKEN contract, not a prefix
+    # continuation, and it must never lose its only token. Stripping there takes num_new
+    # to 0, so the loop at :294 never runs: no KV append, no logits write. The decode-step
+    # export still returns 0, the host reuses its previous logits buffer, and a greedy
+    # sampler re-emits the same token until the length cap.
+    #
+    # This bit for weeks because olmo3 declared TARGET_BOS_ID = 1 while that tokenizer
+    # maps id 1 to the literal '"' (its real BOS, <|endoftext|>, is 100257) -- so every
+    # standalone quote token was eaten. The profile constant is corrected separately, but
+    # requiring num_new > 1 closes the class regardless of what BOS is set to. That matters
+    # here specifically: for olmo3 BOS ALIASES EOS, so after the constant fix an explicit
+    # step(<|endoftext|>) would still have vanished silently.
+    #
+    # Measured cost of the old behaviour: a position drift of exactly -1 per stripped
+    # token, since RoPE is the only consumer of position. Dose-response 0 / -1 / -2 against
+    # a prediction made in advance, |(c,s)| = 1.000000 throughout (a pure rotation -- both
+    # RoPE kernels were innocent). See honesty-probe ad90172.
+    #
+    # The prefix-continuation case this strip exists for is always multi-token, so it is
+    # unaffected. A lone [BOS] continuation would have prefilled nothing anyway.
     var prompt_skip = 0
-    if continue_mode and num_new > 0 and prompt[0] == TARGET_BOS_ID:
+    if continue_mode and num_new > 1 and prompt[0] == TARGET_BOS_ID:
         prompt_skip = 1
         num_new = num_new - 1
         prompt_end = start_pos + num_new
@@ -148,14 +177,18 @@ def run_inference_impl(
     if continue_mode and not self.kv_quant:
         use_batched = False
     if use_batched and num_new > 1 and (not store_mode):
-        var dflash_prefill_context = self.dflash_ptr != 0 and not continue_mode and max_new_tokens == 0
+        # A continuation feeds the drafter only when nomos_prefill_cont says the drafter is in step with the KV
+        # (the KV session store keeps them aligned); otherwise its rows would land at the wrong positions.
+        var dflash_prefill_context = (
+            self.dflash_ptr != 0 and (not continue_mode or self.dflash_capture_continue) and max_new_tokens == 0
+        )
         var pref = List[Int]()
         for i in range(num_new - 1):
             pref.append(prompt[i + prompt_skip])
         # ── CHUNKED PREFILL (NOMOS_PREFILL_CHUNK=C, default 0=off) ────────────────────────────
         # THE 24GB CONTEXT CEILING: prefill_batch allocates O(S²) attention scores (NH·S²·4 =
         # 2.8GB at S=4.7K) and O(S·FF) transients, so a 24GB card cannot prefill past ~4K in any
-        # config (docs/the runbook §3b, measured 2026-08-03). Chunking caps every S-scaled
+        # config (docs/RUNBOOK.md §3b, measured 2026-08-03). Chunking caps every S-scaled
         # allocation at C: each chunk prefills at offset start_pos+off, attending the cached
         # prefix — the continue-mode machinery that already exists and is exact.
         # Requirements/notes:
@@ -192,7 +225,7 @@ def run_inference_impl(
         #   - then the loop broke before the lm-head, so logits_out came back UNTOUCHED with
         #     rc=0 after 12.7s of real compute. Silent, HTTP 200, no log line.
         # Refuse here, before any of that happens. Loud beats corrupt.
-        # (nexus, RTX PRO 4000; four instrumented arms to localize. Do not soften this to a warning.)
+        # (nexus, Gold; four instrumented arms to localize. Do not soften this to a warning.)
         if start_pos + num_new > self.max_seq:
             raise Error(
                 String("prompt does not fit: start_pos+tokens=") + String(start_pos + num_new)
@@ -224,7 +257,7 @@ def run_inference_impl(
                 # PER-TOKEN fallback instead of the batched prefix path. This is the diagnostic
                 # arm for #74: int8 already gets exactly this (it is excluded from the chunk
                 # trigger at engine_prefill.mojo:132 because of a known PV-anchor defect), and
-                # GB10/int8 is CLEAN while the discrete/bf16 path returns an untouched logits buffer and then
+                # GB10/int8 is CLEAN while Gold/bf16 returns an untouched logits buffer and then
                 # poisons the engine. This flag gives bf16 the same treatment, so "chunking is
                 # broken" and "the bf16 prefix-block path is broken" become separable.
                 # Measured 2026-08-05: GB10 chunked is clean in both arms (writeback ordinary),
@@ -280,10 +313,10 @@ def run_inference_impl(
     var t_decode_read_copy: Int = 0
 
     # NOMOS_CHUNK_TRACE=1 -> dump every variable that bounds this loop. #74: chunked prefill
-    # returns with logits_out UNTOUCHED (nexus, RTX PRO 4000, sentinel-verified), and the position
+    # returns with logits_out UNTOUCHED (nexus, Gold, sentinel-verified), and the position
     # arithmetic is identical to the unchunked branch ON PAPER -- pref = prompt[0:num_new-1],
     # prefill_start = num_new-1, so step 0 has pos == prompt_end-1 and the `continue` below
-    # must NOT fire. Something breaks that equality on the RTX PRO 4000 and it is not visible from outside.
+    # must NOT fire. Something breaks that equality on Gold and it is not visible from outside.
     # Print the actuals rather than reason about them.
     var _ctrace = _env_float("NOMOS_CHUNK_TRACE", 0.0) > Float32(0.5)
     if _ctrace:
@@ -337,6 +370,20 @@ def run_inference_impl(
             var embed_scale = sqrt(Float32(D))
             for i in range(D):
                 x[i] *= embed_scale
+        # The prompt's final row is executed through this S=1 path. Keep the
+        # splice complete when an image placeholder occupies that boundary.
+        if self.mm_features_host != 0 and token_id == MM_IMAGE_TOKEN_ID:
+            if self.mm_cursor >= self.mm_nvis:
+                raise Error("vision splice cursor exceeds supplied features")
+            var vf = UnsafePointer[Float32, MutUntrackedOrigin](
+                unsafe_from_address=Int(self.mm_features_host))
+            for i in range(D):
+                x[i] = vf[self.mm_cursor * D + i]
+            self.mm_cursor += 1
+        if self.mm_features_host != 0 and _env_float("NOMOS_MM_DEBUG", 0.0) > Float32(0.5):
+            for i in range(D):
+                self.mm_debug_embeddings.append(x[i])
+            self.mm_debug_rows += 1
         cuda_upload(self.d_x_buf, x)
         if decode_prof:
             cuda_sync()
@@ -452,14 +499,16 @@ def run_inference_impl(
                 # prompt prefill can still populate row taps, but every committed
                 # decode/verify row poisons the drafter context with five zero taps.
                 # Capture the same post-MLP residual surface as batched prefill.
+                # Queued on ctx, after the ctx-queued residual add, like the tap below; see there.
                 if self.d_eagle3_tap_out != 0 and self.drafter_tap_count > 0:
                     var tap_slot = self.drafter_tap_slot(layer)
                     if tap_slot >= 0:
-                        cuda_memcpy(
+                        cuda_memcpy_async(
                             self.d_eagle3_tap_out + UInt64(tap_slot * D * 4),
                             self.d_x_buf,
                             D * 4,
                             3,
+                            self.ctx,
                         )
                 continue
 
@@ -474,7 +523,8 @@ def run_inference_impl(
                 self.d_in_norms[layer], self.d_q_norms[layer], self.d_k_norms[layer],
                 self.d_qw[layer], self.d_kw[layer], d_vw_or_zero, self.d_attn_gw[layer],
                 self.d_matmul_in_bf16,
-                is_full, D, l_nh, l_nkv, l_hd, l_qd, l_kvd, pos, layer, self.d_weight_bf16_scratch,
+                is_full, D, l_nh, l_nkv, l_hd, l_qd, l_kvd,
+                pos + self.mrope_position_delta, layer, self.d_weight_bf16_scratch,
                 self.d_qw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
                 self.d_kw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
                 Float32(0.0) if v_eq_k else (self.d_vw_gs[layer] if self.weight_nvfp4 else Float32(0.0)),
@@ -805,10 +855,14 @@ def run_inference_impl(
             # EAGLE config installs target layers [1,29,56] (HF hidden-state ids [2,30,57]).
             # DFlash installs [1,12,23,35,46,57]. Slots are the configured low->high order.
             # Raw residual, no norm. Read-only D2D copy -> parity-safe when dormant.
+            # The copy is queued on ctx, after apply_output_and_mlp_dev's ctx-queued residual add. A raw
+            # cudaMemcpy is not ordered with ctx's stream, so it could copy the residual before that add
+            # landed: the same pattern made the final norm read a stale residual (d72a076). Every reader
+            # either runs on ctx or fences ctx first (the tap getters/setters in nomos_ffi.mojo).
             if self.d_eagle3_tap_out != 0 and self.drafter_tap_count > 0:
                 var tap_slot = self.drafter_tap_slot(layer)
                 if tap_slot >= 0:
-                    cuda_memcpy(self.d_eagle3_tap_out + UInt64(tap_slot * D * 4), self.d_x_buf, D * 4, 3)
+                    cuda_memcpy_async(self.d_eagle3_tap_out + UInt64(tap_slot * D * 4), self.d_x_buf, D * 4, 3, self.ctx)
 
         # Prefill fast-path: only the last prompt token onward needs logits.
         # The KV cache for this position is already populated by the layer
@@ -862,7 +916,7 @@ def run_inference_impl(
             # largest single category) achieving ~86 GB/s while our own layer GEMMs hit ~459
             # GB/s on the same card. The vocab launch is ALREADY chunked at 32768 rows, so
             # grid geometry is largely exonerated and the scalar decode loop is the suspect.
-            # MEASURED on the RTX PRO 4000 GPU1, one binary / both arms / one session, serve path:
+            # MEASURED on Gold GPU1, one binary / both arms / one session, serve path:
             #   v1  20.339 tok/s, lm-head 9.285 ms/token (85 GB/s)
             #   v3  21.870 tok/s, lm-head 5.745 ms/token (138 GB/s)  -38% on the kernel, +7.5% e2e
             #   12/12 byte-exact vs the NVFP4 base in BOTH arms; token-identity PASS.

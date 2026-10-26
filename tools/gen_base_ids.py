@@ -43,7 +43,15 @@ for p in bar["prompts"]:
     tok = int(np.argmax(logits))
     seq = [tok]
     for _ in range(NTOK - 1):
-        lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+        # THIS SCRIPT WRITES A REFERENCE ARTIFACT, so an unchecked rc here is how a
+        # corrupt baseline gets made and then trusted by every later comparison.
+        # nomos_decode_step can return 0 while having written nothing (the 2026-09-17
+        # BOS/quote bug) -- it now returns -2 for that, but only if someone looks.
+        rc = lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+        if rc != 0:
+            raise RuntimeError(
+                f"nomos_decode_step rc={rc} (prompt {p['id']}, token {len(seq)}). "
+                f"logits are STALE -- refusing to write a reference file from them.")
         tok = int(np.argmax(logits))
         seq.append(tok)
     out[p["id"]] = seq

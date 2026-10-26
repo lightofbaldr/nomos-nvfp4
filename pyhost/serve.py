@@ -22,7 +22,7 @@ import os
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from typing import Any
 
 import anyio
@@ -33,14 +33,14 @@ from pydantic import BaseModel, Field
 from transformers import AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from host import KernelLM, H          # noqa: E402
+from host import KernelLM, H, SESSION_OPEN_UNSUPPORTED, _store_requested   # noqa: E402
 from grammar import ToolGrammar        # noqa: E402
 from agent import parse_call           # noqa: E402  (Gemma <|"|>-arg parser → (name, dict))
-from serve_protocol import load_serve_protocol  # noqa: E402
+from serve_protocol import atem_exact_fields, load_serve_protocol  # noqa: E402
 # Prompt-length ceiling. With NOMOS_BATCHED_PREFILL=1 the engine fully materialises the causal
 # attention scores — lib/engine_prefill.mojo:145, NH * S * S * 4 bytes, plus a bf16 copy at :150
 # (NH * S * S * 2). That is QUADRATIC in prompt length: ~192 bytes * S^2, i.e. 768 MiB at 2k
-# tokens but 4.7 GiB at 5k. Engine + drafter leave only ~3.7 GiB free on the RTX PRO 4000, so an ordinary
+# tokens but 4.7 GiB at 5k. Engine + drafter leave only ~3.7 GiB free on Gold, so an ordinary
 # OpenWebUI prompt (history + tool definitions) walks off the cliff. The failure is NOT
 # recoverable: cudaMalloc failing inside the kernel is a Mojo ABORT that kills the daemon
 # outright — observed repeatedly on 2026-08-05, the exact allocation being
@@ -56,7 +56,55 @@ from serve_protocol import load_serve_protocol  # noqa: E402
 # pass per prompt token (a 576-token prompt did not finish in 10 minutes) — not viable.
 # The real fix is tiled/flash-style scores that never materialise S^2; RUNBOOK 3c already
 # queues it as the context-ceiling build.
+# This cap now applies only when NOMOS_PREFILL_CHUNK is unset (_fit_request below); chunked, NOMOS_MAX_SEQ binds.
+# (The NOMOS_PREFILL_CHUNK bullet above predates the #74 capacity guard: see RUNBOOK 3b, 3c and 3d.)
 MAX_PROMPT_TOKENS = int(os.environ.get("NOMOS_MAX_PROMPT_TOKENS", "2900"))
+MAX_SEQ = int(os.environ.get("NOMOS_MAX_SEQ", "4096"))
+PREFILL_CHUNK = int(float(os.environ.get("NOMOS_PREFILL_CHUNK", "0") or 0))
+
+
+def _fit_request(n_prompt: int, max_tokens: int) -> int:
+    """How many tokens a request may generate. With NOMOS_PREFILL_CHUNK set, prefill memory is capped per chunk and the
+    binding limit is the KV capacity: prompt + generated must fit in NOMOS_MAX_SEQ (engine_decode's #74 capacity guard
+    refuses anything past it). An unchunked engine keeps the O(S^2) prompt cap explained above."""
+    if PREFILL_CHUNK <= 0 and n_prompt > MAX_PROMPT_TOKENS:
+        raise HTTPException(status_code=413, detail=(
+            f"prompt is {n_prompt} tokens; this engine accepts at most {MAX_PROMPT_TOKENS} with unchunked prefill: "
+            f"batched prefill materialises the S*S attention scores (~192 bytes * S^2, 4.7 GiB at 5k tokens) and "
+            f"would abort the engine on cudaMalloc. Set NOMOS_PREFILL_CHUNK (RUNBOOK 3c) to serve long "
+            f"conversations, or shorten this one."))
+    room = MAX_SEQ - n_prompt - 1
+    if room < 1:
+        raise HTTPException(status_code=413, detail=(
+            f"prompt is {n_prompt} tokens; NOMOS_MAX_SEQ={MAX_SEQ} leaves no room to generate. "
+            f"Shorten the conversation or raise NOMOS_MAX_SEQ."))
+    return min(max_tokens, room)
+
+
+_KVSTORE_STATUS = {1: "open", 0: "off", -2: "disabled", SESSION_OPEN_UNSUPPORTED: "off (unsupported)",
+                   -10: "refused (-10: this model profile is not Muse)", -11: "refused (-11: NOMOS_KV_SWA=1)",
+                   -12: "refused (-12: unquantized KV)"}
+
+
+def _open_kvstore(lm) -> dict:
+    """Open the KV session store at startup, not at the first chat request (ruling R79), so its directory lock, its startup
+    scan and any refusal happen at launch, where the operator looks, and /health can report it. Returns /health's
+    `kvstore`: its status ("open", "off", "disabled": another process holds the directory or a setting is invalid, and
+    daemon.log says which; "off (unsupported)": a kernel that cannot open it at launch) and the store's canonical
+    directory while it is open. Never asks the engine when NOMOS_KVSTORE is off, as the launcher forces it for every model
+    but Muse: an engine of another model, or an older daemon, then sees no new request."""
+    if not _store_requested():
+        return {"status": "off", "dir": None}
+    status, store_dir = lm.session_open()
+    return {"status": _KVSTORE_STATUS.get(status, f"error ({status})"), "dir": store_dir or None}
+
+
+IMAGE_TOKEN_ID = 258880  # Gemma-4 <image_soft_token> — vision features splice at these positions
+# Untrusted request input drives image loading — secure by default: inline base64 only, byte- and
+# pixel-capped; local paths (file-read/path-traversal) and remote fetch (SSRF) are opt-in via env.
+_MAX_IMG_BYTES = int(os.environ.get("NOMOS_VISION_MAX_BYTES", 12 * 1024 * 1024))    # 12 MiB
+_MAX_IMG_PIXELS = int(os.environ.get("NOMOS_VISION_MAX_PIXELS", 40 * 1024 * 1024))  # 40 MP
+
 
 class Engine:
     """The serial logits engine + tokenizer, loaded once at app startup.
@@ -67,6 +115,14 @@ class Engine:
 
     def __init__(self) -> None:
         self.tok = AutoTokenizer.from_pretrained(H.TOK_DIR)
+        # Vision is OPT-IN: only when NOMOS_VISION_SO is set do we load the image processor. A text
+        # request never touches it — the processor is consulted only when a request carries an image.
+        self.proc = None
+        if os.environ.get("NOMOS_VISION_SO"):
+            from transformers import AutoProcessor
+            self.proc = AutoProcessor.from_pretrained(
+                os.environ.get("NOMOS_PROC_DIR", os.path.expanduser("~/nomos_data/gemma-4-31b-it-bf16")))
+            print(f"  [vision] image processor loaded (image_token_id={IMAGE_TOKEN_ID})", flush=True)
         # Daemon mode (NOMOS_ENGINE_SOCKET set): talk to the persistent engine daemon over a
         # socket — this process never loads the .so/model, so restarting the serve is instant
         # and never touches the GPU. Else load the kernel in-process (KernelLM).
@@ -84,6 +140,10 @@ class Engine:
         self.model_name = self.protocol.default_model_name
         print(f"[serve] profile={self.profile_id} protocol={self.protocol.kind} "
               f"model={self.model_name}", flush=True)
+        # What this serve admits (_fit_request). The daemon reads the same variables; a serve started without the launcher
+        # can differ from it, and this line is where that shows.
+        print(f"[serve] NOMOS_MAX_SEQ={MAX_SEQ} NOMOS_PREFILL_CHUNK={PREFILL_CHUNK} "
+              f"NOMOS_MAX_PROMPT_TOKENS={MAX_PROMPT_TOKENS}", flush=True)
         self.spec_loaded = False
         self.spec_vb = int(os.environ.get("SPEC_VB", "8"))
         # Per-model serve default (models.py env; per-request repetition_penalty overrides).
@@ -101,6 +161,10 @@ class Engine:
                 # Keep the endpoint available on base greedy if a configured drafter cannot
                 # load. The startup log makes the degraded mode explicit.
                 print(f"[serve] DFlash load failed; using base decode: {e}", flush=True)
+        # After the drafter decision: the store's cache key includes the drafter, so it is final only now.
+        self.kvstore = _open_kvstore(self.lm)
+        print(f"[serve] kvstore {self.kvstore['status']}" + (f" dir={self.kvstore['dir']}" if self.kvstore["dir"] else ""),
+              flush=True)
         self.stop = self.protocol.stop_ids
         self.lock = threading.Lock()
 
@@ -217,6 +281,9 @@ def health():
     request/response conversation at a time, so an overlapping call would corrupt the very
     stream this endpoint is meant to vouch for. A busy engine is by definition a live one,
     which is why a failed lock acquire reports healthy without touching the socket.
+
+    `kvstore` is the KV session store as the serve opened it at startup (_open_kvstore): its status and, while it is
+    open, its canonical directory (tools/kvstore_dirs.sh reads it to know which directory is live).
     """
     eng: Engine | None = getattr(app.state, "engine", None)
     if eng is None:
@@ -224,17 +291,50 @@ def health():
                             content={"status": "starting", "model": "loading", "ready": False})
     if not eng.lock.acquire(blocking=False):
         return {"status": "ok", "model": eng.model_name, "ready": True,
-                "engine": "busy", "spec": eng.spec_loaded}
+                "engine": "busy", "spec": eng.spec_loaded, "kvstore": eng.kvstore}
     try:
         eng.lm.cache_len()
     except Exception as e:  # noqa: BLE001
         return JSONResponse(status_code=503,
                             content={"status": "error", "model": eng.model_name, "ready": False,
-                                     "detail": f"engine unreachable: {e}"})
+                                     "detail": f"engine unreachable: {e}", "kvstore": eng.kvstore})
     finally:
         eng.lock.release()
     return {"status": "ok", "model": eng.model_name, "ready": True,
-            "engine": "ok", "spec": eng.spec_loaded}
+            "engine": "ok", "spec": eng.spec_loaded, "kvstore": eng.kvstore}
+
+
+_KVSTORE_STATS = ["prepares", "prompt_tokens", "reused_tokens", "restores_ram", "restores_nvme", "forks",
+                  "ram_bytes", "nvme_bytes", "ram_evictions", "nvme_evictions"]
+
+
+_STATS_WAIT_S = 60.0   # how long GET /v1/kvstore/stats waits for a running generation before it answers 503 busy
+
+
+@app.get("/v1/kvstore/stats")
+async def kvstore_stats():
+    """KV session store counters (docs/KV_SESSION_STORE_DESIGN.md §3.1). Waits for a running generation:
+    the engine socket carries one conversation at a time.
+
+    Async on purpose (ledger R43). A sync `def` runs on anyio's 40-thread pool and would keep its thread through the
+    whole wait for eng.lock, while the generation that holds the lock needs a pool thread for every chunk it streams
+    (_astream): about 40 overlapping polls would freeze it, and the GPU would idle with the lock held. So the wait
+    polls acquire(blocking=False) on the event loop and holds no thread; a thread is taken only for the stats call
+    itself, once the lock is ours."""
+    eng: Engine | None = getattr(app.state, "engine", None)
+    if eng is None:
+        return JSONResponse(status_code=503, content={"status": "starting"})
+    deadline = time.monotonic() + _STATS_WAIT_S
+    while not eng.lock.acquire(blocking=False):
+        if time.monotonic() >= deadline:
+            return JSONResponse(status_code=503, content={"status": "busy"})
+        await anyio.sleep(0.05)
+    try:
+        # The thread is using the engine socket: abandon_on_cancel stays False (anyio's default), so a cancelled
+        # request waits for the call to finish and only then releases the lock.
+        return dict(zip(_KVSTORE_STATS, await anyio.to_thread.run_sync(eng.lm.session_stats)))
+    finally:
+        eng.lock.release()
 
 
 @app.get("/v1/models")
@@ -242,6 +342,90 @@ def models() -> dict:
     eng: Engine = app.state.engine
     return {"object": "list",
             "data": [{"id": eng.model_name, "object": "model", "owned_by": "light-of-baldr"}]}
+
+
+def _decode_image(raw: bytes):
+    """Bytes → RGB PIL image, size- and pixel-bounded (rejects oversized inputs + decode bombs)."""
+    import io
+    from PIL import Image
+    if len(raw) > _MAX_IMG_BYTES:
+        raise HTTPException(status_code=413, detail=f"image exceeds NOMOS_VISION_MAX_BYTES ({_MAX_IMG_BYTES})")
+    Image.MAX_IMAGE_PIXELS = _MAX_IMG_PIXELS
+    try:
+        im = Image.open(io.BytesIO(raw)); im.load()      # force decode now, bounded by MAX_IMAGE_PIXELS
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"could not decode image: {exc}") from exc
+    return im.convert("RGB")
+
+
+def _load_image(part: dict):
+    """One OpenAI image content part → PIL.Image. data: URLs (base64) always; local paths and http(s)
+    URLs only when explicitly enabled (file-read / SSRF surface). None if not an image part."""
+    import base64
+    url = None
+    if part.get("type") == "image_url":
+        u = part.get("image_url"); url = u.get("url") if isinstance(u, dict) else u
+    elif part.get("type") == "image":
+        url = part.get("image") or part.get("url")
+    if not isinstance(url, str) or not url:
+        return None
+    if url.startswith("data:"):
+        return _decode_image(base64.b64decode(url.split(",", 1)[1]))
+    if url.startswith(("http://", "https://")):
+        if not os.environ.get("NOMOS_VISION_ALLOW_URL"):
+            raise HTTPException(status_code=400, detail="remote image URLs disabled (SSRF); set NOMOS_VISION_ALLOW_URL=1")
+        import urllib.request
+        r = urllib.request.Request(url, headers={"User-Agent": "nomos"})
+        with urllib.request.urlopen(r, timeout=15) as resp:  # noqa: S310
+            return _decode_image(resp.read(_MAX_IMG_BYTES + 1))
+    if not os.environ.get("NOMOS_VISION_ALLOW_LOCAL"):
+        raise HTTPException(status_code=400, detail="local image paths disabled; set NOMOS_VISION_ALLOW_LOCAL=1")
+    with open(url, "rb") as f:
+        return _decode_image(f.read(_MAX_IMG_BYTES + 1))
+
+
+def _messages_have_image(messages: list[dict]) -> bool:
+    return any(isinstance(m.get("content"), list) and
+               any(isinstance(p, dict) and p.get("type") in ("image_url", "image")
+                   for p in m["content"]) for m in messages)
+
+
+def _to_processor_messages(messages: list[dict]):
+    """OpenAI messages (content may be a multi-part list) → Gemma processor chat format,
+    image parts materialized as PIL images; non-image parts fold to text."""
+    out = []
+    for m in messages:
+        role, c = m.get("role", "user"), m.get("content")
+        if isinstance(c, list):
+            parts = []
+            for p in c:
+                if not isinstance(p, dict):
+                    parts.append({"type": "text", "text": str(p)}); continue
+                if p.get("type") in ("image_url", "image"):
+                    img = _load_image(p)
+                    if img is not None:
+                        parts.append({"type": "image", "image": img})
+                else:
+                    parts.append({"type": "text", "text": p.get("text", "")})
+            out.append({"role": role, "content": parts})
+        else:
+            out.append({"role": role, "content": c or ""})
+    return out
+
+
+def _build_vision_inputs(req: ChatReq, eng: "Engine"):
+    """Image request → (ids, image_features, nvis). Uses the HF processor to interleave image
+    placeholder tokens + produce pixel_values, then the kernel vision encoder for features."""
+    msgs = _to_processor_messages(req.messages)
+    inp = eng.proc.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True,
+                                       return_dict=True, return_tensors="np")
+    ids = list(np.asarray(inp["input_ids"][0], dtype=np.int64))
+    feats, nvis = eng.lm.encode_image(np.asarray(inp["pixel_values"]),
+                                      np.asarray(inp["image_position_ids"]))
+    if os.environ.get("NOMOS_DEBUG_RAW"):
+        n_img = int((np.asarray(ids) == IMAGE_TOKEN_ID).sum())
+        print(f"[dbg] VISION ntok={len(ids)} img_placeholders={n_img} nvis={nvis}", flush=True)
+    return ids, feats, nvis
 
 
 def _build_inputs(req: ChatReq, eng: "Engine"):
@@ -295,13 +479,14 @@ def _sse(cid: str, created: int, model: str, delta: dict, finish=None) -> str:
     return "data: " + json.dumps(payload) + "\n\n"
 
 
-def _stream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool = True):
+def _stream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool = True,
+            mm_feats=None, mm_nvis: int = 0):
     """SSE generator. Streams the Gemma thinking channel as `reasoning_content` and visible
     content token-by-token; a tool call is buffered (grammar-completed) then emitted as one
     tool_calls delta. Holds the engine lock for the whole generation (serial kernel)."""
     created = int(time.time())
     cid, model = f"chatcmpl-{created}", (req.model or eng.model_name)
-    with eng.lock:
+    with eng.lock, ExitStack() as turn:
         if gram:
             gram.reset()
         yield _sse(cid, created, model, {"role": "assistant"})
@@ -315,7 +500,14 @@ def _stream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool = True)
         tool_ids: list[int] = []
         broke_stop = False
         # All downstream thinking/tool/visibility handling is shared between both decoders.
-        if _use_spec(req, eng, gram):
+        if mm_feats is not None:
+            # Vision: base decode with spliced image features (spec decode is not mm-compatible).
+            token_source = eng.lm.generate_stream(
+                ids, max_new_tokens=req.max_tokens, stop_ids=eng.stop,
+                temperature=req.temperature, top_p=req.top_p, top_k=req.top_k,
+                processor=gram, mm_features=mm_feats, mm_nvis=mm_nvis,
+                rep_penalty=_rep_penalty(req, eng))
+        elif _use_spec(req, eng, gram):
             token_source = eng.lm.spec_generate_stream(
                 ids, max_new_tokens=req.max_tokens, stop_ids=eng.stop, vb=eng.spec_vb)
         else:
@@ -324,6 +516,11 @@ def _stream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool = True)
                 temperature=req.temperature, top_p=req.top_p,
                 top_k=req.top_k, processor=gram,
                 rep_penalty=_rep_penalty(req, eng))
+        # A token source left suspended (the loop broke at the stop token, or the client went away) is finalised
+        # only when this frame dies, after the lock is released. Its `finally` commits the turn to the KV session
+        # store, and that commit must not run unlocked, racing the next request's prepare on the same engine
+        # (or the same daemon socket). The ExitStack unwinds before the lock does.
+        turn.callback(token_source.close)
         if eng.protocol.kind == "atem":
             parser = eng.protocol.stream_parser(eng.tok)
             for tok in token_source:
@@ -332,6 +529,16 @@ def _stream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool = True)
                         yield _sse(cid, created, model, {field: delta})
                 if parser.saw_stop:
                     break
+            if parser.saw_stop:
+                # After the stop token a source has nothing left to hand out: resume it once, so it ends on its own (from
+                # the daemon, its end frame) and a turn that ends normally keeps its daemon connection. Closing it instead
+                # would close a speculative stream mid-way, which drops the socket, and the next request reconnects. The
+                # ExitStack's close stays for a client that goes away mid-stream, and for a drain that fails: the reply is
+                # complete by now.
+                try:
+                    next(token_source, None)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[serve] the token source failed after the stop token: {e}", flush=True)
             parsed, residual = parser.finish()
             for field, delta in residual:
                 if delta:
@@ -411,7 +618,8 @@ def _next_or_none(gen):
         return None
 
 
-async def _astream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool, request: Request):
+async def _astream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool, request: Request,
+                   mm_feats=None, mm_nvis: int = 0):
     """Drive _stream() while watching for client disconnect.
 
     Starlette iterates a sync generator in a threadpool and, when the client goes away,
@@ -425,7 +633,7 @@ async def _astream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool,
     `with eng.lock` and frees the engine. The close is shielded so cancellation — the very
     thing that gets us here — cannot skip the cleanup.
     """
-    gen = _stream(req, eng, ids, gram, thinking)
+    gen = _stream(req, eng, ids, gram, thinking, mm_feats, mm_nvis)
     try:
         while True:
             chunk = await anyio.to_thread.run_sync(_next_or_none, gen)
@@ -442,7 +650,14 @@ async def _astream(req: ChatReq, eng: "Engine", ids: list, gram, thinking: bool,
 @app.post("/v1/chat/completions")
 def chat(req: ChatReq, request: Request):
     eng: Engine = app.state.engine
-    ids, gram, thinking = _build_inputs(req, eng)
+    # Vision is opt-in per request: only a request carrying an image (and only when the processor
+    # is loaded) takes the multimodal path. Everything else is the unchanged text path.
+    mm_feats = None; mm_nvis = 0
+    if eng.proc is not None and _messages_have_image(req.messages):
+        ids, mm_feats, mm_nvis = _build_vision_inputs(req, eng)
+        gram, thinking = None, False
+    else:
+        ids, gram, thinking = _build_inputs(req, eng)
     # One line per request naming the decoder actually chosen, and the three inputs that
     # choose it. Whether spec decode was engaged was twice inferred from a stack trace and
     # once inferred wrongly; base decode is a plausible-looking number, so a silent fallback
@@ -453,27 +668,21 @@ def chat(req: ChatReq, request: Request):
           f"spec_loaded={eng.spec_loaded} -> decoder="
           f"{'DFLASH-SPEC' if _use_spec(req, eng, gram) else 'base'} "
           f"prompt_tokens={len(ids)} max_tokens={req.max_tokens}", flush=True)
-    if len(ids) > MAX_PROMPT_TOKENS:
-        # Refuse rather than let batched prefill take the daemon down with it. See
-        # MAX_PROMPT_TOKENS: the allocation failure is fatal, not catchable.
-        raise HTTPException(status_code=413, detail=(
-            f"prompt is {len(ids)} tokens; this engine accepts at most {MAX_PROMPT_TOKENS}. "
-            f"Two different limits sit behind this, depending on how the engine was started. "
-            f"UNCHUNKED: batched prefill materialises the S*S attention scores (~192 bytes * "
-            f"S^2 — 4.7 GiB at 5k tokens) and would abort the engine on cudaMalloc. "
-            f"CHUNKED (NOMOS_PREFILL_CHUNK set): prefill scratch is capped per chunk, and the "
-            f"binding limit is instead NOMOS_MAX_SEQ, which must cover prompt + generated "
-            f"tokens — past it the kernel silently stops before writing any logits and leaves "
-            f"the engine returning NaN until restart. Shorten the conversation, or raise "
-            f"NOMOS_MAX_PROMPT_TOKENS (and NOMOS_MAX_SEQ with it) if the card has room."))
+    req.max_tokens = _fit_request(len(ids), req.max_tokens)
     if req.stream:
-        return StreamingResponse(_astream(req, eng, ids, gram, thinking, request),
+        return StreamingResponse(_astream(req, eng, ids, gram, thinking, request, mm_feats, mm_nvis),
                                  media_type="text/event-stream")
     with eng.lock:
         if gram:
             gram.reset()
         t0 = time.time()
-        if _use_spec(req, eng, gram):
+        if mm_feats is not None:
+            # Vision: base decode with spliced image features (spec decode is not mm-compatible).
+            out = eng.lm.generate(ids, max_new_tokens=req.max_tokens, stop_ids=eng.stop,
+                                  temperature=req.temperature, top_p=req.top_p, top_k=req.top_k,
+                                  processor=None, mm_features=mm_feats, mm_nvis=mm_nvis,
+                                  rep_penalty=_rep_penalty(req, eng))
+        elif _use_spec(req, eng, gram):
             # Same token convention as generate(): the stop token is emitted, then the
             # generator returns — so finish_reason/decoding below are unaffected.
             out = list(eng.lm.spec_generate_stream(
@@ -485,7 +694,12 @@ def chat(req: ChatReq, request: Request):
         dt = time.time() - t0
     raw = eng.tok.decode(out, skip_special_tokens=False)
 
-    parsed_atem = eng.protocol.parse_reply(raw) if eng.protocol.kind == "atem" else None
+    # The fields a streaming client would join, unstripped (Task 10b): the history it sends back must re-render to
+    # the token ids the KV holds. parse_atem_reply strips each body, so only its tool call is used.
+    if eng.protocol.kind == "atem":
+        reasoning, content, parsed_atem = atem_exact_fields(eng.tok, eng.protocol, out)
+    else:
+        reasoning = content = parsed_atem = None
     if parsed_atem is not None:
         call = parsed_atem.tool_call
     elif eng.protocol.kind == "qwen":
@@ -504,10 +718,10 @@ def chat(req: ChatReq, request: Request):
         finish = "tool_calls"
     else:
         if parsed_atem is not None:
-            message = {"role": "assistant", "content": parsed_atem.content}
+            message = {"role": "assistant", "content": content}
             # Muse reasoning is mandatory generation state. Keep it out of content, but expose
             # it through the same reasoning_content field as Gemma's thinking channel.
-            thought = parsed_atem.reasoning
+            thought = reasoning
         else:
             message = {"role": "assistant", "content": _visible(raw, thinking)}
             thought = _thought(raw, thinking)

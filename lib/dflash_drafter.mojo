@@ -65,9 +65,7 @@ comptime DFLASH_QKV_DIM = DFLASH_Q_DIM + 2 * DFLASH_KV_DIM
 comptime DFLASH_MLP = DRAFTER_MLP
 comptime DFLASH_VOCAB = VOCAB
 comptime DFLASH_MAX_VERIFY_ROWS = 17
-comptime DFLASH_MAX_CTX = 8192
 comptime DFLASH_CTX_BATCH = DFLASH_MAX_VERIFY_ROWS
-comptime DFLASH_MAX_SEQ = DFLASH_MAX_CTX + DFLASH_BLOCK
 comptime DFLASH_Q4_SCRATCH_BYTES = 16 * ((DFLASH_FC_IN + 31) // 32) * 36
 comptime DFLASH_ARGMAX_TPB = 1024
 comptime DFLASH_MARKOV_RANK = DRAFTER_MARKOV_RANK
@@ -266,7 +264,7 @@ def _dflash_q4_batched(
     # bound on an implementation, not a description of one. (The 166-vs-208 GB/s figures used to
     # rank the routes were also measured at the VERIFY shapes, S=5..8, then misapplied here.)
     #
-    # Leave this OFF. See docs/the measurement notes, "AI is a property of the KERNEL, not the shape".
+    # Leave this OFF. See docs/MEASUREMENT_TRAPS.md, "AI is a property of the KERNEL, not the shape".
     if S >= 9 and S <= 16 and not _dflash_env_flag("NOMOS_DFLASH_DRAFTER_V4"):
         if K <= 8192 and N > 8192:
             gpu_matmul_q4_mmq_relaxed_verify_dev[8](
@@ -324,7 +322,7 @@ struct DFlashDrafter(Movable):
     var d_verify_taps_buf: UInt64
     var last_verify_rows: Int
 
-    # gold-diff and forward scratch. Block-forward use waits for goldens.
+    # Gold-diff and forward scratch. Block-forward use waits for goldens.
     var d_context: UInt64
     var d_target_hidden: UInt64
     var d_fc_out: UInt64
@@ -362,7 +360,7 @@ struct DFlashDrafter(Movable):
     var d_markov_latent: UInt64
     var d_markov_bias: UInt64
 
-    def __init__(out self, dir: String, ctx: DeviceContext, handle: UInt64) raises:
+    def __init__(out self, dir: String, ctx: DeviceContext, handle: UInt64, max_ctx: Int) raises:
         self.handle = handle
         self.dB = DFLASH_HIDDEN
         self.n_taps = DFLASH_TAPS
@@ -377,7 +375,7 @@ struct DFlashDrafter(Movable):
         self.rope_theta = Float32(DRAFTER_ROPE_THETA)
         self.rms_eps = Float32(DRAFTER_RMS_EPS)
         self.softcap = Float32(DRAFTER_SOFTCAP)
-        self.max_ctx = DFLASH_MAX_CTX
+        self.max_ctx = max_ctx   # the engine's NOMOS_MAX_SEQ: the drafter's context never outgrows the target KV
         self.seq_len = 0
 
         self.use_q8 = _dflash_env_flag("NOMOS_DFLASH_DRAFTER_Q8")
@@ -489,10 +487,10 @@ struct DFlashDrafter(Movable):
         self.d_ctx_k_cache = List[UInt64]()
         self.d_ctx_v_cache = List[UInt64]()
         for _ in range(DFLASH_LAYERS):
-            self.d_ctx_k_cache.append(cuda_malloc(DFLASH_MAX_CTX * DFLASH_KV_DIM * 4))
-            self.d_ctx_v_cache.append(cuda_malloc(DFLASH_MAX_CTX * DFLASH_KV_DIM * 4))
-        self.d_k_all = cuda_malloc(DFLASH_MAX_SEQ * DFLASH_KV_DIM * 4)
-        self.d_v_all = cuda_malloc(DFLASH_MAX_SEQ * DFLASH_KV_DIM * 4)
+            self.d_ctx_k_cache.append(cuda_malloc(self.max_ctx * DFLASH_KV_DIM * 4))
+            self.d_ctx_v_cache.append(cuda_malloc(self.max_ctx * DFLASH_KV_DIM * 4))
+        self.d_k_all = cuda_malloc((self.max_ctx + DFLASH_BLOCK) * DFLASH_KV_DIM * 4)
+        self.d_v_all = cuda_malloc((self.max_ctx + DFLASH_BLOCK) * DFLASH_KV_DIM * 4)
         self.d_block_h = cuda_malloc(DFLASH_BLOCK * DFLASH_HIDDEN * 4)
         self.d_residual = cuda_malloc(DFLASH_BLOCK * DFLASH_HIDDEN * 4)
         self.d_normed = cuda_malloc(DFLASH_BLOCK * DFLASH_HIDDEN * 4)
@@ -552,7 +550,7 @@ struct DFlashDrafter(Movable):
             self.d_q4_scratch = cuda_malloc(DFLASH_CTX_BATCH * DFLASH_FC_IN * 2)
         else:
             self.d_q4_scratch = cuda_malloc(DFLASH_Q4_SCRATCH_BYTES)
-        self.d_scores = cuda_malloc(DFLASH_BLOCK * DFLASH_Q_HEADS * DFLASH_MAX_SEQ * 4)
+        self.d_scores = cuda_malloc(DFLASH_BLOCK * DFLASH_Q_HEADS * (self.max_ctx + DFLASH_BLOCK) * 4)
         self.d_markov_latent = UInt64(0)
         self.d_markov_bias = UInt64(0)
         @parameter
@@ -1366,7 +1364,7 @@ def _dflash_readout_argmax_nvfp4(
 ) raises:
     """Read out the 15 block-draft rows through the TARGET's NVFP4 W4A4 lm-head.
 
-    Discrete-VRAM re-wire (RTX PRO 4000, sm_120): the GB10 build read out
+    Discrete-VRAM re-wire (Gold RTX PRO 4000, sm_120): the GB10 build read out
     through the Q4 dp4a lm-head (d_embed_q4), which is not populated on the NVFP4
     weight build (d_embed_q4 == 0). This routes the readout through the SAME
     d_embed_nvfp4 W4A4 batched lm-head base decode / eagle3-verify use (the M-row

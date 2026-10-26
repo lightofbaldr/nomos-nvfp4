@@ -5,7 +5,7 @@ lib/gdn_weights.mojo (GdnWeights). Run with the system python (has torch float8_
     /usr/bin/python3 tools/convert_qwen3_5_gdn.py \
         ~/nomos_data/qwen3_8_27b-nvfp4 ~/nomos_data/qwen3_8_27b-nvfp4/gdn
 
-Correctness-first (contract locked w/ Kvasir 2026-08-17): the 3 FP8 E4M3 tensors
+Correctness-first (contract locked w/ kvasir_codex 2026-08-17): the 3 FP8 E4M3 tensors
 (in_proj_qkv, in_proj_z, out_proj) are dequantised weight_fp8 * weight_scale[out,1] -> BF16;
 the 6 native-BF16 tensors (in_proj_a/b, conv1d, A_log, dt_bias, norm) pass through raw.
 conv1d [10240,1,4] has its singleton squeezed to [10240,4]. FP8-native GEMM + the #518 FP8

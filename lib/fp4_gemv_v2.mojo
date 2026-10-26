@@ -427,7 +427,7 @@ def gpu_lm_head_greedy_dev(
 # ═════════════════════════════════════════════════════════════════════════════
 # v3 GEMV: VECTORIZED ARITHMETIC E2M1 DECODE (the real raw-kernel lever).
 #
-# v1/v2 measured ~3.3-3.6x OVER the HBM roofline on every HBM-bound shape (internal notes):
+# v1/v2 measured ~3.3-3.6x OVER the HBM roofline on every HBM-bound shape (UNIT_A_RESULTS_v1.md):
 # the bottleneck is NOT memory (weight read is already coalesced+minimal) but the PER-ELEMENT
 # SCALAR DEQUANT in v1's inner loop (16 scalar iters/block: nibble shift+mask, sign branch,
 # e2m1_mag branch). v3 vectorizes that decode via a BRANCHLESS ARITHMETIC E2M1->fp32 bit-decode
@@ -537,7 +537,7 @@ def nvfp4_gemv_v3_kernel(
 
 
 comptime NVFP4_GEMV_SMAX = 8   # multirow verify readout: rows batched per launch
-# OUTPUT rows per warp. NCU on the RTX PRO 4000/sm_120 (Codex, 095224b1) says both this kernel and the S=1
+# OUTPUT rows per warp. NCU on Gold/sm_120 (Codex, 095224b1) says both this kernel and the S=1
 # v3 are L1/TEX load-path bound — lg_throttle is 66%/73% of the entire issue gap, DRAM is only
 # 4.97%/22.35% and compute 14.57%/32.70%, with zero spills. The limiter is activation load
 # INSTRUCTIONS, not bytes: every output warp re-traverses all K activations, so 704 MiB (S=1) /
@@ -565,7 +565,7 @@ def nvfp4_gemv_v3_multirow_kernel[SMAX: Int](
 
     WHY: the NVFP4 verify readout called the single-row GEMV once per row, and each call
     re-streams the WHOLE 749 MB embedding matrix to produce one row of logits. At S=5 that
-    is ~3.7 GB of weight traffic for 5 rows. Measured on the RTX PRO 4000: read_lmhead = 23.22 ms/call,
+    is ~3.7 GB of weight traffic for 5 rows. Measured on Gold: read_lmhead = 23.22 ms/call,
     31.6% of the whole verify. Reading the weights once cuts that by ~S.
 
     BIT-EXACT vs the single-row v3 kernel, by construction and not by hope:

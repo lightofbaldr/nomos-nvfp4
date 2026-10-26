@@ -63,7 +63,14 @@ for pi, p in enumerate(bar["prompts"]):
         lib.nomos_eagle3_get_taps(ht, tap_buf.ctypes.data)
         taps_dump["step_prefill"] = tap_buf.reshape(3, D).copy()
     for s in range(NTOK - 1):
-        lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+        # Writes PARITY_OUT (json) and TAPS_OUT (npz). A skipped step corrupts both the
+        # id sequence AND the taps captured alongside it, since the taps below are read
+        # from a state that never advanced. rc 0 used to be returned on a no-op write.
+        rc = lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+        if rc != 0:
+            raise RuntimeError(
+                f"nomos_decode_step rc={rc} at step {s}; logits STALE -- refusing to "
+                f"write parity ids or taps from an un-advanced state.")
         tok = int(np.argmax(logits))
         seq.append(tok)
         if eagle_on and TAPS_OUT and pi == 0 and s < 12:

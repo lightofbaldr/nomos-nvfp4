@@ -14,7 +14,7 @@
 #
 # EVERY constant below is CONFIRMED from one of: unsloth/Qwen3.8-27B config.json,
 # the MAX qwen3_5 source audit (weight_adapters/state_cache/gated_delta.mojo), or
-# Kvasir's source audit of modeling_qwen3_5.py. Items still needing work are
+# kvasir_codex's source audit of modeling_qwen3_5.py. Items still needing work are
 # marked TODO where they describe deferred performance/serve work, not arithmetic gaps.
 
 alias PROFILE_COMPLETE = 1        # GDN + softmax target prefill/decode passed deploy-card G1.
@@ -54,7 +54,7 @@ alias HAS_LINEAR_ATTENTION = 1        # NEW: the non-full layers are Gated-Delta
 alias SLIDING_WINDOW = 4096           # N/A on qwen3_5 — no layer routes to the sliding path.
 
 # ── GDN (Gated-DeltaNet) parameters — NEW aliases, no prior model has these ───
-# The linear-attention scan geometry (config + MAX audit). Kvasir owns the scan; the PROFILE owns
+# The linear-attention scan geometry (config + MAX audit). kvasir_codex owns the scan; the PROFILE owns
 # the shapes. Recurrent state per GDN layer = [GDN_NUM_V_HEADS, GDN_KEY_HEAD_DIM, GDN_VALUE_HEAD_DIM]
 # = [48,128,128] = 786432 elts; STORED bf16 (1.5 MiB/layer × 48 = 72 MiB/slot). Conv state
 # = [conv_dim=10240, GDN_CONV_KERNEL] (HF cache keeps the full kernel width, 4).
@@ -73,7 +73,7 @@ alias GDN_GQA_EXPAND = 3             # GDN_NUM_V_HEADS // GDN_NUM_K_HEADS — qu
 # thresholds as fp16). The kernel is dtype-parametric: work_dtype fp32, state_dtype bf16.
 alias GDN_STATE_DTYPE_IS_BF16 = 1
 alias GDN_COMPUTE_FP32 = 1
-# GDN scan silent-fail deltas (Kvasir owns the impl; recorded here so the contract is one place):
+# GDN scan silent-fail deltas (kvasir_codex owns the impl; recorded here so the contract is one place):
 #   - use_qk_l2norm_in_kernel = True  (q,k L2-normalized INSIDE the scan, not before)
 #   - g = -A_log.float().exp() * softplus(a.float() + dt_bias)   (decay gate, fp32)
 #   - beta = b.sigmoid()
@@ -135,6 +135,7 @@ alias FULL_LAYERS_V_EQ_K = 0         # V distinct from K (separate v_proj), NOT 
 alias UNTIED_LM_HEAD = 1                # tie_word_embeddings = False → distinct lm_head weights (Codex audit).
 alias EMBED_RMSNORM = 0                 # hidden_states[0] = RAW embed_tokens output, NO embedding norm (Codex audit).
 alias EMBED_SQRT_SCALE = 0              # Qwen uses the raw lookup: no norm and no Gemma sqrt(D) scale.
+alias MM_IMAGE_TOKEN_ID = 248056
 alias MLP_ACT_SILU = 1                  # hidden_act = silu.
 # NO output multiplier, NO logit softcap on qwen3_5 (bare lm_head; none of output_multiplier /
 # final_logit_softcapping / logit_scale in config — Codex audit). Disabled explicitly.

@@ -95,44 +95,6 @@ def _e2b_shared_source_layer(layer: Int) -> Int:
     return 13
 
 
-def _host_write_i32_4(ptr: UInt64, a: Int, b: Int, c: Int, d: Int):
-    if ptr == 0:
-        return
-    var out = UnsafePointer[Int32, MutUntrackedOrigin](
-        unsafe_from_address=Int(ptr)
-    )
-    out[0] = Int32(a)
-    out[1] = Int32(b)
-    out[2] = Int32(c)
-    out[3] = Int32(d)
-
-
-def _host_write_i32_8(
-    ptr: UInt64,
-    a: Int,
-    b: Int,
-    c: Int,
-    d: Int,
-    e: Int,
-    f: Int,
-    g: Int,
-    h: Int,
-):
-    if ptr == 0:
-        return
-    var out = UnsafePointer[Int32, MutUntrackedOrigin](
-        unsafe_from_address=Int(ptr)
-    )
-    out[0] = Int32(a)
-    out[1] = Int32(b)
-    out[2] = Int32(c)
-    out[3] = Int32(d)
-    out[4] = Int32(e)
-    out[5] = Int32(f)
-    out[6] = Int32(g)
-    out[7] = Int32(h)
-
-
 def _load_e2b_f32(stem: String) -> UInt64:
     """Load either the legacy .bin fp32 form or the .f32bin form."""
     var ptr = load_f32_file_to_gpu(stem + ".bin")
@@ -524,21 +486,12 @@ struct E2BDraftEngine(Movable):
         mut self,
         layer: Int,
         pos: Int,
-        trace_layer: Int = -1,
-        out_phase_ptr: UInt64 = 0,
-        out_meta_ptr: UInt64 = 0,
-        out_attn_ptr: UInt64 = 0,
-        out_attn_meta_ptr: UInt64 = 0,
     ) raises:
         var is_shared = _e2b_is_shared_layer(layer)
         var is_full = _e2b_layer_is_full(layer)
         var l_hd = _e2b_layer_head_dim(layer)
         var l_qd = E2B_NUM_HEADS * l_hd
         var l_kvd = E2B_NUM_KV_HEADS * l_hd
-        var trace_this = out_phase_ptr != 0 and layer == trace_layer
-        if trace_this:
-            self.ctx.synchronize()
-            cuda_memcpy(out_phase_ptr, self.d_x, E2B_HIDDEN * 4, 2)
 
         gpu_rmsnorm_mojo(
             self.ctx,
@@ -671,13 +624,6 @@ struct E2BDraftEngine(Movable):
             )
 
         var read_hd = _e2b_layer_head_dim(read_layer)
-        if layer == trace_layer:
-            var shared_flag = 0
-            if is_shared:
-                shared_flag = 1
-            _host_write_i32_4(
-                out_meta_ptr, read_layer, l_hd, read_hd, shared_flag
-            )
 
         var attn_len = pos + 1
         var win_start = 0
@@ -686,46 +632,6 @@ struct E2BDraftEngine(Movable):
             attn_len = E2B_SLIDING_WINDOW
         var d_k_read = self.d_k_cache[read_layer] + UInt64(win_start * read_hd * 4)
         var d_v_read = self.d_v_cache[read_layer] + UInt64(win_start * read_hd * 4)
-        if trace_this and out_attn_ptr != 0:
-            cuda_sync()
-            var dump_elems = 16
-            var last_off = UInt64((attn_len - 1) * read_hd * 4)
-            cuda_memcpy(out_attn_ptr, d_q_cur, dump_elems * 4, 2)
-            cuda_memcpy(
-                out_attn_ptr + UInt64(dump_elems * 4),
-                d_k_read,
-                dump_elems * 4,
-                2,
-            )
-            cuda_memcpy(
-                out_attn_ptr + UInt64(2 * dump_elems * 4),
-                d_v_read,
-                dump_elems * 4,
-                2,
-            )
-            cuda_memcpy(
-                out_attn_ptr + UInt64(3 * dump_elems * 4),
-                d_k_read + last_off,
-                dump_elems * 4,
-                2,
-            )
-            cuda_memcpy(
-                out_attn_ptr + UInt64(4 * dump_elems * 4),
-                d_v_read + last_off,
-                dump_elems * 4,
-                2,
-            )
-            _host_write_i32_8(
-                out_attn_meta_ptr,
-                read_layer,
-                pos + 1,
-                attn_len,
-                win_start,
-                l_hd,
-                read_hd,
-                E2B_NUM_HEADS // E2B_NUM_KV_HEADS,
-                self.max_seq,
-            )
         attention_gpu_fp32_dev(
             self.ctx,
             self.handle,
@@ -760,14 +666,6 @@ struct E2BDraftEngine(Movable):
             E2B_HIDDEN,
             Float32(1.0),
         )
-        if trace_this:
-            self.ctx.synchronize()
-            cuda_memcpy(
-                out_phase_ptr + UInt64(E2B_HIDDEN * 4),
-                self.d_x,
-                E2B_HIDDEN * 4,
-                2,
-            )
 
         gpu_rmsnorm_mojo(
             self.ctx,
@@ -828,14 +726,6 @@ struct E2BDraftEngine(Movable):
             E2B_HIDDEN,
             Float32(1.0),
         )
-        if trace_this:
-            self.ctx.synchronize()
-            cuda_memcpy(
-                out_phase_ptr + UInt64(2 * E2B_HIDDEN * 4),
-                self.d_x,
-                E2B_HIDDEN * 4,
-                2,
-            )
 
         var ple_slice = self.d_ple_proj + UInt64(layer * E2B_PLE_DIM * 4)
         gpu_matmul_q4_dp4a_dev[4](
@@ -871,14 +761,6 @@ struct E2BDraftEngine(Movable):
             E2B_HIDDEN,
             self.layer_scalars[layer],
         )
-        if trace_this:
-            self.ctx.synchronize()
-            cuda_memcpy(
-                out_phase_ptr + UInt64(3 * E2B_HIDDEN * 4),
-                self.d_x,
-                E2B_HIDDEN * 4,
-                2,
-            )
 
     def _finish_logits(mut self) raises -> Int:
         gpu_rmsnorm_mojo(
@@ -990,34 +872,6 @@ struct E2BDraftEngine(Movable):
         self.seq_len += 1
         return tok
 
-    def step_token_trace_layer(
-        mut self,
-        token: Int,
-        trace_layer: Int,
-        out_phase_ptr: UInt64,
-        out_meta_ptr: UInt64,
-        out_attn_ptr: UInt64 = 0,
-        out_attn_meta_ptr: UInt64 = 0,
-    ) raises -> Int:
-        if self.seq_len >= self.max_seq:
-            raise Error("E2B draft KV cache full")
-        var pos = self.seq_len
-        self._load_token_embedding(token)
-        self._compute_per_layer_inputs(token)
-        for layer in range(E2B_NUM_LAYERS):
-            self._run_layer(
-                layer,
-                pos,
-                trace_layer,
-                out_phase_ptr,
-                out_meta_ptr,
-                out_attn_ptr,
-                out_attn_meta_ptr,
-            )
-        var tok = self._finish_logits()
-        self.seq_len += 1
-        return tok
-
     def prefill(mut self, tokens: List[Int]) raises -> Int:
         self.set_cache_len(0)
         var out_tok = 0
@@ -1040,36 +894,6 @@ struct E2BDraftEngine(Movable):
             if i == n - 1:
                 out_tok = self.step_token_trace_last(
                     tokens[i], out_hs_ptr, out_logits_ptr
-                )
-            else:
-                out_tok = self.step_token(tokens[i])
-        return out_tok
-
-    def prefill_debug_layer(
-        mut self,
-        tokens: List[Int],
-        trace_layer: Int,
-        out_phase_ptr: UInt64,
-        out_meta_ptr: UInt64,
-        out_attn_ptr: UInt64 = 0,
-        out_attn_meta_ptr: UInt64 = 0,
-    ) raises -> Int:
-        self.set_cache_len(0)
-        var n = len(tokens)
-        if n <= 0:
-            raise Error("E2B debug prefill requires at least one token")
-        if trace_layer < 0 or trace_layer >= E2B_NUM_LAYERS:
-            raise Error("E2B debug layer out of range")
-        var out_tok = 0
-        for i in range(n):
-            if i == n - 1:
-                out_tok = self.step_token_trace_layer(
-                    tokens[i],
-                    trace_layer,
-                    out_phase_ptr,
-                    out_meta_ptr,
-                    out_attn_ptr,
-                    out_attn_meta_ptr,
                 )
             else:
                 out_tok = self.step_token(tokens[i])

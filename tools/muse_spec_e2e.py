@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Muse-Glimmer drafter e2e: acceptance + THE lossless gate, fail-closed.
 
-Implements the six preconditions agreed with Kvasir (2026-08-10) — each is
+Implements the six preconditions agreed with kvasir_codex (2026-08-10) — each is
 a lesson from this week converted into a gate. NO acceptance or speed number is
 printed unless every gate passes; a gate failure exits nonzero with the gate
 named. Numbers from a partially-failed run are exactly how a crash loop printed

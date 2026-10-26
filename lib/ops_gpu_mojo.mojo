@@ -502,6 +502,83 @@ def gpu_rope_batched_mojo(ctx: DeviceContext, d_x: UInt64, base_pos: Int, S: Int
     )
 
 
+# ── Qwen3.5 interleaved multimodal RoPE ─────────────────────────────────────
+# position_ids is channel-major [3, position_stride]: temporal, height, width.
+# Qwen's mrope_section=[11,11,10] interleaves the 32 rotary-frequency slots as
+# T,H,W,T,H,W,...,T,H. Text positions have T==H==W and therefore collapse
+# exactly to ordinary partial RoPE; images exercise the three distinct axes.
+def mrope_interleaved_kernel_batched(
+    x: UnsafePointer[Float32, MutAnyOrigin],
+    position_ids: UnsafePointer[Int32, MutAnyOrigin],
+    position_stride_arg: Int32,
+    position_offset_arg: Int32,
+    S_arg: Int32,
+    n_heads_arg: Int32,
+    hd_arg: Int32,
+    theta: Float32,
+    rope_dim_arg: Int32,
+):
+    var position_stride = Int(position_stride_arg)
+    var position_offset = Int(position_offset_arg)
+    var S = Int(S_arg)
+    var n_heads = Int(n_heads_arg)
+    var hd = Int(hd_arg)
+    var rope_dim = Int(rope_dim_arg)
+    var token = block_idx.z
+    var head = block_idx.x
+    var idx = thread_idx.x + block_idx.y * block_dim.x
+    var half = rope_dim // 2
+    if token >= S or head >= n_heads or idx >= half:
+        return
+
+    # Exact transformers apply_interleaved_mrope frequency schedule for
+    # [11,11,10]: slots 0,3,...,30 use T; 1,4,...,31 use H; 2,5,...,29 use W.
+    var channel = idx % 3
+    var pos = Int(position_ids[channel * position_stride + position_offset + token])
+    # Qwen builds inv_freq for the sliced rotary subspace itself (dim=64),
+    # not the full 256-d head used by Gemma proportional RoPE.
+    var inv_freq = exp(-(Float32(2 * idx) / Float32(rope_dim)) * log(theta))
+    var angle = Float32(pos) * inv_freq
+    var c = cos(angle)
+    var s = sin(angle)
+    var off = (token * n_heads + head) * hd
+    var a = x[off + idx]
+    # Qwen slices x[..., :rope_dim] before rotate_half, so pairs live wholly
+    # inside the 64-d rotary prefix: [0:32] <-> [32:64]. This deliberately
+    # differs from Gemma's proportional-RoPE full-head midpoint convention.
+    var b = x[off + idx + half]
+    x[off + idx] = a * c - b * s
+    x[off + idx + half] = a * s + b * c
+
+
+def gpu_mrope_interleaved_batched_mojo(
+    ctx: DeviceContext,
+    d_x: UInt64,
+    d_position_ids: UInt64,
+    position_stride: Int,
+    position_offset: Int,
+    S: Int,
+    n_heads: Int,
+    hd: Int,
+    theta: Float32,
+    rope_dim: Int,
+) raises:
+    var n_pairs = rope_dim // 2
+    var threads = 128 if n_pairs >= 128 else n_pairs
+    if threads <= 0:
+        threads = 1
+    var blocks_y = (n_pairs + threads - 1) // threads
+    var k = ctx.compile_function[mrope_interleaved_kernel_batched]()
+    ctx.enqueue_function(
+        k,
+        _as_f32_ptr(d_x),
+        UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=Int(d_position_ids)),
+        Int32(position_stride), Int32(position_offset), Int32(S),
+        Int32(n_heads), Int32(hd), theta, Int32(rope_dim),
+        grid_dim=(n_heads, blocks_y, S), block_dim=threads,
+    )
+
+
 # ── YaRN RoPE for target models ─────────────────────────────────────────────────────
 # Mirrors transformers.modeling_rope_utils._compute_yarn_parameters. The
 # correction bounds are derived on device from beta/theta/original_max rather

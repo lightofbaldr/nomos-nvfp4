@@ -5,7 +5,7 @@ Run with the DGX SYSTEM python — /usr/bin/python3 has a CUDA torch (2.11.0+cu1
 (transformers 5.12.1). The pixi env torch is CPU-only, so it CANNOT run this on GPU. Both
 transformers builds carry qwen3_5 and preserve the hybrid layer_types (the harness asserts 48/16):
     /usr/bin/python3 tools/capture_qwen3_5_goldens.py \
-        ~/nomos_data/qwen3_8_27b-base-bf16 ~/nomos-ref/qwen-ref/goldens
+        ~/nomos_data/qwen3_8_27b-base-bf16 ~/kvasir/qwen-ref/goldens
 PROVENANCE: the manifest records the ACTUAL run's transformers/torch versions — those win over any
 version named in this docstring (the 2026-08-16 goldens were captured on transformers 5.12.1).
 

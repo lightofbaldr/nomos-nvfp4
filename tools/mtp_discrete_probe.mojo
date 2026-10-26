@@ -1,7 +1,7 @@
-"""mtp_discrete_probe.mojo — SCOPING PROBE (Nano).
+"""mtp_discrete_probe.mojo — SCOPING PROBE (Nano, nano/mtp-nvfp4-rewire).
 
 Question: does the MTP assistant's Q8 weight GEMV (`gpu_matmul_q8_fused_dev`) MMU-fault
-on the discrete box's DISCRETE VRAM (RTX PRO 4000 / sm_120), the way the 31B's Q4_0-dp4a weight GEMV
+on Gold's DISCRETE VRAM (RTX PRO 4000 / sm_120), the way the 31B's Q4_0-dp4a weight GEMV
 does? Base decode on discrete (w4a4) never exercises the Q8 path, so its discrete-safety is
 unproven — and it decides whether the MTP re-wire is "just the embed" (small) or "requant the
 whole 49-tensor assistant to NVFP4" (big). This probe answers it with a fault check + a

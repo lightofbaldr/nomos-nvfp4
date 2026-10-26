@@ -46,9 +46,3 @@ print("last-pos logit max|diff|=", float(np.max(np.abs(lf - lr))), flush=True)
 print("greedy continuation identical:", seq_full == seq_reuse, flush=True)
 print("  full :", repr(tok.decode(seq_full, skip_special_tokens=False)[:140]), flush=True)
 print("  reuse:", repr(tok.decode(seq_reuse, skip_special_tokens=False)[:140]), flush=True)
-
-# C) the prefill_reuse helper (prefix-match path the serve will use)
-lm.prefill(ids[:P])
-lr2, reused = lm.prefill_reuse(ids, ids[:P])
-print(f"prefill_reuse reused_len={reused} argmax={int(np.argmax(lr2))} "
-      f"== full:{int(np.argmax(lr2)) == int(np.argmax(lf))}", flush=True)

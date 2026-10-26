@@ -18,6 +18,10 @@ VB = int(os.environ.get("SPEC_VB", "8"))
 bar = json.load(open(os.path.join(REPO, "tools", "gold_bar_tokens.json")))
 prompts = bar["prompts"]
 
+# The KV session store off, whatever the caller's env says (a host env may turn it on). With it on, generate() leaves a live
+# session holding the prompt, so the spec run that follows restores it and prefills only the last token: base and spec would
+# then decode from different prefill shapes, which can part within ~13 tokens (design §8 item 14) and read as a FAIL here.
+os.environ["NOMOS_KVSTORE"] = "0"
 lm = KernelLM()
 lm.dflash_load(os.environ["DFLASH_DIR"])
 

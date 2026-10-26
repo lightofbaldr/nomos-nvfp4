@@ -49,7 +49,7 @@ WTS = os.environ.get("WEIGHTS", os.path.expanduser(_WTS_DEFAULT))
 DFLASH_DIR = os.environ.get("DFLASH_DIR", os.path.expanduser(_DFLASH_DEFAULT))
 NTOK = int(os.environ.get("PERF_NTOK", "96"))
 VB = int(os.environ.get("SPEC_VB", "8" if MODEL_ID == 3 else "7"))
-# Default 7 = the swept, lossless-gated champion (docs/the runbook §3). Was 5, which silently
+# Default 7 = the swept, lossless-gated champion (docs/RUNBOOK.md §3). Was 5, which silently
 # disagreed with every runner/serve default — the entry-point class of bug. Harnesses that need
 # a different VB (e.g. kv_block32_matrix.sh pins 5 for cross-card comparability) set it explicitly.
 REPEAT = int(os.environ.get("PERF_REPEAT", "2"))   # warm... last = scored
@@ -123,7 +123,13 @@ def base_generate(ids, ntok):
     tok = int(np.argmax(logits)); out = [tok]
     td0 = time.time()
     for _ in range(ntok - 1):
-        lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+        # base_generate is THE LOSSLESS REFERENCE the spec loop is scored against, so a
+        # silently-skipped step here corrupts the baseline rather than failing. rc 0 used
+        # to be returned even when nothing was written (the 2026-09-17 BOS/quote bug).
+        rc = lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+        if rc != 0:
+            raise RuntimeError(f"nomos_decode_step rc={rc} in base_generate at token "
+                               f"{len(out)}; logits STALE, reference would be invalid.")
         tok = int(np.argmax(logits)); out.append(tok)
     td = time.time() - td0
     return out, td
@@ -147,7 +153,10 @@ def spec_generate(ids, ntok, vb):
         r = ntok - len(out)
         k = min(K, r - 1)                 # drafts to verify this cycle (budget-capped)
         if k <= 0:                        # 1 token left -> exact M=1 step
-            lib.nomos_decode_step(ht, seed, logits.ctypes.data)
+            rc = lib.nomos_decode_step(ht, seed, logits.ctypes.data)
+            if rc != 0:
+                raise RuntimeError(f"nomos_decode_step rc={rc} in the M=1 fallback at "
+                                   f"token {len(out)}; logits STALE.")
             out.append(int(np.argmax(logits))); st["fallback"] += 1
             break
         vb_eff = k + 1
@@ -362,7 +371,7 @@ print(f"  E[tokens/cycle] = {exp_tok:.2f}  (1 free + sum of survival)", flush=Tr
 # acceptance the speculative path degenerates to base decode one token at a time, so it matches
 # base decode trivially and "L1 LOSSLESS 12/12 PASS" prints in green. The failure moved BOTH
 # sides of the comparison, which is exactly the condition under which a self-referential gate
-# goes blind (see docs/the measurement notes).
+# goes blind (see docs/MEASUREMENT_TRAPS.md).
 #
 # This signature appeared THREE times on 2026-08-02, each time initially misread:
 #   - block-32 KV written as fp16 and read as fp32   -> corrupt KV, drafter taps garbage

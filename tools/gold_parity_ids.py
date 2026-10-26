@@ -36,7 +36,14 @@ for p in bar["prompts"]:
     tok = int(np.argmax(logits))
     seq = [tok]
     for _ in range(NTOK - 1):
-        lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+        # This script json.dumps a PARITY REFERENCE. An unchecked rc here writes a
+        # baseline built from stale logits (nomos_decode_step returned 0 while writing
+        # nothing -- the 2026-09-17 BOS/quote bug; it now returns -2, but only if looked at).
+        rc = lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+        if rc != 0:
+            raise RuntimeError(
+                f"nomos_decode_step rc={rc} (prompt {p['id']}, token {len(seq)}). "
+                f"logits are STALE -- refusing to write a parity reference from them.")
         tok = int(np.argmax(logits))
         seq.append(tok)
     out[p["id"]] = seq

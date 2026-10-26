@@ -1,6 +1,6 @@
 """GDN (Gated-DeltaNet) recurrent + conv state pools — the qwen3_5 second engine's linear-attention state.
 
-OWNERSHIP: Kvasir owns this module (the pools + accessors + ordered-slot mapping). Kvasir owns
+OWNERSHIP: Kvasir owns this module (the pools + accessors + ordered-slot mapping). kvasir_codex owns
 lib/gdn_scan.mojo (the scan kernels that read/write these pools) and lib/gemma4_engine.mojo (single
 writer: the GdnStatePools field + init/free + layer routing + the nomos_debug_gdn_state bf16->fp32 cast).
 
@@ -9,7 +9,7 @@ NO MODULO HERE (Codex's guard): the ordered GDN transformer-layer list is PASSED
 set, so GDN and softmax layers can never disagree; this module never re-derives layer types.
 
 Pools (batch-1, layer-major, native BF16 — the debug export casts to fp32, and that cast lives in
-nomos_debug_gdn_state, Kvasir's file):
+nomos_debug_gdn_state, kvasir_codex's file):
   rec_base[gdn_slot, v_head, key_dim, value_dim] -> [n_gdn, GDN_NUM_V_HEADS, GDN_KEY_HEAD_DIM, GDN_VALUE_HEAD_DIM]
                                                     = [48,48,128,128] = 72 MiB at n_gdn=48
   conv_base[gdn_slot, channel, age]              -> [n_gdn, GDN_CONV_DIM, GDN_CONV_KERNEL]

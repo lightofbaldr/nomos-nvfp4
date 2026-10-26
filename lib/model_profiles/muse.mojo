@@ -119,6 +119,7 @@ alias TARGET_YARN_ATTN_FACTOR = 1.0
 
 alias EMBED_RMSNORM = 1
 alias EMBED_SQRT_SCALE = 0              # Muse uses its embedding RMSNorm instead.
+alias MM_IMAGE_TOKEN_ID = 200092
 alias MLP_ACT_SILU = 1
 
 # ── DRAFTER (DFlash assistant) — a SECOND MODEL, not a reshape of the target ──
@@ -250,7 +251,7 @@ alias TARGET_EOS_ID_1 = -1
 # value. Gemma-4 passes its exact gate with this set wrong.
 #
 # It still matters, because raw logit VALUES change: sampling and temperature,
-# logit-based interp probes, calibration, and any published logit number. So this needs
+# logit-based evaluation, calibration, and any published logit number. So this needs
 # a gate whose reference sits outside greedy decode -- a raw-logit comparison against
 # the HF reference -- which we do not currently run. Recording that limit here rather
 # than letting a passing acceptance gate imply more than it proves.

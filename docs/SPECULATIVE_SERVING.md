@@ -53,8 +53,12 @@ Both must pass byte-exact for any change to the spec path.
 ## Config notes
 
 - **`DFLASH_DIR` must end with `/`** — the loader asserts it.
-- **`NOMOS_KV_REUSE=0`** — spec re-anchors the KV cache each cycle; reused INT4
-  KV is not byte-identical and corrupts multi-turn context.
+- **`NOMOS_KV_REUSE` is retired** — setting it does nothing, so there is no longer a
+  `NOMOS_KV_REUSE=0` to set. That one-slot prefix reuse was held at 0 because reused INT4 KV
+  was not byte-identical and corrupted multi-turn context. Multi-turn reuse is now the KV
+  session store (`NOMOS_KVSTORE=1`, Glimmer only; `docs/RUNBOOK.md` §7). It serves the
+  speculative path too: it saves the drafter's context with the KV, and a speculative turn
+  reuses only as much of a session as the drafter's context covers.
 - `SPEC_VB` caps drafts verified per cycle (`K = VB-1`); the drafter always
   proposes a 16-row block. Start at 8 and sweep up where acceptance is high.
 - Per-architecture: GB10 (Q4_0) and discrete Blackwell (NVFP4 W4A4) both drive

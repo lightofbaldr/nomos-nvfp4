@@ -38,6 +38,10 @@ from lib.engine_init import _read_env_bytes, zeros_f32, zeros_f64, zeros_i32
 from lib.eagle3_drafter import MAX_VERIFY_ROWS
 from lib.gdn_state import GdnStatePools
 from lib.gdn_weights import GdnWeights
+from lib.kvstore.engine_trait import KvSessionEngine
+from lib.kvstore.key import weights_id_of, numerics_id_of
+from lib.kvstore.layout import KvLayout
+from lib.kv_session import export_range, import_range, kv_truncate, kv_reset_session, kv_drafter_len
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,10 +58,11 @@ from lib.model_config import (
     HAS_LEARNED_QK_NORM, HAS_LINEAR_ATTENTION,
     NORM_STYLE_POST, QK_NORM_FULL_VECTOR,
     GDN_CONV_DIM, GDN_VALUE_DIM, GDN_NUM_V_HEADS,
+    TARGET_BOS_ID,
 )
 
 
-struct GemmaEngine(Movable):
+struct GemmaEngine(Movable, KvSessionEngine):
     """All state for one loaded model instance."""
 
     # ── GPU contexts ─────────────────────────────────────────────────
@@ -87,6 +92,21 @@ struct GemmaEngine(Movable):
     var drafter_tap_layers: List[Int] # target decoder-layer ids to capture, low->high
     var eagle3_ptr: UInt64           # heap Eagle3Drafter address (0 = not loaded); set by nomos_eagle3_load
     var dflash_ptr: UInt64           # heap DFlashDrafter address (0 = not loaded); set by nomos_dflash_load
+    var dflash_id: UInt64            # hash of the loaded DFlash drafter (0 = none); part of the KV store's cache key
+    var dflash_capture_continue: Bool  # nomos_prefill_cont: feed this continuation's taps to the drafter
+    # KV session store. The store trusts the live state only when len(live_tokens) == cache_len(), so the two fields
+    # below keep that test sound: while live_desync, live_tokens is held EMPTY; otherwise live_tokens[i] is the token
+    # whose KV sits at position i. Equal lengths therefore mean "the tokens describe the KV" (or the KV is empty).
+    # The tracked paths (prefill_logits, step_logits, step_token, prefill_cont_logits, the DFlash verify in
+    # nomos_ffi) keep the list; every other KV write reaches run_inference_impl or prefill_batch_impl, which call
+    # mark_live_desync() on entry. Only a reset, a fresh prefill or set_cache_len(0) trust the KV again.
+    var live_tokens: List[Int]       # KV session store: exactly the token IDs whose KV is held, in order (empty while live_desync)
+    var live_desync: Bool            # KV was written by a path that does not track tokens; live_tokens is held empty until a reset
+    var kv_copy_stream: UInt64       # KV session store copy stream (0 until first use)
+    var kv_copy_event: UInt64
+    var kvstore_ptr: UInt64          # heap SessionStore (0 = none); see nomos_session_prepare
+    var kvstore_disabled: Bool       # the store could not be created (spec §3.1); run without it
+    var numerics_id: UInt64          # what this engine's K/V values depend on besides the code: weights + precision flags (ledger R35)
     # GDN speculative rollback transaction. The verify input rows are retained on
     # host so a partial accept can restore the recurrent pools and replay the exact
     # committed prefix through the full target (not recurrence-only).
@@ -94,6 +114,20 @@ struct GemmaEngine(Movable):
     var dflash_verify_start: Int
     var dflash_verify_rows: Int
     var dflash_verify_tokens: List[Int]
+    # Transient host-side multimodal splice owned by nomos_prefill_mm. The
+    # pointer is valid only for that synchronous fresh-prefill call.
+    var mm_features_host: UInt64
+    var mm_nvis: Int
+    var mm_cursor: Int
+    var mm_debug_embeddings: List[Float32]
+    var mm_debug_rows: Int
+    # Qwen multimodal RoPE. Initial prefill consumes exact channel-major
+    # [T,H,W] positions from d_mrope_position_ids. Generated text then uses
+    # scalar position = cache_position + mrope_position_delta (T==H==W).
+    var d_mrope_position_ids: UInt64
+    var mrope_positions_active: Bool
+    var mrope_position_count: Int
+    var mrope_position_delta: Int
     var final_norm: List[Float32]
 
     var d_qw: List[UInt64]
@@ -232,8 +266,6 @@ struct GemmaEngine(Movable):
     # (lower = less VRAM, higher = more context), no recompile.
     var max_seq: Int
 
-    # (research-only engine state removed — perf-clean product tree)
-
     # ─────────────────────────────────────────────────────────────────
     def __init__(
         out self,
@@ -269,6 +301,10 @@ struct GemmaEngine(Movable):
             raise Error("NOMOS_GDN_NVFP4=1 is only valid for a linear-attention profile")
         if self.gdn_nvfp4 and not self.w4a4:
             raise Error("NOMOS_GDN_NVFP4=1 requires NOMOS_W4A4=1")
+        # The KV session store keys on this, so KV from other weights or other precision is never restored (ledger R35).
+        # Computed here, before the weights load: a weights directory that cannot be listed fails fast.
+        self.numerics_id = numerics_id_of(
+            weights_id_of(weights_dir), self.precision_bits, self.weight_nvfp4, self.w4a4, self.gdn_nvfp4)
         # #431: W4A4 prefill processes the prompt in row-chunks of this many MMA rows, so the
         # act/MMA scratch (esp. cpad = chunk*FF*4) is sized to one chunk, not max_seq (~22GB
         # @256k). Default 2048; floored to 16, rounded up to a multiple of 128 (the sm_100
@@ -293,7 +329,7 @@ struct GemmaEngine(Movable):
         # The block-32 scales are float16 at [nkv, cache_cap, nblocks]; the block-1 reader loads
         # Float32 at [nkv, cache_cap], i.e. it reinterprets TWO fp16 scales as ONE fp32. That is
         # garbage KV, not coarse KV, and it fails silently: the drafter taps corrupt hiddens and
-        # speculative acceptance goes to EXACTLY 0.000 at every depth. It measured +15.7% on the RTX PRO 4000
+        # speculative acceptance goes to EXACTLY 0.000 at every depth. It measured +15.7% on Gold
         # only because that arm ran NOMOS_Q4_DP4A=1 and took the int8 reader; Prime hit the bf16
         # reader on the demo laptop and got 46.58 -> 17.55 tok/s, E 2.69 -> 1.00.
         # Both readers now take scale_blocks, so the flag no longer depends on DP4A.
@@ -303,7 +339,7 @@ struct GemmaEngine(Movable):
         #  debug_omlp_stage==11 and will MISREPORT under block-32. Do not diagnose with it there.)
         self.kv_int4_block32 = self.kv_int4 and (Int(_env_float("NOMOS_KV_I4_BLOCK", 0.0)) == 32)
         # ── BLOCK-1 INT4 KV IS UNSAFE UNDER NVFP4/W4A4 — auto-upgrade to block-32 ──────────
-        # MEASURED 2026-08-04 (Prime found it on a 5090/interp; reproduced by Kvasir on GB10
+        # MEASURED 2026-08-04 (Prime found it on a 5090; reproduced by Kvasir on GB10
         # with THIS tree, deterministic, 3 boxes / 2 architectures / 2 kernel trees):
         #   NVFP4 W4A4 + kv_int4 + block-1 -> DEGENERATE on prose/citation prompts, e.g.
         #     "...introduces **Recursive Lats**, a method for..." then  du dw dx dy dz e//
@@ -511,7 +547,12 @@ struct GemmaEngine(Movable):
             self.d_embed_q4 = load_to_gpu_q4(weights_dir + head_stem + ".q4")
             self.d_lmhead_in = cuda_malloc(D * 4)
             # Fused verify writes up to MAX_VERIFY_ROWS logit rows; decode uses row 0.
-            self.d_lmhead_logits = cuda_malloc(MAX_VERIFY_ROWS * VOCAB * 4)
+            # NOMOS_LOGITS_ROWS caps this (default MAX_VERIFY_ROWS). Set =1 for generate-only
+            # (no spec-verify) to reclaim ~6.4GB (17->1 * VOCAB * 4) so 32B NVFP4 fits a 24GB card.
+            var _logits_rows = Int(_env_float("NOMOS_LOGITS_ROWS", Float32(MAX_VERIFY_ROWS)))
+            if _logits_rows < 1:
+                _logits_rows = 1
+            self.d_lmhead_logits = cuda_malloc(_logits_rows * VOCAB * 4)
         cuda_sync()
         self.final_norm = read_f32(weights_dir + "norm_weight.bin")
 
@@ -584,6 +625,10 @@ struct GemmaEngine(Movable):
                             qn = read_f32(p + "self_attn.q_norm_weight.bin")
                         if len(kn) == 0:
                             kn = read_f32(p + "self_attn.k_norm_weight.bin")
+                    # q_norm spans NH*HD, k_norm spans NKV*HD — DIFFERENT sizes when the learned norm
+                    # is a full projection vector (QK_NORM_FULL_VECTOR=1, e.g. OLMo-3: q=5120, k=1024).
+                    # Check each against its OWN dim, matching the alloc below. The per-head path
+                    # (Qwen/Gemma, =0) uses layer_hd for both, so it is byte-identical to before.
                     var q_norm_dim = (
                         self.layer_qd[layer]
                         if QK_NORM_FULL_VECTOR else self.layer_hd[layer]
@@ -635,7 +680,7 @@ struct GemmaEngine(Movable):
                     self.d_ow.append(load_to_gpu_nvfp4(p + "self_attn_o_proj_weight.nvfp4", self.d_ow_gs, self.d_ow_ags))
                 # ATTENTION GATE — only exists on profiles that HAVE one. This load was
                 # unconditional, and load_to_gpu_* RETURNS 0 FOR A MISSING FILE (the
-                # failure-that-manufactures-a-value shape in docs/the measurement notes).
+                # failure-that-manufactures-a-value shape in docs/MEASUREMENT_TRAPS.md).
                 # On Gemma-4 that produced a NULL weight pointer paired with a NON-ZERO
                 # scale, which defeated the `g_attn_g != 0.0` guard on the grouped QKV+gate
                 # dispatch and launched fp4_gemm_kernel_smem against a null B pointer ->
@@ -800,6 +845,7 @@ struct GemmaEngine(Movable):
         self.d_up_buf = cuda_malloc(FF * 4)
         self.d_mlp_v_buf = cuda_malloc(FF * 4)
         self.d_down_buf = cuda_malloc(FF * 4)
+        self.d_mrope_position_ids = cuda_malloc(3 * self.max_seq * 4)
         if HAS_LINEAR_ATTENTION:
             self.d_gdn_qkv_raw = cuda_malloc(GDN_CONV_DIM * 4)
             self.d_gdn_qkv_conv = cuda_malloc(GDN_CONV_DIM * 4)
@@ -938,10 +984,26 @@ struct GemmaEngine(Movable):
         self.drafter_tap_layers = List[Int]()
         self.eagle3_ptr = UInt64(0)         # EAGLE-3 drafter not loaded until nomos_eagle3_load
         self.dflash_ptr = UInt64(0)         # DFlash drafter not loaded until nomos_dflash_load
+        self.dflash_id = UInt64(0)
+        self.dflash_capture_continue = False
+        self.live_tokens = List[Int]()
+        self.live_desync = False
+        self.kv_copy_stream = UInt64(0)
+        self.kv_copy_event = UInt64(0)
+        self.kvstore_ptr = UInt64(0)
+        self.kvstore_disabled = False
         self.dflash_verify_pending = False
         self.dflash_verify_start = 0
         self.dflash_verify_rows = 0
         self.dflash_verify_tokens = List[Int]()
+        self.mm_features_host = UInt64(0)
+        self.mm_nvis = 0
+        self.mm_cursor = 0
+        self.mm_debug_embeddings = List[Float32]()
+        self.mm_debug_rows = 0
+        self.mrope_positions_active = False
+        self.mrope_position_count = 0
+        self.mrope_position_delta = 0
 
     def clear_drafter_taps(mut self):
         self.d_eagle3_tap_out = UInt64(0)
@@ -1013,27 +1075,52 @@ struct GemmaEngine(Movable):
         self.kv_continue = False
         var dummy = List[Int]()
         run_inference_impl(self, prompt, 0, False, dummy, Int64(0), logits_out)
+        # A fresh prefill rewrites the KV from position 0: the state is tracked again, whatever it was before.
+        self.live_tokens = prompt.copy()
+        self.live_desync = False
 
     def step_logits(mut self, token: Int, logits_out: Int64) raises:
         """Logits-engine path (Python host): append one `token` at the current cache
         position (continuing the held KV), write the next logits[VOCAB] to logits_out,
         and sample NOTHING."""
+        var in_step = self.live_in_step()
+        var held = List[Int]()   # run_inference_impl empties live_tokens on entry; hold it out of its reach
+        if in_step:
+            swap(held, self.live_tokens)
         self.kv_continue = True
         var p = List[Int]()
         p.append(token)
         var dummy = List[Int]()
         run_inference_impl(self, p, 0, False, dummy, Int64(0), logits_out)
+        if in_step:
+            held.append(token)
+            self.live_tokens = held^
+            self.live_desync = False
+        else:
+            self.live_tokens.clear()    # untracked stays untracked (run_inference_impl already marked it)
+            self.live_desync = True
 
     def step_token(mut self, token: Int, fast_token_out: Int64) raises:
         """Perf Lever A: append one `token`, run the decode forward (same as
         step_logits, leaving d_lmhead_logits on device), then on-device softcap+argmax;
         write the chosen greedy token (Int32) to fast_token_out. NO VOCAB host copy.
         Greedy fast-path only (sampling/grammar use step_logits)."""
+        var in_step = self.live_in_step()
+        var held = List[Int]()   # run_inference_impl empties live_tokens on entry; hold it out of its reach
+        if in_step:
+            swap(held, self.live_tokens)
         self.kv_continue = True
         var p = List[Int]()
         p.append(token)
         var dummy = List[Int]()
         run_inference_impl(self, p, 0, False, dummy, Int64(0), Int64(0), fast_token_out)
+        if in_step:
+            held.append(token)
+            self.live_tokens = held^
+            self.live_desync = False
+        else:
+            self.live_tokens.clear()    # untracked stays untracked (run_inference_impl already marked it)
+            self.live_desync = True
 
     def debug_decode_qkv_source(
         mut self,
@@ -1089,17 +1176,54 @@ struct GemmaEngine(Movable):
 
     def set_cache_len(mut self, n: Int):
         """KV reuse: set every layer's cache valid length to n (truncate/position). The KV
-        memory [0,n) stays valid; the next append goes at n. SWA-off (linear cache) only."""
+        memory [0,n) stays valid; the next append goes at n. SWA-off (linear cache) only.
+
+        Keeps live_tokens in step: trims it to n. After an untracked write (live_desync) the list
+        stays empty, except that n == 0 (an empty KV is trustworthy) tracks again."""
         for l in range(TOTAL_LAYERS):
             self.cache_lens_fp32[l] = n
+        if not self.live_desync:
+            while len(self.live_tokens) > n:
+                _ = self.live_tokens.pop()
+        elif n == 0:
+            self.live_tokens.clear()
+            self.live_desync = False
+
+    def live_in_step(self) -> Bool:
+        """True when live_tokens describes the whole KV: nothing untracked wrote it since the last
+        reset / fresh prefill, and the list reaches exactly cache_len()."""
+        return not self.live_desync and len(self.live_tokens) == self.cache_len()
+
+    def mark_live_desync(mut self):
+        """Called first by every low-level KV writer (run_inference_impl, prefill_batch_impl): the KV
+        is about to change in a way live_tokens does not describe. Marks the state untracked and
+        empties the list, so len(live_tokens) == cache_len() can only hold for an empty KV. A tracked
+        wrapper that vouches for the write takes the list out beforehand and puts it back after."""
+        self.live_desync = True
+        self.live_tokens.clear()
 
     def prefill_cont_logits(mut self, suffix: List[Int], logits_out: Int64) raises:
         """KV reuse: prefill `suffix` at the CURRENT cache position (continue mode), attending
         the held prefix [0,cache_len). Writes last-position logits[VOCAB], samples NOTHING. The
         caller positions the cache to the common-prefix length via set_cache_len() first."""
+        var in_step = self.live_in_step()
+        var held = List[Int]()   # run_inference_impl empties live_tokens on entry; hold it out of its reach
+        if in_step:
+            swap(held, self.live_tokens)
         self.kv_continue = True
         var dummy = List[Int]()
         run_inference_impl(self, suffix, 0, False, dummy, Int64(0), logits_out)
+        if in_step:
+            # Mirror engine_decode's continue-mode BOS strip (engine_decode.mojo:153-157): a multi-token
+            # continuation that starts with BOS writes KV for suffix[1:] only.
+            var skip = 1 if (len(suffix) > 1 and suffix[0] == TARGET_BOS_ID) else 0
+            for i in range(skip, len(suffix)):
+                held.append(suffix[i])
+            self.live_tokens = held^
+            self.live_desync = False
+        else:
+            self.live_tokens.clear()    # untracked stays untracked (run_inference_impl already marked it)
+            self.live_desync = True
 
     def cache_len(self) -> Int:
         """Current committed target length from the first softmax-KV layer.
@@ -1113,13 +1237,35 @@ struct GemmaEngine(Movable):
                 return self.cache_lens_fp32[layer]
         return 0
 
+    # ── KvSessionEngine (docs/KV_SESSION_STORE_DESIGN.md §3.1) ─────────────────────────────
+    def kv_len(self) -> Int:
+        return self.cache_len()
+
+    def drafter_len(self) -> Int:
+        return kv_drafter_len(self)
+
+    def live_tokens_copy(self) -> List[Int]:
+        return self.live_tokens.copy()
+
+    def export_chunk(mut self, layout: KvLayout, a: Int, b: Int, drafter_end: Int, dst: UInt64) raises:
+        export_range(self, layout, a, b, drafter_end, dst)
+
+    def import_chunk(mut self, layout: KvLayout, a: Int, b: Int, drafter_end: Int, src: UInt64, src_tokens: Int, tokens: List[Int]) raises:
+        import_range(self, layout, a, b, drafter_end, src, src_tokens, tokens)
+
+    def truncate_to(mut self, p: Int) raises:
+        kv_truncate(self, p)
+
+    def reset_session(mut self) raises:
+        kv_reset_session(self)
+
     def reset_kv_cache(mut self):
         """Restore fresh-init KV state for a NEW stateless request. CALLER-GATED
         (the `fresh` boundary, via nomos_reset_kv). Multi-turn callers must NOT
         call this between turns — it wipes the conversation cache. Zeros only
         positions 0..max(cache_lens) per head (cheap, one cudaMemset2D per
         buffer) so a reused engine starts each inject/generate byte-identical to
-        a fresh init; then clears lengths + kv_continue."""
+        a fresh init; then clears lengths + kv_continue + the token tracking (live_tokens, live_desync)."""
         var p = 0
         for l in range(TOTAL_LAYERS):
             if self.cache_lens_fp32[l] > p:
@@ -1143,6 +1289,11 @@ struct GemmaEngine(Movable):
         self.dflash_verify_rows = 0
         self.dflash_verify_tokens = List[Int]()
         self.kv_continue = False
+        self.live_tokens.clear()
+        self.live_desync = False     # an empty KV is trustworthy: tracking starts over
+        self.mrope_positions_active = False
+        self.mrope_position_count = 0
+        self.mrope_position_delta = 0
 
     # (research delegators removed — perf-clean product tree)
 
@@ -1253,6 +1404,7 @@ def release_engine_handle(handle: UInt64):
     cuda_free(ptr[0].d_up_buf)
     cuda_free(ptr[0].d_mlp_v_buf)
     cuda_free(ptr[0].d_down_buf)
+    cuda_free(ptr[0].d_mrope_position_ids)
     if ptr[0].d_gdn_qkv_raw != 0: cuda_free(ptr[0].d_gdn_qkv_raw)
     if ptr[0].d_gdn_qkv_conv != 0: cuda_free(ptr[0].d_gdn_qkv_conv)
     if ptr[0].d_gdn_z != 0: cuda_free(ptr[0].d_gdn_z)

@@ -31,9 +31,13 @@ lib.nomos_prefill(ht, ids.ctypes.data, len(ids), logits.ctypes.data)
 tok = int(np.argmax(logits))
 # warm a few, then timed window
 for _ in range(8):
-    lib.nomos_decode_step(ht, tok, logits.ctypes.data); tok = int(np.argmax(logits))
+    if lib.nomos_decode_step(ht, tok, logits.ctypes.data) != 0:
+        raise RuntimeError("nomos_decode_step rc!=0 — logits STALE")
+    tok = int(np.argmax(logits))
 t0 = time.perf_counter()
 for _ in range(NTOK):
-    lib.nomos_decode_step(ht, tok, logits.ctypes.data); tok = int(np.argmax(logits))
+    if lib.nomos_decode_step(ht, tok, logits.ctypes.data) != 0:
+        raise RuntimeError("nomos_decode_step rc!=0 — logits STALE")
+    tok = int(np.argmax(logits))
 dt = time.perf_counter() - t0
 print(f"[base] {NTOK} decode steps in {dt:.3f}s -> {NTOK/dt:.2f} tok/s, {1000*dt/NTOK:.2f} ms/tok", flush=True)

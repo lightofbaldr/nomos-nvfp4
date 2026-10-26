@@ -44,6 +44,24 @@ def cublas_set_stream(h: UInt64, ctx: DeviceContext) raises:
     _ = external_call["cublasSetStream_v2", c_int, UInt64, CUstream](h, stream)
 
 
+def cublas_sdot(h: UInt64, n: Int, x: UInt64, y: UInt64) raises -> Float32:
+    """dot product s = x[n] . y[n] (fp32). Host pointer mode -> synchronous, result to host."""
+    var result: c_float = 0.0
+    _ = external_call["cublasSdot_v2", c_int,
+        UInt64, c_int, UInt64, c_int, UInt64, c_int,
+        UnsafePointer[c_float, origin_of(result)]](
+        h, c_int(n), x, c_int(1), y, c_int(1), UnsafePointer(to=result))
+    return Float32(result)
+
+
+def cublas_saxpy(h: UInt64, n: Int, alpha: Float32, x: UInt64, y: UInt64) raises:
+    """AXPY: y[n] += alpha * x[n]  (fp32, host alpha)."""
+    var a: c_float = alpha
+    _ = external_call["cublasSaxpy_v2", c_int,
+        UInt64, c_int, UnsafePointer[c_float, origin_of(a)], UInt64, c_int, UInt64, c_int](
+        h, c_int(n), UnsafePointer(to=a), x, c_int(1), y, c_int(1))
+
+
 def cublas_sgemm(h: UInt64, a: UInt64, b: UInt64, c: UInt64, M: Int, K: Int, N: Int):
     """out_row[M,N] = inp_row[M,K] @ weight_row[N,K]^T."""
     var alpha: c_float = 1.0

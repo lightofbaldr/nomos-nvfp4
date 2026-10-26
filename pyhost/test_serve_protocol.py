@@ -165,6 +165,9 @@ def _fake_muse_engine(tokenizer, raw: str):
         "lock": threading.Lock(),
         "spec_loaded": False,
         "spec_vb": 8,
+        "proc": None,                  # no vision image processor: chat() reads it on every request
+        "rep_penalty_default": 1.0,    # the serve's default repetition penalty (Engine.rep_penalty_default)
+        "kvstore": {"status": "off", "dir": None},   # Engine.kvstore, which /health reports
     })()
 
 

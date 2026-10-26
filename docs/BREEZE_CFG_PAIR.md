@@ -41,7 +41,10 @@ Both lanes must have a live prefix. At each frame:
    Each backbone cursor advances by one from its own current position.
 
 Only codes already sampled are read by depth. The replay test fills later
-codebooks with -1 to exercise this contract. A null required pointer returns
+codebooks with -1 to exercise this contract and checks that supplying the
+complete golden frame instead produces byte-identical outputs. Progressive
+fill models generation but is not a restriction on teacher-forced callers.
+A null required pointer returns
 -1. Invalid paired cadence, missing prefill, or exhausted backbone capacity
 returns -99 through the existing exception convention.
 

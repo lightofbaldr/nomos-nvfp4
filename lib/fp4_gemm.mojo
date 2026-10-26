@@ -18,7 +18,7 @@ so padded rows/cols never perturb live results.
 
 Toolchain: requires Mojo ≥1.0.0b3 + `--target-accelerator sm_121a` (the b3 NVPTX backend
 stamps PTX `.target sm_121a`; older nightlies stamp `sm_121` and the driver rejects the
-FP4 block-scale features). See the design notes (2026-06-16).
+FP4 block-scale features). See STATE.md (2026-06-16).
 """
 from max.gpu.host import DeviceContext
 from std.gpu.primitives import thread_idx, block_idx
@@ -194,7 +194,7 @@ def fp4_gemm_kernel(
 # (NOMOS_FP4_OLD=1, or any shape with N%32!=0 / K%256!=0 falls back).
 # ─────────────────────────────────────────────────────────────────────────────
 # RTX PRO 6000 (Blackwell, 188 SMs, ~1.79 TB/s) re-tune sweep — HONEST NULL
-# (2026-07-08, inst 44270246, all L1 12/12): the discrete NS3/TK4/WARPS4 geometry
+# (2026-07-08, inst 44270246, all L1 12/12): the Gold NS3/TK4/WARPS4 geometry
 # stays optimal on the 188-SM card. Engine base decode is flat across geometry:
 #   NS3(ship) 48.5 | NS2 48.2 | WARPS8 48.2 tok/s ; NS4/TK6 worse (isolated probe,
 #   gateup regresses). The wave-quant hypothesis (NS4 wins on more SMs) did NOT

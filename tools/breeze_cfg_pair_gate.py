@@ -41,7 +41,7 @@ def checked(rc):
     assert rc == 0, f"FFI returned {rc}"
 
 
-def replay(lib, h, prefixes, codes, paired):
+def replay(lib, h, prefixes, codes, paired, full_codes=False):
     lm = np.empty((len(codes) + 1, 2, 2052), "f4")
     dp = np.empty((len(codes), 15, 2, 2051), "f4")
     for lane, prefix in enumerate(prefixes):
@@ -52,6 +52,8 @@ def replay(lib, h, prefixes, codes, paired):
     dt, bt = [], []
     for f, frame in enumerate(codes):
         partial = np.full(16, -1, dtype="i8")
+        if full_codes:
+            partial[:] = frame
         partial[0] = frame[0]
         t = time.perf_counter()
         for cb in range(15):
@@ -129,6 +131,7 @@ def main():
     assert h
     result = {"sha256": hashlib.sha256(Path(a.so).read_bytes()).hexdigest(),
               "prefix_lengths": [len(x) for x in prefixes], "frames": len(codes), "runs": []}
+    paired_control = None
     try:
         out = np.empty((2, 2052), "f4")
         assert lib.nomos_breeze_model_depth_begin2(h, None, out.ctypes.data) == -1
@@ -137,10 +140,18 @@ def main():
         for rep in range(a.repeats):
             for paired in ((False, True) if rep % 2 == 0 else (True, False)):
                 lm, dp, times = replay(lib, h, prefixes, codes, paired)
+                if paired and paired_control is None:
+                    paired_control = (lm[:3].copy(), dp[:2].copy())
                 rows = metrics(lm, dp, lg, dg)
                 arm = {"rep": rep, "paired": paired, "timing": times, "gate": rows}
                 result["runs"].append(arm)
                 print(json.dumps(arm), flush=True)
+        # Supplying future teacher-forced codes must have no effect: the ABI
+        # may only read cb0 at begin and codes[input_codebook] at advance.
+        full_lm, full_dp, _ = replay(lib, h, prefixes, codes[:2], True, full_codes=True)
+        assert np.array_equal(full_lm, paired_control[0])
+        assert np.array_equal(full_dp, paired_control[1])
+        result["future_codes_ignored_byte_exact"] = True
         # Illegal out-of-order advance must reject before it mutates either cache.
         assert lib.nomos_breeze_model_depth_advance2(h, 1, codes[0].ctypes.data, out.ctypes.data) != 0
     finally:

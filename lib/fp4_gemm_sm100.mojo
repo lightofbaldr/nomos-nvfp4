@@ -12,7 +12,7 @@ SWIZZLE_32B tile (32-byte swizzle atom == the slice width), so the MMA descripto
 with no swizzle-offset math. The 8x32B FP4 k-atom (`_select_k_atom_bits[SWIZZLE_32B]` upcast to
 4-bit) exactly matches one MMA_K slice.
 
-Design + recipe: internal notes ; docs/tcgen05_w4a4_design_findings.json
+Design + recipe: docs/TCGEN05_W4A4_SM100_DESIGN.md ; docs/tcgen05_w4a4_design_findings.json
 Dispatch: gpu_matmul_nvfp4_w4a4_dev (lib/fp4_act.mojo) routes here when _is_sm_100x().
 
 The TMADescriptor kernel params MUST carry `@__llvm_arg_metadata(<p>, `nvvm.grid_constant`)`

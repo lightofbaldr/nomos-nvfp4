@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PREMISE GATE (Phase 0 of docs/the native-hotpath notes) — nano's acceptance arbiter.
+"""PREMISE GATE (Phase 0 of docs/PURE_MOJO_HOTPATH.md) — nano's acceptance arbiter.
 
 Does the pure-Mojo `nomos_generate` (one FFI call/request: Mojo loop + on-device sampling +
 stop) produce the SAME greedy tokens as the current Python per-token decode loop
@@ -7,7 +7,7 @@ stop) produce the SAME greedy tokens as the current Python per-token decode loop
 serve at nomos_generate is semantically inert and the plan is de-risked BEFORE any host rewrite.
 
 Self-contained: binds nomos_generate itself; does NOT depend on any host.py change. Run on the
-box that has the built .so + model (discrete Blackwell). Greedy only (deterministic → exact token compare).
+box that has the built .so + model (Gold). Greedy only (deterministic → exact token compare).
 
 KNOWN, EXPLAINABLE divergence source (classified, not hidden): the single-step logits path
 (`nomos_decode_step`→logits_out) returns raw post-softcap logits BEFORE the engine's special-token

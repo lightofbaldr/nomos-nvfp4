@@ -105,6 +105,7 @@ alias TARGET_YARN_ATTN_FACTOR = 1.0
 # Embedding scaling: Gemma multiplies embeddings by sqrt(D); Muse RMS-normalizes them.
 alias EMBED_RMSNORM = 0
 alias EMBED_SQRT_SCALE = 1              # Gemma scales token embeddings by sqrt(D).
+alias MM_IMAGE_TOKEN_ID = 258880
 
 # MLP activation: Gemma is GeGLU, Muse is SiLU-mul.
 alias MLP_ACT_SILU = 0
@@ -237,7 +238,7 @@ alias TARGET_EOS_ID_1 = 106
 # value. Gemma-4 passes its exact gate with this set wrong.
 #
 # It still matters, because raw logit VALUES change: sampling and temperature,
-# logit-based interp probes, calibration, and any published logit number. So this needs
+# logit-based evaluation, calibration, and any published logit number. So this needs
 # a gate whose reference sits outside greedy decode -- a raw-logit comparison against
 # the HF reference -- which we do not currently run. Recording that limit here rather
 # than letting a passing acceptance gate imply more than it proves.

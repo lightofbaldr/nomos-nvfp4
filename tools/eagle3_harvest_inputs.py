@@ -49,7 +49,17 @@ for p in bar["prompts"]:
     taps.append(tap.reshape(3, D).copy()); tokens.append(tok)
     pids.append(p["id"]); steps.append(-1)
     for s in range(9):
-        lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+        # THE WORST CASE IN THIS SWEEP. This harvests TAPS immediately after the step and
+        # savez's them as EAGLE TRAINING INPUTS. A silently-skipped step does not merely
+        # misrecord a token -- it pairs taps from the UN-ADVANCED state with a token that
+        # was never computed. A corrupted reference poisons a comparison; corrupted
+        # training inputs poison a model, and nothing downstream would ever surface it.
+        rc = lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+        if rc != 0:
+            raise RuntimeError(
+                f"nomos_decode_step rc={rc} at harvest step {s}; the engine state did NOT "
+                f"advance, so the taps about to be read belong to the previous position. "
+                f"Refusing to harvest training inputs from it.")
         tok = int(np.argmax(logits))
         lib.nomos_eagle3_get_taps(ht, tap.ctypes.data)
         taps.append(tap.reshape(3, D).copy()); tokens.append(tok)

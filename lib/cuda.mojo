@@ -15,7 +15,7 @@ from std.memory import UnsafePointer
 from std.collections import List
 from std.os import abort
 from max.gpu.host import DeviceContext
-from max.gpu.host._nvidia_cuda import CUDA, CUstream
+from max.gpu.host._nvidia_cuda import CUDA, CUstream, _CUstream_st
 
 
 def cuda_malloc(bytes: Int) -> UInt64:
@@ -164,6 +164,81 @@ def cuda_memcpy_2d_async(
         c_int(kind),
         stream,
     )
+
+
+def cuda_host_alloc(bytes: Int) -> UInt64:
+    """Pinned (page-locked) host memory, so H2D/D2H copies run at full PCIe speed and truly async.
+    Returns 0 on failure (no abort): the KV store's RAM tier degrades instead of killing the serve."""
+    var ptr: UInt64 = 0
+    var rc = external_call["cudaHostAlloc", c_int, UnsafePointer[UInt64, origin_of(ptr)], UInt64, UInt32](
+        UnsafePointer(to=ptr), UInt64(bytes), UInt32(0))
+    if rc != c_int(0):
+        # Handled failure: consume the non-sticky error so a later cuda_last_error() diagnostic does not misread it.
+        _ = external_call["cudaGetLastError", c_int]()
+        return 0
+    return ptr
+
+
+def cuda_free_host(ptr: UInt64):
+    _ = external_call["cudaFreeHost", c_int, UInt64](ptr)
+
+
+def cuda_stream_create() -> UInt64:
+    """A non-blocking stream (cudaStreamNonBlocking = 1): no implicit sync with the legacy default stream."""
+    var s: UInt64 = 0
+    var rc = external_call["cudaStreamCreateWithFlags", c_int, UnsafePointer[UInt64, origin_of(s)], UInt32](
+        UnsafePointer(to=s), UInt32(1))
+    if rc != c_int(0):
+        abort(t"cudaStreamCreateWithFlags failed rc={Int(rc)}")
+    return s
+
+
+def cuda_stream_destroy(s: UInt64):
+    _ = external_call["cudaStreamDestroy", c_int, UInt64](s)
+
+
+def cuda_event_create() -> UInt64:
+    """cudaEventDisableTiming (= 2): a pure ordering fence, the cheapest event to record and wait on."""
+    var e: UInt64 = 0
+    var rc = external_call["cudaEventCreateWithFlags", c_int, UnsafePointer[UInt64, origin_of(e)], UInt32](
+        UnsafePointer(to=e), UInt32(2))
+    if rc != c_int(0):
+        abort(t"cudaEventCreateWithFlags failed rc={Int(rc)}")
+    return e
+
+
+def cuda_event_destroy(e: UInt64):
+    _ = external_call["cudaEventDestroy", c_int, UInt64](e)
+
+
+def cuda_event_record(e: UInt64, stream: UInt64) -> Int:
+    return Int(external_call["cudaEventRecord", c_int, UInt64, UInt64](e, stream))
+
+
+def cuda_event_sync(e: UInt64) -> Int:
+    return Int(external_call["cudaEventSynchronize", c_int, UInt64](e))
+
+
+def _as_custream(h: UInt64) -> CUstream:
+    """A raw stream handle as the CUstream that cuda_memcpy_async / cuda_memcpy_2d_async declare.
+
+    The kernel is one compilation unit, so a C symbol may be declared with only one set of operand types:
+    cudaMemcpyAsync and cudaMemcpy2DAsync take a CUstream here, not a UInt64."""
+    return CUstream(UnsafePointer[_CUstream_st, MutUntrackedOrigin](unsafe_from_address=Int(h)))
+
+
+def cuda_memcpy_async_on(dst: UInt64, src: UInt64, bytes: Int, kind: Int, stream: UInt64) -> Int:
+    """cudaMemcpyAsync on an explicit stream. kind: 1 = H2D, 2 = D2H, 3 = D2D."""
+    return Int(external_call["cudaMemcpyAsync", c_int, UInt64, UInt64, UInt64, c_int, CUstream](
+        dst, src, UInt64(bytes), c_int(kind), _as_custream(stream)))
+
+
+def cuda_memcpy_2d_async_on(
+    dst: UInt64, dpitch: Int, src: UInt64, spitch: Int, width_bytes: Int, height: Int, kind: Int, stream: UInt64,
+) -> Int:
+    """cudaMemcpy2DAsync on an explicit stream: `height` rows of `width_bytes`, at the given pitches."""
+    return Int(external_call["cudaMemcpy2DAsync", c_int, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, c_int, CUstream](
+        dst, UInt64(dpitch), src, UInt64(spitch), UInt64(width_bytes), UInt64(height), c_int(kind), _as_custream(stream)))
 
 
 def cuda_memset_2d(dst: UInt64, pitch: Int, value: Int, width_bytes: Int, height: Int):

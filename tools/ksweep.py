@@ -98,7 +98,21 @@ def spec_generate(ids, ntok, k, trace=False):
         r = ntok - len(out)
         k_eff = min(k, r - 1)
         if k_eff <= 0:
-            lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+            # This driver records BOTH tok/s AND L1-lossless (bit-identical vs BASE_IDS),
+            # so an unchecked failure here corrupts the speed number and the correctness
+            # verdict that is supposed to catch it: a skipped step does less GPU work, so
+            # it manufactures a speedup while also producing ids that cannot match the
+            # base reference. The timing is an artifact too.
+            #
+            # NOTE: spec_generate() here is a VERBATIM COPY of tools/eagle3_spec_loop.py
+            # (see this file's header), so this defect was copy-pasted with the code and
+            # fixing the original did nothing for the copy. Repo-wide sweeps catch that;
+            # fixing "at the source" does not.
+            rc = lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+            if rc != 0:
+                raise RuntimeError(f"nomos_decode_step rc={rc} in the M=1 fallback at "
+                                   f"token {len(out)}; logits STALE -- both the tok/s and "
+                                   f"the L1-lossless verdict would be invalid.")
             out.append(int(np.argmax(logits)))
             stats["fallback_steps"] += 1
             break

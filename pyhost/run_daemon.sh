@@ -11,12 +11,12 @@ export NOMOS_PRECISION_BITS="${NOMOS_PRECISION_BITS:-4}"
 export NOMOS_KV_QUANT="${NOMOS_KV_QUANT:-1}"
 export NOMOS_KV_INT4="${NOMOS_KV_INT4:-1}"
 export NOMOS_KV_SWA="${NOMOS_KV_SWA:-0}"
-# Cross-turn KV-reuse OFF by default: reused INT4-quantized KV is NOT byte-identical to a fresh
-# prefill (#429 — cache-reset/reuse not kv-quant-aware), which corrupts multi-turn agentic context
-# (the model re-calls tools / degenerates — proven on the Pro 6000 e2e battery 2026-06-17). Reuse is
-# a speed optimization, not correctness — full prefill each turn is correct + cheap for short agentic
-# prompts. Re-enable (=1) once #429 makes reuse quant-aware.
-export NOMOS_KV_REUSE="${NOMOS_KV_REUSE:-0}"
+# KV session store (docs/KV_SESSION_STORE_DESIGN.md): OFF unless the caller sets NOMOS_KVSTORE=1. It replaces the
+# retired one-slot prefix reuse (NOMOS_KV_REUSE; #429: reused INT4 KV was not byte-identical to a fresh prefill).
+export NOMOS_KVSTORE="${NOMOS_KVSTORE:-0}"
+# GB10 unified memory: a pinned RAM tier frees no GPU memory there, so its budget defaults to 1 GB (the kernel's own
+# default is 8 on every architecture). serve_nomos.sh sets the same.
+[ "$(uname -m)" = "aarch64" ] && export NOMOS_KVSTORE_RAM_GB="${NOMOS_KVSTORE_RAM_GB:-1}"
 export NOMOS_MAX_SEQ="${NOMOS_MAX_SEQ:-16384}"
 export NOMOS_BATCHED_PREFILL="${NOMOS_BATCHED_PREFILL:-1}"
 export CUBLAS_WORKSPACE_CONFIG=":4096:8"

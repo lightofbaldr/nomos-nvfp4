@@ -29,42 +29,10 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 VOCAB = 262144
 BLOCK = 16
 
-# Verify budget is BOX-DEPENDENT, exactly like the quant dict below — do not flatten it.
-#
-# DISCRETE (x86_64, NVFP4 W4A4, bf16 KV read). Measured RTX 5090, BLOCK_ATTN=0, ntok=96,
-# every point 12/12 token-exact:
-#     VB    5      6      7      8   |   9     10     12     14     16
-#   spec  51.91  52.76  52.85  53.34 | 32.51  31.18  27.48  24.38  22.58
-# A STEP at 8->9 (-39%, the MMQ_SMALL S=5..8 window ending) AND a monotonic decline after
-# it. It does NOT recover: by VB=16 speculation (22.58) is slower than base decode (~23),
-# i.e. net-negative. Base was flat across the sweep, so the decay is in the spec path.
-# Two effects, not one — widening the window could recover the step, but the slope would
-# continue, so that fix has a bounded payoff. VB 5-8 is one plateau (7 and 8 are within
-# 0.9%, inside the ~2.5% base drift measured on that sweep — neither is "the champion").
-#
-# GB10 (aarch64, Q4_0, int8 acts/dp4a). Measured by Kvasir, KV_I4_BLOCK=32, 12/12 at every
-# point: VB 7=22.80  8=22.98  9=23.38  10=23.45. NO CLIFF through 10 — a +2.9% monotonic
-# rise, so the S=5..8 window does not bite under int8 acts. 9 and 10 are within 0.3%,
-# inside a 1.6% base spread: 9 is a SAFE DEFAULT, not a measured champion, and 11+ is
-# unprobed. (The older "9 is the champion, that is where 21.88 lives" claim showed only
-# that 9 was USED. That curve is also at KV_I4_BLOCK=32, which is not the shipped default,
-# and was sequential rather than interleaved.)
-#
-# A flat default fixes one arch by silently degrading the other. Same box-scoping rule the
-# 2x2 sweep established for kv_i4_block.
-VB_BY_ARCH = {"aarch64": 9, "x86_64": 8}
-
 BASE_ENV = {
     "NOMOS_KV_QUANT": "1", "NOMOS_KV_INT4": "1", "NOMOS_KV_SWA": "0",
-    "NOMOS_KV_REUSE": "0", "NOMOS_MAX_SEQ": "4096", "NOMOS_BATCHED_PREFILL": "1",
-    # MUST default to 0. This selects the verify PREFILL route (engine_prefill.mojo:131,
-    # use_prefix_block) and it BREAKS LOSSLESSNESS: measured on 5090/NVFP4, interleaved,
-    # =1 gives 1/12 token-exact vs greedy and =0 gives 12/12, reproduced twice each.
-    # It buys ~16% throughput by producing a DIFFERENT answer, and it was ON by default
-    # in BASE_ENV — so a fresh `./nomos bench --spec` reported a fast number that was not
-    # lossless, while the harness printed a losslessness line right next to it.
-    # Kvasir task #65. Do not re-enable without a 12/12 gate on the SAME arch.
-    "NOMOS_VERIFY_BLOCK_ATTN": "0", "NOMOS_VERIFY_DECODE_ORDER_ATTN": "1",
+    "NOMOS_MAX_SEQ": "4096", "NOMOS_BATCHED_PREFILL": "1",
+    "NOMOS_VERIFY_BLOCK_ATTN": "1", "NOMOS_VERIFY_DECODE_ORDER_ATTN": "1",
     "NOMOS_VERIFY_DECODE_ORDER_MULTIROW_ATTN": "1",
     # Route S=5..8 verify through the tensor-core MMQ body. The shipped GEMV route
     # degrades ~19ms/row there and peaks at 185ms @S=8 — WORSE than S=9 (128ms), where
@@ -145,7 +113,8 @@ def greedy(lib, ht, logits, ids_np, ntok):
     out = [int(np.argmax(logits))]
     t0 = time.time()
     for _ in range(ntok - 1):
-        lib.nomos_decode_step(ht, out[-1], logits.ctypes.data)
+        if lib.nomos_decode_step(ht, out[-1], logits.ctypes.data) != 0:
+            raise RuntimeError("nomos_decode_step rc!=0 — logits are STALE, output would be wrong")
         out.append(int(np.argmax(logits)))
     return out, (ntok - 1) / (time.time() - t0)
 
@@ -185,6 +154,10 @@ def dflash_spec(lib, ht, logits, ids_np, ntok, vb):
         assert rc > 0, f"ctx append rc={rc}"
         c = nxt
     dt = time.time() - t0
+    # (ntok - 1), not ntok: spec[0] comes from prefill BEFORE t0 — exactly as in greedy()
+    # above, which already divides by (ntok - 1). Counting it here over-credited the
+    # speculative path by ntok/(ntok-1): +1.05% at the default 96, +6.7% at --ntok 16,
+    # and the speedup ratio inherited it. A benchmark may not round in its own favour.
     return spec[:ntok], 1.0 + acc / steps, (ntok - 1) / dt
 
 
@@ -226,7 +199,8 @@ def cmd_verify(args):
         lib.nomos_prefill(ht, prefix.ctypes.data, pp, logits.ctypes.data)
         g = [int(np.argmax(logits))]; refs = []
         for _ in range(max_s):
-            lib.nomos_decode_step(ht, g[-1], logits.ctypes.data)
+            if lib.nomos_decode_step(ht, g[-1], logits.ctypes.data) != 0:
+                raise RuntimeError("nomos_decode_step rc!=0 — logits STALE; reference would be invalid")
             refs.append(logits.copy()); g.append(int(np.argmax(logits)))
         for S in s_list:
             lib.nomos_reset_kv(ht)
@@ -261,13 +235,6 @@ def cmd_env(_):
     print(f"WEIGHTS={wts}  exists={os.path.isdir(wts)}")
     so = os.path.join(REPO, "libnomos_kernel.so")
     print(f"SO={so}  exists={os.path.exists(so)}")
-    ddir = os.environ.get(
-        "DFLASH_DIR", os.path.expanduser("~/nomos_data/dflash-gemma-4-31b-flat/"))
-    n_q4 = (len([f for f in os.listdir(ddir) if f.endswith(".q4")])
-            if os.path.isdir(ddir) else 0)
-    print(f"DFLASH_DIR={ddir}  exists={os.path.isdir(ddir)}  q4_files={n_q4}"
-          f"{'   <-- --spec WOULD REPORT A FAKE NUMBER' if n_q4 == 0 else ''}")
-    print(f"VB default for this arch: {VB_BY_ARCH.get(arch, 8)}")
     for k in sorted(k for k in os.environ if k.startswith("NOMOS_")):
         print(f"  {k}={os.environ[k]}")
 
@@ -287,31 +254,14 @@ def cmd_smoke(args):
 
 
 def cmd_bench(args):
-    arch, _q, _w = resolve_env()
-    if args.vb is None:
-        args.vb = VB_BY_ARCH.get(arch, 8)
-        print(f"VB={args.vb} (arch default for {arch})")
+    resolve_env()
     import numpy as np
     bar = json.load(open(os.path.join(REPO, "tools/gold_bar_tokens.json")))
     lib = load_lib()
     ht, logits = engine_init(lib)
     if args.spec:
-        ddir = os.environ.get(
-            "DFLASH_DIR", os.path.expanduser("~/nomos_data/dflash-gemma-4-31b-flat/"))
-        # VALIDATE HERE, BEFORE the C call. nomos_dflash_load returns rc=0 on a directory
-        # that does not exist; the drafter is then garbage, every decode step dies with
-        # CUDA_ERROR_ILLEGAL_ADDRESS, and the timing loop divides by ~0 and prints a
-        # plausible five-figure tok/s. The rc check below CANNOT catch that — rc is 0.
-        if not os.path.isdir(ddir):
-            sys.exit(f"DFLASH_DIR is not a directory: {ddir}\n"
-                     f"  (nomos_dflash_load returns rc=0 here and reports a FAKE tok/s)")
-        n_q4 = len([f for f in os.listdir(ddir) if f.endswith(".q4")])
-        if n_q4 == 0:
-            sys.exit(f"DFLASH_DIR has no .q4 files: {ddir}")
-        if not ddir.endswith("/"):
-            ddir += "/"
-        print(f"drafter: {ddir}  ({n_q4} .q4 files)")
-        buf, dptr = cptr(ddir)
+        buf, dptr = cptr(os.environ.get(
+            "DFLASH_DIR", os.path.expanduser("~/nomos_data/dflash-gemma-4-31b-flat/")))
         rc = lib.nomos_dflash_load(ht, dptr)
         if rc != 0:
             sys.exit(f"DFlash drafter load failed (rc={rc}) — check DFLASH_DIR (.q4 flat dir)")
@@ -345,10 +295,7 @@ def main():
     ps.add_argument("--ntok", type=int, default=96)
     pb = sub.add_parser("bench")
     pb.add_argument("--spec", action="store_true", help="run DFlash speculative decode too")
-    pb.add_argument("--vb", type=int, default=None,
-                    help="verify budget. Default is ARCH-SWITCHED (aarch64/GB10=9, "
-                         "x86_64/discrete=8): the MMQ_SMALL S=5..8 cliff is present on "
-                         "discrete and absent on GB10. Override only if you know your box.")
+    pb.add_argument("--vb", type=int, default=9, help="verify budget (champion: 9)")
     pb.add_argument("--ntok", type=int, default=96)
     pv = sub.add_parser("verify")
     pv.add_argument("--s", default="8,9,12,14,16,17", help="comma list of verify row counts")

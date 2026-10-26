@@ -13,9 +13,9 @@
 #
 # It also reported LINK_OK on a FAILED build, because its readelf check ran unconditionally and
 # inspected the STALE .so still sitting on disk. A build script that reports green on failure is
-# the same defect family as the BLOCK_ATTN trap — see docs/the measurement notes.
+# the same defect family as the BLOCK_ATTN trap — see docs/MEASUREMENT_TRAPS.md.
 #
-# One build path, arch-dispatched inside it. If you need a discrete-specific tweak, add it to
+# One build path, arch-dispatched inside it. If you need a Gold-specific tweak, add it to
 # refresh_build.sh behind an arch/host check so every box keeps getting the same treatment.
 set -eo pipefail
 echo "NOTE: tools/build_gold.sh is deprecated; running refresh_build.sh instead." >&2

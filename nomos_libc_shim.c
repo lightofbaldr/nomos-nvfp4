@@ -9,7 +9,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -138,3 +140,19 @@ int nomos_flag_violation(int code) {
 long nomos_violation_count(void) { return nomos_viol_count; }
 long nomos_violation_mask(void)  { return nomos_viol_mask; }
 int  nomos_reset_violations(void) { nomos_viol_count = 0; nomos_viol_mask = 0; return 0; }
+
+ssize_t nomos_pwrite(int fd, const void *buf, size_t count, off_t offset) {
+    return pwrite(fd, buf, count, offset);
+}
+
+int nomos_ftruncate(int fd, off_t length) {
+    return ftruncate(fd, length);
+}
+
+int nomos_flock(int fd, int operation) {
+    return flock(fd, operation);
+}
+
+ssize_t nomos_getrandom(void *buf, size_t buflen, unsigned int flags) {
+    return getrandom(buf, buflen, flags);
+}

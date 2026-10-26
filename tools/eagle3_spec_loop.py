@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""D3 — EAGLE-3 spec-decode loop on the discrete NVFP4 path (propose k=3 -> batched
+"""D3 — EAGLE-3 spec-decode loop on the Gold NVFP4 path (propose k=3 -> batched
 verify M=k+1 -> greedy longest-prefix accept -> commit num_acc+1).
 
 Port of the GB10 lineage loop semantics (b1ec92d / 25641de / 573faf0 / the
@@ -120,7 +120,12 @@ def spec_generate(ids, ntok, k=K, trace=False):
         r = ntok - len(out)
         k_eff = min(k, r - 1)
         if k_eff <= 0:
-            lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+            # M=1 fallback. IDS_OUT is written from `out`, so a stale step here lands in
+            # the persisted id sequence.
+            rc = lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+            if rc != 0:
+                raise RuntimeError(f"nomos_decode_step rc={rc} in the M=1 fallback at "
+                                   f"token {len(out)}; logits STALE.")
             out.append(int(np.argmax(logits)))
             stats["fallback_steps"] += 1
             break
@@ -183,7 +188,13 @@ def base_generate(ids, ntok):
     out = [tok]
     td0 = time.time()
     for _ in range(ntok - 1):
-        lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+        # The base reference the spec loop is scored against, AND a timed path: an ignored
+        # failure skips GPU work, so it would manufacture a speedup as well as a wrong
+        # sequence (Codex's point -- the timing is an artifact too).
+        rc = lib.nomos_decode_step(ht, tok, logits.ctypes.data)
+        if rc != 0:
+            raise RuntimeError(f"nomos_decode_step rc={rc} in base_generate at token "
+                               f"{len(out)}; logits STALE and the timing is invalid.")
         tok = int(np.argmax(logits))
         out.append(tok)
     return out, time.time() - td0
@@ -216,7 +227,12 @@ if MODE == "seam":
         chain = [tok]
         dec_logits = np.zeros((4, VOCAB), np.float32)
         for i in range(4):
-            lib.nomos_decode_step(ht, chain[-1], logits.ctypes.data)
+            # dec_logits[i] is COPIED FROM the shared buffer, so a no-op step silently
+            # duplicates the previous row and the chain reads an uncomputed token.
+            rc = lib.nomos_decode_step(ht, chain[-1], logits.ctypes.data)
+            if rc != 0:
+                raise RuntimeError(f"nomos_decode_step rc={rc} building the decode chain "
+                                   f"at i={i}; logits STALE, dec_logits would duplicate.")
             dec_logits[i] = logits
             chain.append(int(np.argmax(logits)))
         # fused verify M=4 over the SAME rows (rollback first)

@@ -158,7 +158,7 @@ def _mm_dev(
         # Q4 decode (M=1): occ4 fused GEMV — WPB=4 (4 warps/block) widens occupancy
         # 50%->100% on GB10 (+40-48% on the HBM-bound D_FF/FF_D shapes), BIT-IDENTICAL to the
         # old 1-warp/block fused path (same per-row math, packed 4 rows/block). Reads the Q4
-        # blob directly, no bf16 materialization. (GLM/swarm 2026-06-25; internal notes)
+        # blob directly, no bf16 materialization. (GLM/swarm 2026-06-25; UNIT_A_Q4_OCCUPANCY.md)
         # Activation-precision selector (2026-06-27): 8 = q8 dp4a (production,
         # ~2.85x BW, int8 dp4a on q8_1 acts; q4_dp4a.mojo), 32 = fp32 acts (occ4). The
         # q8_1-quantized input lands in the (Q4-unused) bf16 scratch. q16/q4 bolt in here.
@@ -249,6 +249,7 @@ from lib.ops_gpu_mojo import (
     gpu_silu_mul_mojo, gpu_sigmoid_mul_inplace_mojo,
     gpu_embed_load_mojo, gpu_embed_copy_fp32_mojo, gpu_rope_mojo,
     gpu_rope_batched_mojo, gpu_yarn_rope_mojo, gpu_yarn_rope_batched_mojo,
+    gpu_mrope_interleaved_batched_mojo,
     gpu_split_q_gate_interleaved_mojo,
 )
 from lib.model_config import (
@@ -513,6 +514,9 @@ def prepare_qkv_batched(
     debug_row: Int = -1,
     debug_stage: Int = -1,
     debug_out: Int64 = 0,
+    d_mrope_position_ids: UInt64 = 0,
+    mrope_position_stride: Int = 0,
+    mrope_position_offset: Int = 0,
 ) raises -> Bool:
     """Batched steps 1-5 of a Gemma-4 layer over S tokens [S,d]. Positions are
     base_pos..base_pos+S-1. Mirrors prepare_qkv_dev but every op is batched:
@@ -570,8 +574,20 @@ def prepare_qkv_batched(
     # Same profile rules as the single-token path. These two sites MUST stay in step:
     # a divergence is a prefill/decode split that only shows up as drift deep into a
     # long generation.
-    @parameter
-    if TARGET_ROPE_YARN:
+    if d_mrope_position_ids != 0:
+        # Multimodal Qwen prefill. The caller owns exact [T,H,W] positions;
+        # generated-text continuation falls back to scalar RoPE with a
+        # persisted logical-position delta because all three channels agree.
+        var rdim = l_hd // 4 if ROPE_FULL_PARTIAL_DIM else l_hd
+        gpu_mrope_interleaved_batched_mojo(
+            ctx, d_q, d_mrope_position_ids, mrope_position_stride,
+            mrope_position_offset, S, l_nh, l_hd, ROPE_THETA_FULL, rdim,
+        )
+        gpu_mrope_interleaved_batched_mojo(
+            ctx, d_k_new, d_mrope_position_ids, mrope_position_stride,
+            mrope_position_offset, S, l_nkv, l_hd, ROPE_THETA_FULL, rdim,
+        )
+    elif TARGET_ROPE_YARN:
         if is_full:
             gpu_yarn_rope_batched_mojo(
                 ctx, d_q, base_pos, S, l_nh, l_hd, ROPE_THETA_FULL,

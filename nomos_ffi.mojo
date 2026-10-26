@@ -30,7 +30,8 @@ from lib.model_config import (
     MODEL_ID, EAGLE3_TAPS, DRAFTER_EMBED_SQRT_SCALE, RMS_EPS_FINAL,
     HAS_LINEAR_ATTENTION, GDN_NUM_V_HEADS, GDN_KEY_HEAD_DIM,
     GDN_VALUE_HEAD_DIM, GDN_CONV_DIM, GDN_CONV_KERNEL,
-    MAX_PROBE_TOKENS,
+    MM_IMAGE_TOKEN_ID,
+    TARGET_BOS_ID, TARGET_EOS_ID_0, TARGET_EOS_ID_1,   # deploy-time attestation exports
 )
 from lib.gdn_scan import gpu_gdn_bf16_to_f32
 from lib.mtp_drafter import MTPDrafter, mtp_draft_k, release_mtp_drafter_handle
@@ -60,7 +61,6 @@ from lib.dflash_drafter import (
     DFLASH_FC_IN,
     DFLASH_HIDDEN,
     DFLASH_LAYERS,
-    DFLASH_MAX_CTX,
     DFLASH_MAX_VERIFY_ROWS,
     dflash_append_context_rows,
     dflash_draft_block,
@@ -77,7 +77,7 @@ from lib.dflash_profile import (
     validate_dflash_profile_metadata,
 )
 from lib.io import file_size_bytes
-from lib.cuda import cuda_malloc, cuda_free, cuda_memcpy, cuda_sync, cuda_upload, cuda_download
+from lib.cuda import cuda_malloc, cuda_free, cuda_memcpy, cuda_sync, cuda_upload, cuda_download, cuda_stream_destroy, cuda_event_destroy
 from lib.gemma4_ops import rmsnorm
 from lib.engine_init import _read_env_bytes
 from lib.kv_cache_quant import (
@@ -85,9 +85,29 @@ from lib.kv_cache_quant import (
     gpu_append_quant_kv_i4_with_q8,
     gpu_dequant_kv_i4_to_q8_layer,
 )
+from lib.build_stamp import BUILD_ID
+from lib.kvstore.support import store_supported
+from lib.kvstore.store import N_STATS, SessionStore
+from lib.kv_session import (
+    build_layout, export_range, import_range, kv_truncate, kv_is_linear_quantized,
+    store_status, session_store, release_kvstore_handle, kv_reset_session, kv_drafter_len, kv_drafter_cap, drafter_id_of,
+)
 
 
 # ── C-ABI helpers (read/write across the cgo boundary) ──────────────────────
+def _write_cstr(ptr: Int64, cap: Int32, s: String):
+    """Write s at address `ptr` as a NUL-terminated C string of at most cap bytes, cut short to fit. Writes nothing when
+    ptr is 0 or cap is not positive."""
+    if ptr == 0 or cap <= Int32(0):
+        return
+    var p = UnsafePointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(ptr))
+    var b = s.as_bytes()
+    var n = min(len(b), Int(cap) - 1)
+    for i in range(n):
+        p[i] = b[i]
+    p[n] = 0
+
+
 def _read_cstr(ptr: Int64) raises -> String:
     """Read a NUL-terminated C string from address `ptr` into a Mojo String."""
     if ptr == 0:
@@ -188,6 +208,11 @@ def nomos_shutdown(handle: Int64) -> Int32:
     var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](
         unsafe_from_address=Int(handle)
     )
+    # First: closing the KV session store frees pinned host memory, which needs the engine's CUDA context alive,
+    # and releases the store directory's lock.
+    if engine_ptr[0].kvstore_ptr != 0:
+        release_kvstore_handle(engine_ptr[0].kvstore_ptr)
+        engine_ptr[0].kvstore_ptr = UInt64(0)
     if engine_ptr[0].mtp_ptr != 0:
         release_mtp_drafter_handle(engine_ptr[0].mtp_ptr)
         engine_ptr[0].mtp_ptr = UInt64(0)
@@ -198,7 +223,12 @@ def nomos_shutdown(handle: Int64) -> Int32:
     if engine_ptr[0].dflash_ptr != 0:
         release_dflash_drafter_handle(engine_ptr[0].dflash_ptr)
         engine_ptr[0].dflash_ptr = UInt64(0)
+        engine_ptr[0].dflash_id = UInt64(0)
         engine_ptr[0].clear_drafter_taps()
+    if engine_ptr[0].kv_copy_stream != 0:
+        cuda_stream_destroy(engine_ptr[0].kv_copy_stream)
+        cuda_event_destroy(engine_ptr[0].kv_copy_event)
+        engine_ptr[0].kv_copy_stream = UInt64(0)
     release_engine_handle(UInt64(handle))
     return Int32(0)
 
@@ -319,84 +349,6 @@ def nomos_lm_draft_debug_prefill(
         return Int32(0)
     except e:
         print("[nomos_lm_draft_debug_prefill EXC]", e, " n=", Int(n))
-        return Int32(-99)
-
-
-@export
-def nomos_lm_draft_debug_prefill_layer(
-    draft_handle: Int64,
-    ids_ptr: Int64,
-    n: Int32,
-    trace_layer: Int32,
-    out_phase_ptr: Int64,
-    out_meta_ptr: Int64,
-    out_token_ptr: Int64,
-) -> Int32:
-    """Debug one E2B layer on the last prompt token.
-
-    Runs reset+prefill over ids[0..n-1], writes:
-    - out_phase_ptr: optional host float[4*1536]:
-      [layer input, post-attn residual, post-MLP residual, final layer output];
-    - out_meta_ptr: optional host int32[4]:
-      [read_layer, q_head_dim, read_head_dim, is_shared];
-    - out_token_ptr: required Int32 greedy next token.
-    Leaves draft KV length == n. 0=ok, -1=bad arg, -99=exception.
-    """
-    if draft_handle == 0 or ids_ptr == 0 or out_token_ptr == 0 or n <= Int32(0):
-        return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
-    try:
-        var ids = List[Int]()
-        _read_int32_array_into(ids_ptr, Int(n), ids)
-        var tok = dp[0].prefill_debug_layer(
-            ids, Int(trace_layer), UInt64(out_phase_ptr), UInt64(out_meta_ptr)
-        )
-        UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(tok)
-        return Int32(0)
-    except e:
-        print("[nomos_lm_draft_debug_prefill_layer EXC]", e, " n=", Int(n), " layer=", Int(trace_layer))
-        return Int32(-99)
-
-
-@export
-def nomos_lm_draft_debug_prefill_layer_attn(
-    draft_handle: Int64,
-    ids_ptr: Int64,
-    n: Int32,
-    trace_layer: Int32,
-    out_phase_ptr: Int64,
-    out_meta_ptr: Int64,
-    out_attn_ptr: Int64,
-    out_attn_meta_ptr: Int64,
-    out_token_ptr: Int64,
-) -> Int32:
-    """Debug one E2B layer plus attention inputs on the last prompt token.
-
-    Includes all outputs from nomos_lm_draft_debug_prefill_layer and adds:
-    - out_attn_ptr: optional host float[80], five rows of 16 floats:
-      [q0, k_first, v_first, k_last, v_last];
-    - out_attn_meta_ptr: optional host int32[8]:
-      [read_layer, pos_plus_one, attn_len, win_start,
-       q_head_dim, read_head_dim, kvg, max_seq].
-    """
-    if draft_handle == 0 or ids_ptr == 0 or out_token_ptr == 0 or n <= Int32(0):
-        return Int32(-1)
-    var dp = UnsafePointer[E2BDraftEngine, MutUntrackedOrigin](unsafe_from_address=Int(draft_handle))
-    try:
-        var ids = List[Int]()
-        _read_int32_array_into(ids_ptr, Int(n), ids)
-        var tok = dp[0].prefill_debug_layer(
-            ids,
-            Int(trace_layer),
-            UInt64(out_phase_ptr),
-            UInt64(out_meta_ptr),
-            UInt64(out_attn_ptr),
-            UInt64(out_attn_meta_ptr),
-        )
-        UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_token_ptr))[0] = Int32(tok)
-        return Int32(0)
-    except e:
-        print("[nomos_lm_draft_debug_prefill_layer_attn EXC]", e, " n=", Int(n), " layer=", Int(trace_layer))
         return Int32(-99)
 
 
@@ -663,7 +615,7 @@ def nomos_prefill(handle: Int64, ids_ptr: Int64, n: Int32, logits_out_ptr: Int64
         if dflash_loaded:
             var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
                 unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
-            if dp[0].cache_len() + 1 > DFLASH_MAX_CTX:
+            if dp[0].cache_len() + 1 > dp[0].max_ctx:
                 return Int32(-3)
             dflash_append_context_rows(
                 engine_ptr[0].ctx,
@@ -677,20 +629,256 @@ def nomos_prefill(handle: Int64, ids_ptr: Int64, n: Int32, logits_out_ptr: Int64
         print("[nomos_prefill EXC]", e, "  n=", Int(n))
         return Int32(-99)
 
+
+@export
+def nomos_prefill_mm(
+    handle: Int64, ids_ptr: Int64, n: Int32,
+    vision_features_ptr: Int64, n_vis: Int32, logits_out_ptr: Int64,
+) -> Int32:
+    """Fresh multimodal prefill.
+
+    vision_features is host fp32 [n_vis,D], already projected and
+    perception_emb_norm'd. Rows replace image-token embeddings after the text
+    embed_norm and before layer 0, in token order. A count mismatch fails
+    before any cache or recurrent-state mutation.
+    """
+    if (
+        handle == 0 or ids_ptr == 0 or n <= Int32(0) or logits_out_ptr == 0
+        or vision_features_ptr == 0 or n_vis <= Int32(0)
+    ):
+        return Int32(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    try:
+        var prompt = List[Int]()
+        _read_int32_array_into(ids_ptr, Int(n), prompt)
+        var placeholders = 0
+        for i in range(len(prompt)):
+            if prompt[i] == MM_IMAGE_TOKEN_ID:
+                placeholders += 1
+        if placeholders != Int(n_vis):
+            print("[nomos_prefill_mm] image-token/features mismatch:", placeholders, "!=", Int(n_vis))
+            return Int32(-2)
+        engine_ptr[0].reset_kv_cache()
+        var dflash_loaded = engine_ptr[0].dflash_ptr != 0
+        if dflash_loaded:
+            var dp_reset = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
+                unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
+            dp_reset[0].reset()
+        engine_ptr[0].mm_features_host = UInt64(vision_features_ptr)
+        engine_ptr[0].mm_nvis = Int(n_vis)
+        engine_ptr[0].mm_cursor = 0
+        engine_ptr[0].mm_debug_embeddings.clear()
+        engine_ptr[0].mm_debug_rows = 0
+        var lp = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(logits_out_ptr))
+        lp[0] = Float32(-1.0e30)
+        lp[VOCAB - 1] = Float32(-1.0e30)
+        engine_ptr[0].prefill_logits(prompt, logits_out_ptr)
+        # KV spliced from image features is not described by token IDs: never let the session store match it.
+        engine_ptr[0].live_tokens.clear()
+        engine_ptr[0].live_desync = True
+        var consumed = engine_ptr[0].mm_cursor
+        engine_ptr[0].mm_features_host = UInt64(0)
+        engine_ptr[0].mm_nvis = 0
+        engine_ptr[0].mm_cursor = 0
+        if consumed != Int(n_vis):
+            print("[nomos_prefill_mm] splice consumed", consumed, "of", Int(n_vis))
+            return Int32(-5)
+        if lp[0] == Float32(-1.0e30) and lp[VOCAB - 1] == Float32(-1.0e30):
+            return Int32(-4)
+        if dflash_loaded:
+            var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
+                unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
+            if dp[0].cache_len() + 1 > dp[0].max_ctx:
+                return Int32(-3)
+            dflash_append_context_rows(engine_ptr[0].ctx, dp[0], dp[0].d_taps_buf, 1)
+            engine_ptr[0].ctx.synchronize()
+        return Int32(0)
+    except e:
+        engine_ptr[0].mm_features_host = UInt64(0)
+        engine_ptr[0].mm_nvis = 0
+        engine_ptr[0].mm_cursor = 0
+        print("[nomos_prefill_mm EXC]", e, " n=", Int(n), " n_vis=", Int(n_vis))
+        return Int32(-99)
+
+
+@export
+def nomos_prefill_mm_mrope(
+    handle: Int64, ids_ptr: Int64, n: Int32,
+    vision_features_ptr: Int64, n_vis: Int32,
+    position_ids_ptr: Int64, next_logical_position: Int32,
+    logits_out_ptr: Int64,
+) -> Int32:
+    """Fresh Qwen multimodal prefill with exact interleaved M-RoPE positions.
+
+    position_ids is host int64 [3,n], channel-major T/H/W, matching HF
+    get_rope_index. next_logical_position is the scalar T=H=W position for
+    the first generated token. The engine persists delta=logical-cache so
+    decode/verify/rollback never infer logical position from image-token count.
+    """
+    if (
+        handle == 0 or ids_ptr == 0 or n <= Int32(0) or logits_out_ptr == 0
+        or vision_features_ptr == 0 or n_vis <= Int32(0)
+        or position_ids_ptr == 0 or next_logical_position < Int32(0)
+    ):
+        return Int32(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    if Int(n) > engine_ptr[0].max_seq:
+        return Int32(-3)
+    try:
+        var prompt = List[Int]()
+        _read_int32_array_into(ids_ptr, Int(n), prompt)
+        var placeholders = 0
+        for i in range(len(prompt)):
+            if prompt[i] == MM_IMAGE_TOKEN_ID:
+                placeholders += 1
+        if placeholders != Int(n_vis):
+            print("[nomos_prefill_mm_mrope] image-token/features mismatch:", placeholders, "!=", Int(n_vis))
+            return Int32(-2)
+
+        # Convert the ABI's portable int64 positions once, then retain them in
+        # the engine's channel-pitched int32 device buffer for all softmax layers.
+        var src = UnsafePointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(position_ids_ptr))
+        var pos32 = List[Int32](capacity=3 * Int(n))
+        for i in range(3 * Int(n)):
+            if src[i] < Int64(0) or src[i] > Int64(2147483647):
+                return Int32(-6)
+            pos32.append(Int32(src[i]))
+
+        engine_ptr[0].reset_kv_cache()
+        for channel in range(3):
+            cuda_memcpy(
+                engine_ptr[0].d_mrope_position_ids
+                + UInt64(channel * engine_ptr[0].max_seq * 4),
+                UInt64(Int(pos32.unsafe_ptr())) + UInt64(channel * Int(n) * 4),
+                Int(n) * 4, 1,
+            )
+        engine_ptr[0].mrope_positions_active = True
+        engine_ptr[0].mrope_position_count = Int(n)
+
+        var dflash_loaded = engine_ptr[0].dflash_ptr != 0
+        if dflash_loaded:
+            var dp_reset = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
+                unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
+            dp_reset[0].reset()
+        engine_ptr[0].mm_features_host = UInt64(vision_features_ptr)
+        engine_ptr[0].mm_nvis = Int(n_vis)
+        engine_ptr[0].mm_cursor = 0
+        engine_ptr[0].mm_debug_embeddings.clear()
+        engine_ptr[0].mm_debug_rows = 0
+        var lp = UnsafePointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(logits_out_ptr))
+        lp[0] = Float32(-1.0e30)
+        lp[VOCAB - 1] = Float32(-1.0e30)
+        engine_ptr[0].prefill_logits(prompt, logits_out_ptr)
+        # KV spliced from image features is not described by token IDs: never let the session store match it.
+        engine_ptr[0].live_tokens.clear()
+        engine_ptr[0].live_desync = True
+        var consumed = engine_ptr[0].mm_cursor
+        engine_ptr[0].mm_features_host = UInt64(0)
+        engine_ptr[0].mm_nvis = 0
+        engine_ptr[0].mm_cursor = 0
+        engine_ptr[0].mrope_positions_active = False
+        if consumed != Int(n_vis):
+            return Int32(-5)
+        if lp[0] == Float32(-1.0e30) and lp[VOCAB - 1] == Float32(-1.0e30):
+            return Int32(-4)
+
+        # Fresh prefill occupies cache positions [0,n). Generated text begins
+        # at next_logical_position on every M-RoPE channel.
+        engine_ptr[0].mrope_position_delta = Int(next_logical_position) - Int(n)
+        if dflash_loaded:
+            var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
+                unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
+            if dp[0].cache_len() + 1 > dp[0].max_ctx:
+                return Int32(-3)
+            dflash_append_context_rows(engine_ptr[0].ctx, dp[0], dp[0].d_taps_buf, 1)
+            engine_ptr[0].ctx.synchronize()
+        return Int32(0)
+    except e:
+        engine_ptr[0].mm_features_host = UInt64(0)
+        engine_ptr[0].mm_nvis = 0
+        engine_ptr[0].mm_cursor = 0
+        engine_ptr[0].mrope_positions_active = False
+        engine_ptr[0].mrope_position_count = 0
+        engine_ptr[0].mrope_position_delta = 0
+        print("[nomos_prefill_mm_mrope EXC]", e, " n=", Int(n), " n_vis=", Int(n_vis))
+        return Int32(-99)
+
 @export
 def nomos_decode_step(handle: Int64, token: Int32, logits_out_ptr: Int64) -> Int32:
     """LOGITS-ENGINE decode step (Python-host path). Append `token` at the current cache
     position (continuing the held KV) and write the next logits (VOCAB fp32, post-softcap)
-    to logits_out_ptr. The host does sampling + grammar. 0 = ok, -1 = bad arg, -99 = exc."""
+    to logits_out_ptr. The host does sampling + grammar.
+    0 = ok, -1 = bad arg, -2 = step consumed no token (see below), -99 = exc."""
     if handle == 0 or logits_out_ptr == 0:
         return Int32(-1)
     var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     try:
+        # WRITTEN-OUTPUT GUARD (2026-09-17). This export used to return 0 unconditionally,
+        # which is how a dropped token became invisible: if the continuation filter ate the
+        # single token, num_new fell to 0, engine_decode's loop never ran, no KV was
+        # appended and no logits were written -- yet this returned success, so the host
+        # (pyhost/host.py:369-380, which reuses one logits allocation across prefill and
+        # step) read its PREVIOUS logits and a greedy sampler re-emitted the same token
+        # until the length cap. Weeks of "quote runaway" and an FFI-vs-serve mismatch were
+        # this, and nothing anywhere said a word.
+        #
+        # The contract of a single-token step is: consume the token, advance the cache by
+        # exactly one, write fresh logits. Assert the STRUCTURE, never compare logit
+        # VALUES -- a legitimate step may recompute identical logits, so a value test would
+        # fire on correct behaviour and stay silent on the real defect. In this path the
+        # KV append and the logits copy live in the same loop body (engine_decode.mojo:294,
+        # :548-584, :1003-1006), so a cache advance of one implies the write completed. If
+        # those are ever decoupled, sentinel logits_out[0] before the call and verify it
+        # was overwritten -- that tests a completed write rather than a changed value.
+        var len_before = engine_ptr[0].cache_len()
         engine_ptr[0].step_logits(Int(token), logits_out_ptr)
+        var len_after = engine_ptr[0].cache_len()
+        if len_after != len_before + 1:
+            print("[nomos_decode_step] REFUSING SUCCESS: step consumed no token.",
+                  " token=", Int(token), " cache_len ", len_before, "->", len_after,
+                  " (expected ", len_before + 1, ").",
+                  " logits_out is STALE -- do not sample from it.")
+            return Int32(-2)
         return Int32(0)
     except e:
         print("[nomos_decode_step EXC]", e, "  token=", Int(token))
         return Int32(-99)
+
+@export
+def nomos_target_bos_id() -> Int32:
+    """DEPLOY-TIME ATTESTATION: the BOS id COMPILED INTO THIS BINARY.
+
+    Why this exists (2026-09-17). olmo3 shipped TARGET_BOS_ID = 1 while its tokenizer
+    maps id 1 to the literal '"', so every standalone quote token was silently eaten.
+    Codex's build-time check now compares the profile SOURCE against the tokenizer, but
+    their own audit draws the line explicitly: build-input validation is NOT loaded-binary
+    attestation. A correct profile on disk paired with a stale .so passes a source check
+    and still serves the bug -- which is the same false assurance in a new place.
+
+    So the binary answers for itself. This reads the compile-time constant out of the
+    loaded library, which cannot be faked by a correct-looking file sitting next to it.
+    Kvasir's serve-side deploy assert compares THIS against the loaded tokenizer's
+    bos_token_id and refuses to serve on mismatch.
+
+    Takes no handle: it is a property of the BINARY, not of any engine instance, and must
+    be callable before a model is initialised (the whole point is to refuse to load one).
+    """
+    return Int32(TARGET_BOS_ID)
+
+@export
+def nomos_target_eos_id_0() -> Int32:
+    """First compiled EOS id. See nomos_target_bos_id. Exported alongside BOS because for
+    olmo3 they ALIAS (both <|endoftext|> = 100257) -- which is why correcting the BOS
+    constant alone did not close the class: an explicit step of EOS would then have matched
+    the strip condition. A deploy assert should be able to SEE that aliasing rather than
+    infer it, so both are exported as separate facts."""
+    return Int32(TARGET_EOS_ID_0)
+
+@export
+def nomos_target_eos_id_1() -> Int32:
+    """Second compiled EOS id (models with two terminators; equal to the first when the
+    profile declares only one). See nomos_target_eos_id_0."""
+    return Int32(TARGET_EOS_ID_1)
 
 @export
 def nomos_mtp_load(handle: Int64, dir_ptr: Int64) -> Int32:
@@ -837,47 +1025,6 @@ def nomos_verify_exact_next_token(
         print("[nomos_verify_exact_next_token EXC]", e,
               " start=", Int(start_pos), " num_acc=", Int(num_acc),
               " n_rows=", Int(n_rows))
-        return Int32(-99)
-
-
-@export
-def nomos_debug_prefill_all_layers(
-    handle: Int64,
-    ids_ptr: Int64,
-    n: Int32,
-    out_ptr: Int64,
-) -> Int32:
-    """Capture raw residual output for every prompt row and all 60 layers.
-
-    out_ptr is Float32[n, TOTAL_LAYERS, D], row-major. This is a correctness
-    oracle surface only; it does not alter the normal prefill ABI.
-    """
-    if handle == 0 or ids_ptr == 0 or out_ptr == 0 or n <= Int32(0):
-        return Int32(-1)
-    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
-    var d_rows = UInt64(0)
-    try:
-        var prompt = List[Int]()
-        _read_int32_array_into(ids_ptr, Int(n), prompt)
-        engine_ptr[0].reset_kv_cache()
-        d_rows = cuda_malloc(Int(n) * TOTAL_LAYERS * D * 4)
-        var layers = List[Int]()
-        for layer in range(TOTAL_LAYERS):
-            layers.append(layer)
-        engine_ptr[0].configure_drafter_taps(UInt64(0), d_rows, layers)
-        prefill_batch_impl(
-            engine_ptr[0], prompt, 0,
-            eagle_tap_rows=Int(n),
-        )
-        cuda_memcpy(UInt64(out_ptr), d_rows, Int(n) * TOTAL_LAYERS * D * 4, 2)
-        engine_ptr[0].clear_drafter_taps()
-        cuda_free(d_rows)
-        return Int32(0)
-    except e:
-        engine_ptr[0].clear_drafter_taps()
-        if d_rows != 0:
-            cuda_free(d_rows)
-        print("[nomos_debug_prefill_all_layers EXC]", e)
         return Int32(-99)
 
 
@@ -2280,6 +2427,7 @@ def nomos_dflash_load(handle: Int64, dir_ptr: Int64) -> Int32:
         if engine_ptr[0].dflash_ptr != 0:
             release_dflash_drafter_handle(engine_ptr[0].dflash_ptr)
             engine_ptr[0].dflash_ptr = UInt64(0)
+            engine_ptr[0].dflash_id = UInt64(0)
             engine_ptr[0].clear_drafter_taps()
 
         var dir = _read_cstr(dir_ptr)
@@ -2291,9 +2439,11 @@ def nomos_dflash_load(handle: Int64, dir_ptr: Int64) -> Int32:
                   "drafter from null pointers.")
             return Int32(-2)
         validate_dflash_profile_metadata(dir)
+        var drafter_id = drafter_id_of(dir)   # before the allocation: a raise here must not leave a drafter without its id
         var dp = alloc[DFlashDrafter](1)
-        dp.init_pointee_move(DFlashDrafter(dir, engine_ptr[0].ctx, engine_ptr[0].handle))
+        dp.init_pointee_move(DFlashDrafter(dir, engine_ptr[0].ctx, engine_ptr[0].handle, engine_ptr[0].max_seq))
         engine_ptr[0].dflash_ptr = UInt64(Int(dp))
+        engine_ptr[0].dflash_id = drafter_id   # the KV session store's cache key: the next session_store() re-keys
 
         var tap_layers = dflash_profile_tap_layers()
         engine_ptr[0].configure_drafter_taps(
@@ -2319,6 +2469,7 @@ def nomos_dflash_get_taps(handle: Int64, out_ptr: Int64) -> Int32:
         var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].dflash_ptr)
         )
+        engine_ptr[0].ctx.synchronize()   # the decode taps are queued on ctx (engine_decode.mojo)
         cuda_memcpy(UInt64(out_ptr), dp[0].d_taps_buf, DFLASH_FC_IN * 4, 2)
         return Int32(0)
     except e:
@@ -2328,7 +2479,7 @@ def nomos_dflash_get_taps(handle: Int64, out_ptr: Int64) -> Int32:
 
 @export
 def nomos_dflash_project_context(handle: Int64, taps_ptr: Int64, out_context: Int64) -> Int32:
-    """gold-diff helper: hidden_norm(fc([tap_count,D] taps)) -> [D] context.
+    """Gold-diff helper: hidden_norm(fc([tap_count,D] taps)) -> [D] context.
 
     If taps_ptr is non-zero, it is a host fp32[tap_count*D] input and is uploaded into
     the DFlash live tap buffer first. If taps_ptr is zero, the already armed live
@@ -2344,6 +2495,8 @@ def nomos_dflash_project_context(handle: Int64, taps_ptr: Int64, out_context: In
         var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
         if taps_ptr != 0:
+            # A decode tap still queued on ctx would otherwise land after this upload and overwrite it.
+            engine_ptr[0].ctx.synchronize()
             cuda_memcpy(dp[0].d_taps_buf, UInt64(taps_ptr), DFLASH_FC_IN * 4, 1)
             cuda_sync()
         dflash_project_context(engine_ptr[0].ctx, dp[0], dp[0].d_taps_buf)
@@ -2570,6 +2723,15 @@ def nomos_dflash_verify_fused(
                 )
             engine_ptr[0].ctx.synchronize()
         else:
+            # Track the rows prefill_batch_impl is about to write, but only from a state that was in step and
+            # whose start_pos does not leave a gap. Anything else stays untracked (live_desync, list empty).
+            var in_step = (
+                engine_ptr[0].live_in_step()
+                and Int(start_pos) <= engine_ptr[0].cache_len()
+            )
+            var held = List[Int]()   # prefill_batch_impl empties live_tokens on entry; hold it out of its reach
+            if in_step:
+                swap(held, engine_ptr[0].live_tokens)
             prefill_batch_impl(
                 engine_ptr[0],
                 tokens,
@@ -2578,6 +2740,17 @@ def nomos_dflash_verify_fused(
                 Int(n_rows) - 1,
                 Int(n_rows),
             )
+            if in_step:
+                # Mirror the KV just written: rows [start_pos, start_pos + n_rows) hold `tokens`.
+                while len(held) > Int(start_pos):
+                    _ = held.pop()
+                for i in range(len(tokens)):
+                    held.append(tokens[i])
+                engine_ptr[0].live_tokens = held^
+                engine_ptr[0].live_desync = False
+            else:
+                engine_ptr[0].live_tokens.clear()    # untracked stays untracked (prefill_batch_impl already marked it)
+                engine_ptr[0].live_desync = True
         return Int32(0)
     except e:
         if HAS_LINEAR_ATTENTION and engine_ptr[0].dflash_verify_pending:
@@ -2623,7 +2796,7 @@ def nomos_dflash_append_verify_context(
             unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
         if Int(start_row) + Int(n_rows) > dp[0].last_verify_rows:
             return Int32(-1)
-        if dp[0].cache_len() + Int(n_rows) > DFLASH_MAX_CTX:
+        if dp[0].cache_len() + Int(n_rows) > dp[0].max_ctx:
             return Int32(-3)
         if HAS_LINEAR_ATTENTION:
             # Target verify inputs are [seed, draft_0, ...]. If a drafts are
@@ -2720,13 +2893,15 @@ def nomos_dflash_cache_len(handle: Int64) -> Int32:
 
 @export
 def nomos_dflash_set_len(handle: Int64, n: Int32) -> Int32:
-    if handle == 0 or n < Int32(0) or Int(n) > DFLASH_MAX_CTX:
+    if handle == 0 or n < Int32(0):
         return Int32(-1)
     var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     if engine_ptr[0].dflash_ptr == 0:
         return Int32(-2)
     var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](
         unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
+    if Int(n) > dp[0].max_ctx:
+        return Int32(-1)
     dp[0].set_cache_len(Int(n))
     return Int32(0)
 
@@ -2881,7 +3056,7 @@ def nomos_eagle3_select_verify_tap(handle: Int64, row: Int32) -> Int32:
 
     row is zero-based within the last nomos_eagle3_verify_fused tokens array.
     Call after host accept/rollback so the next nomos_eagle3_draft consumes the
-    tap for the accepted-final token. 0=ok, -1=bad arg/stale row, -2=EAGLE not loaded.
+    tap for the accepted-final token. 0=ok, -1=bad arg/stale row, -2=EAGLE not loaded, -99=exception.
     """
     if handle == 0 or row < Int32(0) or Int(row) >= MAX_VERIFY_ROWS:
         return Int32(-1)
@@ -2892,6 +3067,12 @@ def nomos_eagle3_select_verify_tap(handle: Int64, row: Int32) -> Int32:
         unsafe_from_address=Int(engine_ptr[0].eagle3_ptr))
     if Int(row) >= ep[0].last_verify_rows:
         return Int32(-1)
+    # A decode tap still queued on ctx would otherwise land after this copy and overwrite it.
+    try:
+        engine_ptr[0].ctx.synchronize()
+    except e:
+        print("[nomos_eagle3_select_verify_tap EXC]", e)
+        return Int32(-99)
     cuda_memcpy(
         ep[0].d_taps_buf,
         ep[0].d_verify_taps_buf + UInt64(Int(row) * ep[0].n_taps * ep[0].dB * 4),
@@ -2904,7 +3085,7 @@ def nomos_eagle3_select_verify_tap(handle: Int64, row: Int32) -> Int32:
 @export
 def nomos_eagle3_draft_from_taps(handle: Int64, taps_ptr: Int64, seed_token: Int32, k: Int32,
         out_draft_ids: Int64, out_target_ids: Int64, out_inter: Int64) -> Int32:
-    """gold-diff entry. Upload FIXED taps [3*dB] (host fp32 at taps_ptr), draft k steps from
+    """Gold-diff entry. Upload FIXED taps [3*dB] (host fp32 at taps_ptr), draft k steps from
     seed_token at position_start=1, write per-step draft_ids + target_ids (Int32) to
     out_draft_ids / out_target_ids, and (if out_inter!=0) the captured intermediates as fp32:
     fc_out[dB], then per step attn_out[nh*hd], o_out[dB], hidden_out[dB]. Returns the count
@@ -3173,6 +3354,7 @@ def nomos_eagle3_get_taps(handle: Int64, out_ptr: Int64) -> Int32:
     try:
         var ep = UnsafePointer[Eagle3Drafter, MutUntrackedOrigin](
             unsafe_from_address=Int(engine_ptr[0].eagle3_ptr))
+        engine_ptr[0].ctx.synchronize()   # the decode taps are queued on ctx (engine_decode.mojo)
         cuda_memcpy(UInt64(out_ptr), ep[0].d_taps_buf, 3 * ep[0].dB * 4, 2)   # D2H
         return Int32(0)
     except e:
@@ -3251,12 +3433,217 @@ def nomos_kv_cache_len(handle: Int64) -> Int32:
     return Int32(engine_ptr[0].cache_len())
 
 @export
+def nomos_live_tokens(handle: Int64, out_ptr: Int64, cap: Int32) -> Int32:
+    """The token IDs whose KV the engine holds: writes min(cap, len) Int32s to out_ptr, returns len. -1 = bad arg."""
+    if handle == 0 or out_ptr == 0 or cap < Int32(0):
+        return Int32(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    var out = UnsafePointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(out_ptr))
+    var n = len(engine_ptr[0].live_tokens)
+    for i in range(min(n, Int(cap))):
+        out[i] = Int32(engine_ptr[0].live_tokens[i])
+    return Int32(n)
+
+@export
+def nomos_kv_bytes_per_token(handle: Int64) -> Int64:
+    """Bytes one token of the live KV takes in a session chunk (with a DFlash drafter loaded, plus its context rows).
+    -1 = bad arg, or a KV the store cannot copy (it needs NOMOS_KV_QUANT=1 and NOMOS_KV_SWA=0)."""
+    if handle == 0:
+        return Int64(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    if not kv_is_linear_quantized(engine_ptr[0]):
+        return Int64(-1)
+    return Int64(build_layout(engine_ptr[0]).bytes_per_token())
+
+
+@export
+def nomos_kv_export(handle: Int64, a: Int32, b: Int32, dst: Int64) -> Int32:
+    """Test hook: export tokens [a, b) of the live KV to host memory at dst, with a DFlash drafter loaded also the
+    drafter's context rows, as many as it holds (nomos_kv_bytes_per_token bytes per token). 0 = ok, -1 = bad arg,
+    -99 = error."""
+    if handle == 0 or dst == 0:
+        return Int32(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    try:
+        var layout = build_layout(engine_ptr[0])
+        export_range(engine_ptr[0], layout, Int(a), Int(b), kv_drafter_len(engine_ptr[0]), UInt64(Int(dst)))
+        return Int32(0)
+    except e:
+        print("[nomos_kv_export EXC]", e)
+        return Int32(-99)
+
+
+@export
+def nomos_kv_import(handle: Int64, a: Int32, b: Int32, src: Int64, src_tokens: Int32, tokens_ptr: Int64) -> Int32:
+    """Test hook: import tokens [a, b) from a chunk of src_tokens tokens at src, the drafter's rows too when its context
+    holds exactly [0, a). 0 = ok, -1 = bad arg, -99 = error."""
+    if handle == 0 or src == 0 or tokens_ptr == 0 or b <= a:
+        return Int32(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    try:
+        var tokens = List[Int]()
+        _read_int32_array_into(tokens_ptr, Int(b - a), tokens)
+        var layout = build_layout(engine_ptr[0])
+        import_range(engine_ptr[0], layout, Int(a), Int(b), Int(b), UInt64(Int(src)), Int(src_tokens), tokens)
+        return Int32(0)
+    except e:
+        print("[nomos_kv_import EXC]", e)
+        return Int32(-99)
+
+
+@export
+def nomos_kv_truncate(handle: Int64, p: Int32) -> Int32:
+    """Test hook: cut the live KV (and live tokens) to p. 0 = ok, -1 = bad arg, -99 = error."""
+    if handle == 0:
+        return Int32(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    try:
+        kv_truncate(engine_ptr[0], Int(p))
+        return Int32(0)
+    except e:
+        print("[nomos_kv_truncate EXC]", e)
+        return Int32(-99)
+
+@export
+def nomos_build_id() -> Int64:
+    """BUILD_ID from lib/build_stamp.mojo (refresh_build.sh): a hash of the profile and every kernel source byte."""
+    return BUILD_ID.cast[DType.int64]()
+
+
+@export
+def nomos_session_supported() -> Int32:
+    """1 when this build's model profile supports the KV session store, else -10."""
+    return Int32(1) if store_supported(MODEL_ID) else Int32(-10)
+
+
+@export
+def nomos_session_status(handle: Int64) -> Int32:
+    """1 = the KV session store is enabled and this build supports it. That stays 1 after the store was DISABLED for
+    this process (another process holds its directory, or its config is bad): that is logged once, and
+    nomos_session_prepare then returns 0. 0 = off (NOMOS_KVSTORE unset). Negative = refused: -10 model profile not
+    supported, -11 NOMOS_KV_SWA=1, -12 unquantized KV. -1 = bad arg."""
+    if handle == 0:
+        return Int32(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    return Int32(store_status(engine_ptr[0]))
+
+
+@export
+def nomos_session_open(handle: Int64, dir_out: Int64, cap: Int32) -> Int32:
+    """Create the KV session store now, at launch, instead of at the first chat request (ruling R79): take its directory's
+    lock, scan its files and print its [kvstore] lines while the operator watches the launch. Call it once the drafter is
+    loaded or known absent: the cache key is final only then. Returns:
+    - 1, open: the store's directory (as NOMOS_KVSTORE_DIR spells it) is written to dir_out, NUL-terminated, cut to cap;
+    - 0, off: NOMOS_KVSTORE unset or 0;
+    - -10 / -11 / -12, refused (see nomos_session_status);
+    - -2, DISABLED for this process: the store could not be created (another process holds its directory, or a setting
+      is invalid). Logged once, as nomos_session_prepare does, which then returns 0: every turn is a fresh prefill;
+    - -1, bad arg. dir_out may be 0 (with cap 0) when the directory is not wanted."""
+    if handle == 0 or cap < Int32(0) or (dir_out == 0 and cap != Int32(0)):
+        return Int32(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    _write_cstr(dir_out, cap, "")
+    var st = store_status(engine_ptr[0])
+    if st != 1:
+        return Int32(st)
+    if engine_ptr[0].kvstore_disabled:
+        return Int32(-2)
+    try:
+        var sp = session_store(engine_ptr[0])
+        _write_cstr(dir_out, cap, sp[0].cfg.dir)
+        return Int32(1)
+    except e:
+        engine_ptr[0].kvstore_disabled = True   # as nomos_session_prepare does when the store cannot be created
+        print("[kvstore] DISABLED for this process:", e)
+        return Int32(-2)
+
+
+@export
+def nomos_session_prepare(handle: Int64, ids_ptr: Int64, n: Int32, spec: Int32) -> Int32:
+    """Position the KV on the longest reusable prefix of ids and return its length c (0 <= c <= n-1). The caller
+    then runs nomos_prefill(ids) if c == 0, else nomos_prefill_cont(ids[c:]). spec = 1 when the caller runs the
+    DFlash loop. Other returns:
+    - 0, engine untouched, when the store is off or already DISABLED for this process (the caller's nomos_prefill
+      starts afresh);
+    - 0, KV reset, after an internal error: a fresh prefill is always correct. An error with no store to blame (it could not be created, e.g. another process holds its
+      directory) also DISABLES the store for the rest of the process, logged once;
+    - -1 bad arg (null handle or ids, n <= 0);
+    - -10 / -11 / -12 the store is refused (see nomos_session_status), engine untouched."""
+    if handle == 0 or ids_ptr == 0 or n <= Int32(0):
+        return Int32(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    var st = store_status(engine_ptr[0])
+    if st != 1:
+        return Int32(0) if st == 0 else Int32(st)
+    if engine_ptr[0].kvstore_disabled:
+        return Int32(0)
+    try:
+        var ids = List[Int]()
+        _read_int32_array_into(ids_ptr, Int(n), ids)
+        var sp = session_store(engine_ptr[0])
+        return Int32(sp[0].prepare(engine_ptr[0], ids, spec != Int32(0)))
+    except e:
+        if engine_ptr[0].kvstore_ptr == 0:
+            # The store could not be created, e.g. another process holds its directory (spec §3.1). Run without
+            # it for the rest of this process, and say so once.
+            engine_ptr[0].kvstore_disabled = True
+            print("[kvstore] DISABLED for this process:", e)
+        else:
+            print("[kvstore] ERROR in prepare; falling back to a fresh prefill:", e)
+        try:
+            kv_reset_session(engine_ptr[0])   # the target KV and, with a drafter loaded, its context
+        except:
+            engine_ptr[0].reset_kv_cache()
+        return Int32(0)
+
+
+@export
+def nomos_session_commit(handle: Int64) -> Int32:
+    """Persist the live session's tokens since the last commit; call once per turn, after generation. Returns
+    tokens committed (>= 0), 0 when the store is off or disabled, a negative store code
+    (see SessionStore.commit), or -99 if committing raised (logged; the store keeps running)."""
+    if handle == 0:
+        return Int32(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    if store_status(engine_ptr[0]) != 1 or engine_ptr[0].kvstore_ptr == 0:
+        return Int32(0)
+    try:
+        var sp = session_store(engine_ptr[0])
+        return Int32(sp[0].commit(engine_ptr[0]))
+    except e:
+        print("[kvstore] ERROR in commit:", e)
+        return Int32(-99)
+
+
+@export
+def nomos_session_stats(handle: Int64, out_ptr: Int64) -> Int32:
+    """Ten Int64 counters, in order: prepares, prompt tokens, reused tokens, restores from RAM, restores from
+    NVMe, forks, RAM bytes, NVMe bytes, RAM evictions, NVMe evictions. Zeros before the store exists. They belong to
+    the store, so they restart from zero when it is re-keyed (a DFlash drafter loaded or unloaded)."""
+    if handle == 0 or out_ptr == 0:
+        return Int32(-1)
+    var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    var out = UnsafePointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(out_ptr))
+    for i in range(N_STATS):
+        out[i] = Int64(0)
+    if engine_ptr[0].kvstore_ptr != 0:
+        var sp = UnsafePointer[SessionStore, MutUntrackedOrigin](unsafe_from_address=Int(engine_ptr[0].kvstore_ptr))
+        var s = sp[0].stats_snapshot()
+        for i in range(N_STATS):
+            out[i] = Int64(s[i])
+    return Int32(0)
+
+
+@export
 def nomos_kv_set_len(handle: Int64, n: Int32) -> Int32:
     """KV reuse: position the cache to length n (truncate to the common-prefix length) before a
-    continue-prefill of the new suffix. The KV memory [0,n) stays valid. 0 = ok, -1 = bad arg."""
+    continue-prefill of the new suffix. The KV memory [0,n) stays valid. 0 = ok, -1 = bad arg,
+    -2 = n beyond the current length."""
     if handle == 0 or n < Int32(0):
         return Int32(-1)
     var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
+    if Int(n) > engine_ptr[0].cache_len():
+        return Int32(-2)   # growing the length would expose KV that was never written
     engine_ptr[0].set_cache_len(Int(n))
     return Int32(0)
 
@@ -3264,16 +3651,43 @@ def nomos_kv_set_len(handle: Int64, n: Int32) -> Int32:
 def nomos_prefill_cont(handle: Int64, ids_ptr: Int64, n: Int32, logits_out_ptr: Int64) -> Int32:
     """LOGITS-ENGINE continue-prefill (KV reuse): prefill the `n` suffix tokens at the CURRENT
     cache position (set via nomos_kv_set_len), attending the held prefix, and write the last-
-    position logits to logits_out_ptr. 0 = ok, -1 = bad arg, -99 = exception."""
+    position logits to logits_out_ptr. While the KV session store exists and a DFlash drafter is
+    loaded, in step with the KV (its length == cache_len) and has room for the whole suffix, the
+    suffix also extends the drafter's context, so the two stay equal. That is an optimization
+    (ledger R50): a suffix the drafter has no room for leaves it where it was, trailing the KV,
+    and the call still succeeds; so does one the batched prefill did not feed (NOMOS_BATCHED_PREFILL=0).
+    The drafter holds as many rows as the engine's max_seq, so the target's capacity guard rejects a
+    suffix too long for the drafter first, and the room check is a safeguard.
+    0 = ok, -1 = bad arg, -99 = exception."""
     if handle == 0 or n <= Int32(0) or ids_ptr == 0 or logits_out_ptr == 0:
         return Int32(-1)
     var engine_ptr = UnsafePointer[GemmaEngine, MutUntrackedOrigin](unsafe_from_address=Int(handle))
     try:
         var suffix = List[Int]()
         _read_int32_array_into(ids_ptr, Int(n), suffix)
+        # R50: a drafter capacity limit must never fail a turn whose target prefill succeeds, so the room is checked
+        # here, before the target runs; a check after it could only fail a turn whose KV and logits are fine. The room
+        # is the loaded drafter's own max_ctx.
+        var capture = (engine_ptr[0].kvstore_ptr != 0 and engine_ptr[0].dflash_ptr != 0
+                       and kv_drafter_len(engine_ptr[0]) == engine_ptr[0].cache_len()
+                       and kv_drafter_len(engine_ptr[0]) + Int(n) <= kv_drafter_cap(engine_ptr[0]))
+        engine_ptr[0].dflash_capture_continue = capture
         engine_ptr[0].prefill_cont_logits(suffix, logits_out_ptr)
+        engine_ptr[0].dflash_capture_continue = False
+        if capture:
+            # The batched part appended the suffix's first n-1 tap rows; the last token's taps sit in the drafter's
+            # one-row sink, exactly as after nomos_prefill (see there). The gate left room for all n rows, and
+            # dflash_append_context_rows itself appends nothing to a full cache, so there is no failure path here.
+            # The sink row belongs at cache_len - 1, so it is appended only if the batched part left the drafter exactly
+            # one row behind. It did not feed any with NOMOS_BATCHED_PREFILL=0, or with a tap-count mismatch (the
+            # engine warns): the drafter then trails, instead of holding that row at the wrong position.
+            var dp = UnsafePointer[DFlashDrafter, MutUntrackedOrigin](unsafe_from_address=Int(engine_ptr[0].dflash_ptr))
+            if dp[0].cache_len() + 1 == engine_ptr[0].cache_len():
+                dflash_append_context_rows(engine_ptr[0].ctx, dp[0], dp[0].d_taps_buf, 1)
+                engine_ptr[0].ctx.synchronize()
         return Int32(0)
     except e:
+        engine_ptr[0].dflash_capture_continue = False
         print("[nomos_prefill_cont EXC]", e, "  n=", Int(n))
         return Int32(-99)
 

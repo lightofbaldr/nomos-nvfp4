@@ -17,7 +17,7 @@ Gate (ALL must be byte-identical, else the fix is WRONG):
   * quant packed[16,K/2] + scales[16,K/16]  (encode bytes, incl pad rows)
   * output[4,N] fp32   (final postscaled result, bitwise)
 
-Build (discrete Blackwell, sm_120a):
+Build (Gold, sm_120a):
   pixi run mojo build tools/fp4_m4_parity.mojo -I . \
       --target-accelerator sm_120a -o build/fp4_m4_parity \
       -Xlinker -L/usr/local/cuda/lib64 -Xlinker -lcudart -Xlinker -lm

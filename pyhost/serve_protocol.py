@@ -249,8 +249,8 @@ class AtemStreamParser:
         self.raw_ids: list[int] = []
         self.header_ids: list[int] = []
         self.body_ids: list[int] = []
+        self.body_done = 0          # body_ids[:body_done] are decoded and emitted, and end on a whole character
         self.recipient: str | None = None
-        self.body_emitted = ""
         self.content_emitted = ""
         self.reasoning_emitted = ""
         self.saw_stop = False
@@ -260,12 +260,12 @@ class AtemStreamParser:
         match = re.search(r"(?:^|\s)to=([^\s<]+)", header)
         self.recipient = match.group(1) if match else "user"
         self.body_ids.clear()
-        self.body_emitted = ""
+        self.body_done = 0
 
     def _reset_header(self) -> None:
         self.header_ids.clear()
         self.body_ids.clear()
-        self.body_emitted = ""
+        self.body_done = 0
         self.recipient = None
 
     def feed(self, token: int) -> list[tuple[str, str]]:
@@ -280,20 +280,35 @@ class AtemStreamParser:
             return []
 
         if token == self.protocol.eom_id:
+            out = self._body_delta(final=True)
             self._reset_header()
-            return []
+            return out
         if token in self.protocol.stop_ids:
             self.saw_stop = True
-            return []
+            return self._body_delta(final=True)
 
         self.body_ids.append(token)
-        if self.recipient not in ("self", "user"):
+        return self._body_delta(final=False)
+
+    def _body_delta(self, final: bool) -> list[tuple[str, str]]:
+        """The text the current body adds since the last emit. A character split across tokens (Glimmer writes many
+        emoji as two byte-level tokens) decodes to U+FFFD until its last byte arrives, so a body that may still grow
+        holds that tail back: streaming the U+FFFD would put a wrong character in the client's text, and the history
+        it sends back would then diverge from the KV (plan Task 10b). A finished body emits everything.
+
+        Only the tokens after the last emit are decoded (ledger R58): decoding the whole body again cost each token time
+        linear in the body, on the engine's critical path since R56. That is exact because the last emit ended on a whole
+        character (its text did not end in U+FFFD, or the body is finished) and Glimmer's decoder is byte-level: the text
+        of the body is the text up to that point followed by the text of the tokens after it. A held-back tail is simply
+        decoded again, with the token that completes it."""
+        if self.recipient not in ("self", "user") or self.body_done >= len(self.body_ids):
             return []
-        full = self.tokenizer.decode(self.body_ids, skip_special_tokens=True)
-        if len(full) <= len(self.body_emitted):
+        delta = self.tokenizer.decode(self.body_ids[self.body_done:], skip_special_tokens=True)
+        if not final and delta.endswith("\ufffd"):
             return []
-        delta = full[len(self.body_emitted):]
-        self.body_emitted = full
+        self.body_done = len(self.body_ids)
+        if not delta:
+            return []
         if self.recipient == "self":
             self.reasoning_emitted += delta
             return [("reasoning_content", delta)]
@@ -303,7 +318,7 @@ class AtemStreamParser:
     def finish(self) -> tuple[ParsedReply, list[tuple[str, str]]]:
         raw = self.tokenizer.decode(self.raw_ids, skip_special_tokens=False)
         parsed = parse_atem_reply(raw)
-        residual: list[tuple[str, str]] = []
+        residual = self._body_delta(final=True)   # a body cut off by max_tokens may still hold a split character back
         # If the model omitted/garbled an envelope, parse_atem_reply's plain-text fallback
         # still gives the caller the answer. Emit only the suffix not already streamed.
         if parsed.reasoning.startswith(self.reasoning_emitted):
@@ -315,6 +330,24 @@ class AtemStreamParser:
             if tail:
                 residual.append(("content", tail))
         return parsed, residual
+
+
+def atem_exact_fields(tokenizer, protocol: "AtemServeProtocol", ids) -> tuple[str, str, ParsedReply]:
+    """(reasoning, content, parsed) for generated ids, exactly as a streaming client joins them: the deltas the SSE
+    path sends. The non-streaming reply returns these too, so either kind of client can send its history back
+    verbatim and the next prompt re-renders to the token ids the KV holds (plan Task 10b). parse_atem_reply strips
+    each body, so its text is not used for the fields; its tool call is."""
+    parser = protocol.stream_parser(tokenizer)
+    got = {"reasoning_content": [], "content": []}
+    for t in ids:
+        for field, delta in parser.feed(int(t)):
+            got[field].append(delta)
+        if parser.saw_stop:
+            break
+    parsed, residual = parser.finish()
+    for field, delta in residual:
+        got[field].append(delta)
+    return "".join(got["reasoning_content"]), "".join(got["content"]), parsed
 
 
 class AtemServeProtocol:

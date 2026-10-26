@@ -10,6 +10,7 @@ from lib.gemma4_engine import (
 from lib.gemma4_ops import rmsnorm, rmsnorm_no_weight
 from lib.model_config import (
     EMBED_RMSNORM, EMBED_SQRT_SCALE, RMS_EPS_INPUT, RMS_EPS_FINAL,
+    MM_IMAGE_TOKEN_ID,
     HAS_LINEAR_ATTENTION, ATTENTION_SCORE_SCALE,
     GDN_CONV_DIM, GDN_VALUE_DIM, GDN_NUM_V_HEADS,
 )
@@ -83,6 +84,10 @@ def prefill_batch_impl(
     the live [tap_count,D] tap sink directly.
 
     Scratch is allocated here sized to S and freed before return."""
+    # KV session store: this writes KV that live_tokens does not describe. A tracked wrapper (the DFlash verify
+    # in nomos_ffi) vouches for its own write and restores the list afterwards; any other caller leaves the state
+    # marked untracked. First statement, so a call that raises is marked too.
+    self.mark_live_desync()
     var S = len(tokens)
     if S <= 0:
         return
@@ -215,8 +220,9 @@ def prefill_batch_impl(
     # caught it on the agent8k ceiling proof). The drafter append API owns its own contiguous
     # cursor (dflash_append_context_rows appends at current seq_len; capacity-checked), so
     # sequential chunk captures accumulate correctly WITHOUT any start_pos indexing here.
-    # Continue-mode/KV-reuse offset prefill stays excluded by dflash_context_append itself, which
-    # the caller only sets on fresh full-prompt requests.
+    # Continue-mode/KV-reuse offset prefill is excluded by dflash_context_append itself, which the
+    # caller sets on fresh full-prompt requests and, for a continuation, only when nomos_prefill_cont
+    # found the drafter in step with the KV (dflash_capture_continue: its rows append at the cursor).
     # Tap capture must match the drafter THIS BUILD was compiled for. A mismatch is a
     # configuration error, not a reason to quietly run without taps: with capture off the
     # drafter sees no target context, every block is rejected, and acceptance pins to E=1 —
@@ -254,6 +260,22 @@ def prefill_batch_impl(
         var embed_scale = sqrt(Float32(D))
         for j in range(S * D):
             host_x[j] *= embed_scale
+    # Vision features already carry perception_emb_norm. Replace matching text
+    # rows AFTER embed_norm, so neither modality is normalized twice.
+    if self.mm_features_host != 0:
+        var vf = UnsafePointer[Float32, MutUntrackedOrigin](
+            unsafe_from_address=Int(self.mm_features_host))
+        for i in range(S):
+            if tokens[i] == MM_IMAGE_TOKEN_ID:
+                if self.mm_cursor >= self.mm_nvis:
+                    raise Error("vision splice cursor exceeds supplied features")
+                for j in range(D):
+                    host_x[i * D + j] = vf[self.mm_cursor * D + j]
+                self.mm_cursor += 1
+        if _env_float("NOMOS_MM_DEBUG", 0.0) > Float32(0.5):
+            for i in range(S * D):
+                self.mm_debug_embeddings.append(host_x[i])
+            self.mm_debug_rows += S
     cuda_upload(d_x_b, host_x)
     if verify_prof:
         cuda_sync()
@@ -467,7 +489,7 @@ def prefill_batch_impl(
             self.d_in_norms[layer], self.d_q_norms[layer], self.d_k_norms[layer],
             self.d_qw[layer], self.d_kw[layer], d_vw_or_zero, d_bf16_b,
             is_full, D, l_nh, l_nkv, l_hd, l_qd, l_kvd, S, layer,
-            start_pos,
+            start_pos + self.mrope_position_delta,
             self.d_weight_bf16_scratch,
             self.d_qw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
             self.d_kw_gs[layer] if self.weight_nvfp4 else Float32(0.0),
@@ -479,6 +501,9 @@ def prefill_batch_impl(
             debug_omlp_row if layer == debug_omlp_layer else -1,
             debug_omlp_stage if layer == debug_omlp_layer else -1,
             debug_omlp_out if layer == debug_omlp_layer else Int64(0),
+            self.d_mrope_position_ids if self.mrope_positions_active else UInt64(0),
+            self.max_seq,
+            start_pos,
         )
         if layer == debug_omlp_layer and (
             debug_omlp_stage == 8 or debug_omlp_stage == 26
@@ -1373,7 +1398,7 @@ def prefill_batch_impl(
             off += chunk
         self.ctx.synchronize()
 
-    # EAGLE-3 D3 (discrete NVFP4/W4A4) verify readout: when verify_g_out != 0 on the w4a4
+    # EAGLE-3 D3 (Gold NVFP4/W4A4) verify readout: when verify_g_out != 0 on the w4a4
     # path, emit per-position logits for ALL S rows via the DECODE-IDENTICAL lm-head:
     # per row, D2H the post-layer hidden -> HOST rmsnorm(final_norm) -> H2D d_lmhead_in
     # -> the SAME direct NVFP4-weight/fp32-activation GEMV engine_decode uses
@@ -1387,7 +1412,7 @@ def prefill_batch_impl(
         var normed = List[Float32](capacity=D)
         for _ in range(D): normed.append(0.0)
         # BATCHED READOUT. Each single-row GEMV re-streams the whole 749 MB embedding matrix to
-        # produce one row of logits, so S rows cost S x that traffic. Measured on the RTX PRO 4000:
+        # produce one row of logits, so S rows cost S x that traffic. Measured on Gold:
         # read_lmhead 23.22 ms/call = 31.6% of verify. The multirow kernel reads each weight
         # once per <=SMAX row chunk and reuses it across that chunk, and is bit-exact to v3 by
         # construction (row-independent weight decode hoisted; identical per-(s,n) expression,

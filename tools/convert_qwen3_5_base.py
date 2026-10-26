@@ -12,7 +12,7 @@ our-quant-of-bf16 isolates kernel arithmetic + our quant; repacking the third-pa
 would conflate a third source and make a layer-30 divergence unattributable. Emits into the SAME root the
 GDN blobs (<root>/gdn/) already sit under.
 
-QWEN CONTRACT (source-verified w/ Kvasir, all silent if wrong):
+QWEN CONTRACT (source-verified w/ kvasir_codex, all silent if wrong):
   - NORM CENTERING: Qwen3_5RMSNorm.forward = norm(x)*(1+weight); the kernel primitive multiplies the stored
     weight directly, so PRE-ADD +1 to ALL regular norms: input_layernorm, post_attention_layernorm, q_norm,
     k_norm, AND final norm. (GDN gated norm is RAW — different class, handled by the GDN converter.)

@@ -37,9 +37,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from quantize_q4_0 import quantize as q4_quantize, write_q4  # noqa: E402
 
 # FORMAT IS BOX-SCOPED, exactly like the rest of the kernel's precision law:
-#   --format q4     GB10 / unified memory (the GB10 dev box). The proven-coherent decode path,
+#   --format q4     GB10 / unified memory (Spark 2). The proven-coherent decode path,
 #                   and the apples-to-apples quant against the llama.cpp bar.
-#   --format nvfp4  x86 discrete Blackwell (5090 / discrete Blackwell). W4A4 shipping path,
+#   --format nvfp4  x86 discrete Blackwell (5090 demo box, Gold). W4A4 shipping path,
 #                   proven at 53.34 tok/s lossless on the 5090.
 # We encode from META'S OWN bf16 in BOTH cases rather than repacking a third-party NVFP4
 # (Inferact/RadixArk). Not dogma -- a parity argument: the golden reference is HF bf16, so
@@ -49,7 +49,7 @@ from quantize_q4_0 import quantize as q4_quantize, write_q4  # noqa: E402
 # be MORE work than encoding from bf16, not less.
 # CAVEAT, unresolved: tools/convert_redhat_nvfp4.py still carries a 2026-06-29 note that our
 # NVFP4 decode was incoherent ON GB10. Discrete is proven; GB10+NVFP4 is NOT, and this
-# converter does not settle it. Check before trusting an nvfp4 build on the GB10 dev box.
+# converter does not settle it. Check before trusting an nvfp4 build on Spark 2.
 
 HIDDEN = 6656
 N_LAYERS = 52

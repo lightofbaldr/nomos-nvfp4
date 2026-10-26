@@ -25,7 +25,7 @@ max-core = "==26.5.0"
 #
 # THE SHARP EDGE THIS FIXES (root-caused 2026-08-15, and the reason "the CUDA issue" recurred
 # on EVERY branch switch): `.pixi/envs/default` is ONE shared environment, reconciled against
-# whichever manifest is checked out. an earlier branch declares CUDA; main did not. So
+# whichever manifest is checked out. kvasir/muse-glimmer-port declares CUDA; main did not. So
 # checking out main and running `pixi install` REMOVED cudart/cublas from the env, and checking
 # out the branch put them back. Measured live: 3 libcudart files -> 0 on switching to main, and
 # back to 3 on returning. Worse, `pixi install` currently panics at the pypi stage AFTER the
@@ -34,7 +34,7 @@ max-core = "==26.5.0"
 # Declaring CUDA on BOTH branches makes the shared env stable across switches.
 #
 # SCOPED TO linux-64 ON PURPOSE. This workspace declares two platforms (linux-aarch64 for
-# the GB10 dev box / GB10, linux-64 for the 5090). These are the x86 CUDA packages; forcing them to
+# Spark 2 / GB10, linux-64 for the 5090). These are the x86 CUDA packages; forcing them to
 # solve for aarch64 too is what made `pixi install` panic (aarch64 wants the sbsa layout).
 # Per-target is also the honest shape: every arch builds its own .so, and a .so is never
 # copied across arches.

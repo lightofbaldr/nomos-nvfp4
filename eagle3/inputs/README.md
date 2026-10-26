@@ -16,7 +16,7 @@ obtained model.
 - `eagle3_oracle_ref.npz` — **THE GOLD.** Byte-verified against the real `Eagle3DraftModel`
   (speculators 0.6.0) on FIXED synthetic taps (`torch.manual_seed(0)`). The arbiter for every port.
 
-## gold-diff protocol
+## Gold-diff protocol
 Feed the drafter `taps_flat` [16128] (= cat of the 3 aux hiddens, low→high) + `seed_token` (=1),
 run `k_steps` (=3) draft steps. Diff:
 - `draft_ids` [3], `target_ids` [3] — token-level (exact, modulo quant flips deep in the chain).

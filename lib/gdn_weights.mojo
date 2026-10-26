@@ -1,7 +1,7 @@
 """GDN (Gated-DeltaNet) per-layer weights for the qwen3_5 second engine.
 
 OWNERSHIP: Kvasir owns this loader + tools/convert_qwen3_5_gdn.py (the converter that produces the blobs).
-Kvasir owns adding the GdnWeights field to the engine, the prefill/decode routing that GEMMs these
+kvasir_codex owns adding the GdnWeights field to the engine, the prefill/decode routing that GEMMs these
 weights, and the g/beta + gated-RMSNorm transforms (computed FP32 in-engine from A_log/dt_bias/norm).
 
 The shipped/default contract keeps all 9 tensors as BF16 device blobs:

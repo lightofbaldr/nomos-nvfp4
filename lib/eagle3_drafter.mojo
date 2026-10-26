@@ -86,7 +86,7 @@ from lib.eagle3_d2t import eagle3_argmax_d2t
 comptime D2D = 3  # cudaMemcpyDeviceToDevice
 comptime DRAFT_VOCAB = 32000   # real draft_vocab_size (was 32768 — padded tail → OOB d2t)
 comptime TARGET_VOCAB = 262144
-# Weight modes (D2, discrete NVFP4 port). NVFP4 = drafter-study/eagle3-flat blobs on the
+# Weight modes (D2, Gold NVFP4 port). NVFP4 = drafter-study/eagle3-flat blobs on the
 # R2 W4A4 path (prequant dedup + fused postscale). GOLD = the same weights as EXACT
 # checkpoint bf16 (fp32 blob -> bf16 device, lossless) + fp32-activation GEMV — the
 # quant-BYPASS mode for the G2 wiring-parity gate vs the HF Eagle3DraftModel. Q8 is
